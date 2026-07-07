@@ -169,6 +169,18 @@ type
     class function parse(const s: string; base: integer): UBigInt; static;
     class function tryParse(const s: string; out v: UBigInt): boolean; static;
     class function tryParse(const s: string; base: integer; out v: UBigInt): boolean; static;
+    // math
+    function sqr: UBigInt;
+    function sqrt: UBigInt;
+    function nthRoot(n: LongWord): UBigInt;
+    function pow(e: LongWord): UBigInt;
+    function modPow(const e, m: UBigInt): UBigInt;
+    function modInverse(const m: UBigInt): UBigInt;
+    function gcd(const other: UBigInt): UBigInt;
+    function lcm(const other: UBigInt): UBigInt;
+    // primes (Miller-Rabin; deterministic witnesses below 3.3e24, then random rounds)
+    function isProbablePrime(rounds: integer = 24): boolean;
+    function nextPrime: UBigInt;
     // bytes, little/big endian magnitude; zero gives an empty array
     function toBytesLE: TBytes;
     function toBytesBE: TBytes;
@@ -187,6 +199,8 @@ type
     class function random(bits: LongWord): UBigInt; static;
     class function randomBelow(const bound: UBigInt): UBigInt; static;
     class function randomRange(const lo, hi: UBigInt): UBigInt; static;
+    class function factorial(n: LongWord): UBigInt; static;
+    class function fibonacci(n: LongWord): UBigInt; static;
   end;
 
   { BigInt - signed arbitrary precision integer, sign-magnitude storage;
@@ -325,6 +339,20 @@ type
     class function parse(const s: string; base: integer): BigInt; static;
     class function tryParse(const s: string; out v: BigInt): boolean; static;
     class function tryParse(const s: string; base: integer; out v: BigInt): boolean; static;
+    // math
+    function sqr: BigInt;
+    function sqrt: BigInt;
+    function nthRoot(n: LongWord): BigInt;
+    function pow(e: LongWord): BigInt;
+    // modPow follows Java: modulus must be positive, result in [0, m),
+    // a negative exponent goes through the modular inverse
+    function modPow(const e, m: BigInt): BigInt;
+    function modInverse(const m: BigInt): BigInt;
+    function gcd(const other: BigInt): BigInt;
+    function lcm(const other: BigInt): BigInt;
+    // primes: negative values are never prime, nextPrime returns the first prime > self
+    function isProbablePrime(rounds: integer = 24): boolean;
+    function nextPrime: BigInt;
     // bytes: minimal two's complement with sign bit, like Java toByteArray
     function toBytesLE: TBytes;
     function toBytesBE: TBytes;
@@ -344,6 +372,8 @@ type
     class function random(bits: LongWord): BigInt; static;
     class function randomBelow(const bound: BigInt): BigInt; static;
     class function randomRange(const lo, hi: BigInt): BigInt; static;
+    class function factorial(n: LongWord): BigInt; static;
+    class function fibonacci(n: LongWord): BigInt; static;
   end;
 
   // declared after both records so UBigInt can offer a BigInt-returning method
@@ -2534,6 +2564,285 @@ begin
   if start = 2 then result[1] := '-';
 end;
 
+function UBigInt.sqr: UBigInt;
+begin
+  result.fLimbs := LSqr(fLimbs);
+end;
+
+function UBigInt.sqrt: UBigInt;
+begin
+  if Length(fLimbs) = 0 then exit(default(UBigInt));
+  // Newton iteration seeded above the root converges downward to floor(sqrt)
+  var x := UBigInt.pow2((bitLength + 1) div 2);
+  repeat
+    var y := (x + self div x) shr 1;
+    if y >= x then break;
+    x := y;
+  until false;
+  result := x;
+end;
+
+function UBigInt.nthRoot(n: LongWord): UBigInt;
+begin
+  if n = 0 then raise EBigIntError.Create('zeroth root is undefined');
+  if (n = 1) or (Length(fLimbs) = 0) or isOne then exit(self);
+  var x := UBigInt.pow2((bitLength + n - 1) div n);
+  repeat
+    var y := ((n - 1) * x + self div x.pow(n - 1)) div n;
+    if y >= x then break;
+    x := y;
+  until false;
+  // Newton for higher roots can land one off, correct exactly
+  while x.pow(n) > self do x := x - 1;
+  while (x + 1).pow(n) <= self do x := x + 1;
+  result := x;
+end;
+
+function UBigInt.pow(e: LongWord): UBigInt;
+begin
+  result.fLimbs := UPowQ(fLimbs, e);
+end;
+
+// negated inverse of m0 modulo the limb base (Montgomery m'), m0 odd
+function MontInv(m0: TLimb): TLimb;
+begin
+  var inv := m0; // 3 correct bits to seed (x = x^-1 mod 8 for odd x), Newton doubles per step
+  for var i := 1 to 5 do inv := inv * (TLimb(2) - m0 * inv);
+  result := TLimb(0) - inv;
+end;
+
+// Montgomery product rp := ap * bp / B^n mod m; every run is n limbs, t is a
+// caller-provided 2n+1 limb workspace; rp may alias ap and bp
+procedure MontMul(rp, ap, bp: PLimb; const m: TLimbs; mInv: TLimb; n: SizeInt; var t: TLimbs);
+begin
+  t[2 * n] := 0;
+  t[n] := MpnMul1(@t[0], ap, n, bp[0]);
+  for var j := 1 to n - 1 do t[n + j] := MpnAddMul1(@t[j], ap, n, bp[j]);
+  // interleaved REDC: kill one low limb per round with a multiple of m
+  for var i := 0 to n - 1 do begin
+    var u: TLimb := t[i] * mInv;
+    var c := MpnAddMul1(@t[i], @m[0], n, u);
+    MpnAdd1(@t[i + n], @t[i + n], n + 1 - i, c);
+  end;
+  // t[n..2n] holds a value below 2m: one conditional subtract finishes
+  if (t[2 * n] <> 0) or (MpnCmp(@t[n], @m[0], n) >= 0) then MpnSubN(rp, @t[n], @m[0], n)
+  else Move(t[n], rp^, n * SizeOf(TLimb));
+end;
+
+// modular exponentiation for odd m: Montgomery form with a fixed k-bit window
+function UMontModPow(const base, e, m: UBigInt): UBigInt;
+var
+  q, rr, bred, baseM, acc, t, oneVec: TLimbs;
+  table: array of TLimbs;
+begin
+  var n := Length(m.fLimbs);
+  var mInv := MontInv(m.fLimbs[0]);
+  // base*R mod m, costs one shift and two divisions
+  LDivMod(base.fLimbs, m.fLimbs, q, rr);
+  bred := LShl(rr, LongWord(n) * LIMB_BITS);
+  LDivMod(bred, m.fLimbs, q, baseM);
+  SetLength(baseM, n);
+  var ebits := e.bitLength;
+  var k := if ebits >= 1024 then 6 else if ebits >= 256 then 5 else if ebits >= 64 then 4 else if ebits >= 16 then 3 else if ebits >= 4 then 2 else 1;
+  SetLength(t, 2 * n + 1);
+  SetLength(table, 1 shl k);
+  table[1] := baseM;
+  for var j := 2 to (1 shl k) - 1 do begin
+    SetLength(table[j], n);
+    MontMul(@table[j][0], @table[j - 1][0], @baseM[0], m.fLimbs, mInv, n, t);
+  end;
+  // scan the exponent top-down in k-bit digits: k squarings then one table mul
+  var chunks := (SizeInt(ebits) + k - 1) div k;
+  acc := Copy(table[LGetBits(e.fLimbs, LongWord((chunks - 1) * k), k)]);
+  for var c := chunks - 2 downto 0 do begin
+    for var s := 1 to k do MontMul(@acc[0], @acc[0], @acc[0], m.fLimbs, mInv, n, t);
+    var d := LGetBits(e.fLimbs, LongWord(c * k), k);
+    if d <> 0 then MontMul(@acc[0], @acc[0], @table[d][0], m.fLimbs, mInv, n, t);
+  end;
+  // back out of Montgomery form via a multiply by plain 1
+  SetLength(oneVec, n);
+  oneVec[0] := 1;
+  MontMul(@acc[0], @acc[0], @oneVec[0], m.fLimbs, mInv, n, t);
+  LNorm(acc);
+  result.fLimbs := acc;
+end;
+
+function UBigInt.modPow(const e, m: UBigInt): UBigInt;
+begin
+  if m.isZero then RaiseDivByZero;
+  if m.isOne then exit(default(UBigInt));
+  // Montgomery needs an odd modulus; tiny exponents skip the setup cost
+  if m.isOdd and (e.bitLength > 8) then exit(UMontModPow(self, e, m));
+  var base := self mod m;
+  var acc: UBigInt := 1;
+  var bits := e.bitLength;
+  for var i := 0 to Int64(bits) - 1 do begin
+    if e.testBit(i) then acc := (acc * base) mod m;
+    if i < Int64(bits) - 1 then base := base.sqr mod m;
+  end;
+  result := acc;
+end;
+
+function UBigInt.modInverse(const m: UBigInt): UBigInt;
+begin
+  if m.isZero then RaiseDivByZero;
+  // extended Euclid on signed values
+  var oldR: BigInt := self mod m;
+  var r: BigInt := m;
+  var oldS: BigInt := 1;
+  var s: BigInt := 0;
+  while not r.isZero do begin
+    var q := oldR div r;
+    (oldR, r) := (r, oldR - q * r);
+    (oldS, s) := (s, oldS - q * s);
+  end;
+  if not oldR.isOne then raise EBigIntError.Create('value has no modular inverse for this modulus');
+  result := oldS.floorMod(m).toUBigInt;
+end;
+
+// remainder of a modulo a single limb
+function LModW(const a: TLimbs; w: TLimb): TLimb;
+begin
+  result := 0;
+  for var i := Length(a) - 1 downto 0 do UDivLimb(result, a[i], w, result);
+end;
+
+function GcdQWord(a, b: QWord): QWord;
+begin
+  while b <> 0 do begin
+    var t := a mod b;
+    a := b;
+    b := t;
+  end;
+  result := a;
+end;
+
+// p*a + q*b for small cofactors of opposite sign, result known nonnegative
+function LSignedComb(p: Int64; const a: TLimbs; q: Int64; const b: TLimbs): TLimbs;
+var
+  res: TLimbs;
+begin
+  // orient so the nonnegative coefficient comes first
+  if (p < 0) or ((p = 0) and (q > 0)) then exit(LSignedComb(q, b, p, a));
+  var la := Length(a);
+  var lb := Length(b);
+  SetLength(res, MaxS(la, lb) + 1);
+  if (p <> 0) and (la > 0) then res[la] := MpnMul1(@res[0], @a[0], la, TLimb(p));
+  if (q <> 0) and (lb > 0) then begin
+    var borrow := MpnSubMul1(@res[0], @b[0], lb, TLimb(-q));
+    MpnSub1(@res[lb], @res[lb], Length(res) - lb, borrow);
+  end;
+  LNorm(res);
+  result := res;
+end;
+
+function UBigInt.gcd(const other: UBigInt): UBigInt;
+begin
+  var aL := Copy(fLimbs);
+  var bL := Copy(other.fLimbs);
+  if LCmp(aL, bL) < 0 then SwapValues(aL, bL);
+  // Lehmer: run Euclid on the top 63 bits, apply the resulting 2x2 matrix to
+  // the full numbers with single-limb rows, fall back to one big division
+  // whenever the word view cannot certify a quotient
+  while Length(bL) > 1 do begin
+    var shs := SizeInt(LBitLen(aL)) - 63;
+    if shs < 0 then shs := 0;
+    var x := Int64(LExtract64(aL, LongWord(shs)));
+    var y := Int64(LExtract64(bL, LongWord(shs)));
+    var mA: Int64 := 1;
+    var mB: Int64 := 0;
+    var mC: Int64 := 0;
+    var mD: Int64 := 1;
+    while (y + mC > 0) and (y + mD > 0) do begin
+      var q := (x + mA) div (y + mC);
+      if (q <> (x + mB) div (y + mD)) or (q > $7FFFFFFF) then break;
+      var t1 := mA - q * mC;
+      var t2 := mB - q * mD;
+      mA := mC;
+      mB := mD;
+      mC := t1;
+      mD := t2;
+      var t := x - q * y;
+      x := y;
+      y := t;
+      if (System.Abs(mC) > $40000000) or (System.Abs(mD) > $40000000) then break;
+    end;
+    if mB = 0 then begin
+      // no certified quotient in the top words: one full division step
+      var q, r: TLimbs;
+      LDivMod(aL, bL, q, r);
+      aL := bL;
+      bL := r;
+    end else begin
+      var na := LSignedComb(mA, aL, mB, bL);
+      var nb := LSignedComb(mC, aL, mD, bL);
+      aL := na;
+      bL := nb;
+      if LCmp(aL, bL) < 0 then SwapValues(aL, bL);
+    end;
+  end;
+  if Length(bL) = 0 then begin
+    result.fLimbs := aL;
+    exit;
+  end;
+  var w := bL[0];
+  result.fLimbs := LFromQWord(GcdQWord(w, LModW(aL, w)));
+end;
+
+function UBigInt.lcm(const other: UBigInt): UBigInt;
+begin
+  if isZero or other.isZero then exit(default(UBigInt));
+  result := (self div gcd(other)) * other;
+end;
+
+function UBigInt.isProbablePrime(rounds: integer): boolean;
+const
+  // enough trial primes that every composite below 47*47 gets caught,
+  // and the first 12 double as deterministic Miller-Rabin witnesses to 3.3e24
+  smallPrimes: array[0..14] of byte = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47);
+begin
+  if self < 2 then exit(false);
+  for var i := 0 to High(smallPrimes) do begin
+    if self = smallPrimes[i] then exit(true);
+    if (self mod smallPrimes[i]).isZero then exit(false);
+  end;
+  if self < 47 * 47 then exit(true);
+  // n-1 = d * 2^s with d odd
+  var nm1 := self - 1;
+  var s := nm1.lowestSetBit;
+  var d := nm1 shr s;
+  var witnesses := if rounds > 12 then rounds else 12;
+  for var w := 0 to witnesses - 1 do begin
+    var a: UBigInt;
+    if w <= 11 then a := smallPrimes[w]
+    else begin
+      // random witness in [2, n-2]
+      a := UBigInt.random(bitLength + 8) mod (self - 3) + 2;
+    end;
+    var x := a.modPow(d, self);
+    if x.isOne or (x = nm1) then continue;
+    var composite := true;
+    for var j := 1 to s - 1 do begin
+      x := x.sqr mod self;
+      if x = nm1 then begin
+        composite := false;
+        break;
+      end;
+    end;
+    if composite then exit(false);
+  end;
+  result := true;
+end;
+
+function UBigInt.nextPrime: UBigInt;
+begin
+  if self < 2 then exit(UBigInt(2));
+  var c := self + 1;
+  if c.isEven then c := c + 1;
+  while not c.isProbablePrime do c := c + 2;
+  result := c;
+end;
+
 function UBigInt.toBytesLE: TBytes;
 var
   res: TBytes;
@@ -2794,6 +3103,52 @@ class function UBigInt.randomRange(const lo, hi: UBigInt): UBigInt;
 begin
   if lo > hi then raise EBigIntError.Create('randomRange needs lo <= hi');
   result := lo + randomBelow(hi - lo + 1);
+end;
+
+// balanced product of lo..hi, far fewer big*big multiplications than a plain loop
+function UProdRange(lo, hi: LongWord): UBigInt;
+begin
+  if hi - lo < 8 then begin
+    result := lo;
+    for var i := lo + 1 to hi do result := result * Int64(i);
+    exit;
+  end;
+  var mid := lo + (hi - lo) shr 1;
+  result := UProdRange(lo, mid) * UProdRange(mid + 1, hi);
+end;
+
+class function UBigInt.factorial(n: LongWord): UBigInt;
+begin
+  if n < 2 then exit(UBigInt.one);
+  result := UProdRange(2, n);
+end;
+
+// fast doubling: F(2k) = F(k)*(2F(k+1)-F(k)), F(2k+1) = F(k)^2+F(k+1)^2
+procedure UFibPair(n: LongWord; out fn, fn1: UBigInt);
+begin
+  var a := UBigInt.zero;
+  var b := UBigInt.one;
+  if n > 0 then
+    for var i := integer(BsrDWord(n)) downto 0 do begin
+      var c := a * ((b shl 1) - a);
+      var d := a.sqr + b.sqr;
+      if (n shr i) and 1 = 1 then begin
+        a := d;
+        b := c + d;
+      end else begin
+        a := c;
+        b := d;
+      end;
+    end;
+  fn := a;
+  fn1 := b;
+end;
+
+class function UBigInt.fibonacci(n: LongWord): UBigInt;
+var
+  f1: UBigInt;
+begin
+  UFibPair(n, result, f1);
 end;
 
 // ---------------------------------------------------------------------------
@@ -3621,6 +3976,67 @@ begin
   result.fNeg := false;
 end;
 
+function BigInt.sqr: BigInt;
+begin
+  result.fLimbs := LSqr(fLimbs);
+  result.fNeg := false;
+end;
+
+function BigInt.sqrt: BigInt;
+begin
+  if fNeg then raise EBigIntError.Create('square root of a negative value');
+  result := magnitude.sqrt.toBigInt;
+end;
+
+function BigInt.nthRoot(n: LongWord): BigInt;
+begin
+  if not fNeg then exit(magnitude.nthRoot(n).toBigInt);
+  if n and 1 = 0 then raise EBigIntError.Create('even root of a negative value');
+  result := -magnitude.nthRoot(n).toBigInt;
+end;
+
+function BigInt.pow(e: LongWord): BigInt;
+begin
+  result.fLimbs := UPowQ(fLimbs, e);
+  result.fNeg := fNeg and (e and 1 = 1) and (Length(result.fLimbs) > 0);
+end;
+
+function BigInt.modPow(const e, m: BigInt): BigInt;
+begin
+  if m.sign <= 0 then raise EBigIntError.Create('modulus must be positive');
+  var mm := m.toUBigInt;
+  var base := floorMod(m).toUBigInt;
+  if e.isNegative then base := base.modInverse(mm);
+  result := base.modPow(e.magnitude, mm).toBigInt;
+end;
+
+function BigInt.modInverse(const m: BigInt): BigInt;
+begin
+  if m.sign <= 0 then raise EBigIntError.Create('modulus must be positive');
+  result := floorMod(m).toUBigInt.modInverse(m.toUBigInt).toBigInt;
+end;
+
+function BigInt.gcd(const other: BigInt): BigInt;
+begin
+  result := magnitude.gcd(other.magnitude).toBigInt;
+end;
+
+function BigInt.lcm(const other: BigInt): BigInt;
+begin
+  result := magnitude.lcm(other.magnitude).toBigInt;
+end;
+
+function BigInt.isProbablePrime(rounds: integer): boolean;
+begin
+  result := (not fNeg) and magnitude.isProbablePrime(rounds);
+end;
+
+function BigInt.nextPrime: BigInt;
+begin
+  if fNeg or (Length(fLimbs) = 0) then exit(BigInt(2));
+  result := magnitude.nextPrime.toBigInt;
+end;
+
 function BigInt.toBytesLE: TBytes;
 var
   res: TBytes;
@@ -3732,6 +4148,16 @@ class function BigInt.randomRange(const lo, hi: BigInt): BigInt;
 begin
   if lo > hi then raise EBigIntError.Create('randomRange needs lo <= hi');
   result := lo + UBigInt.randomBelow((hi - lo + 1).toUBigInt).toBigInt;
+end;
+
+class function BigInt.factorial(n: LongWord): BigInt;
+begin
+  result := UBigInt.factorial(n).toBigInt;
+end;
+
+class function BigInt.fibonacci(n: LongWord): BigInt;
+begin
+  result := UBigInt.fibonacci(n).toBigInt;
 end;
 
 {$ifdef BIGINT_ASM}
