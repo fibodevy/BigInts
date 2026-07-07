@@ -182,6 +182,165 @@ type
     class function pow2(n: LongWord): UBigInt; static;
   end;
 
+  { BigInt - signed arbitrary precision integer, sign-magnitude storage;
+    bitwise operators and bit access use two's complement semantics with
+    infinite sign extension (like Python ints), div/mod truncate like Pascal }
+
+  BigInt = record
+  private
+    fLimbs: TBigIntLimbs;
+    fNeg: boolean;
+    function getBitProp(i: LongWord): boolean; inline;
+    procedure putBitProp(i: LongWord; v: boolean); inline;
+  public
+    // conversions in
+    class operator :=(x: Int64): BigInt;
+    class operator :=(x: QWord): BigInt;
+    class operator :=(const s: string): BigInt;
+    class operator :=(const u: UBigInt): BigInt;
+    class operator explicit(d: Double): BigInt;
+    // exact integer paths for typecasts, so BigInt(q) never rounds via Double
+    class operator explicit(x: Int64): BigInt;
+    class operator explicit(x: QWord): BigInt;
+    // conversions out (values that do not fit raise ERangeError)
+    class operator explicit(const a: BigInt): Int64;
+    class operator explicit(const a: BigInt): QWord;
+    class operator explicit(const a: BigInt): LongInt;
+    class operator explicit(const a: BigInt): LongWord;
+    class operator explicit(const a: BigInt): Double;
+    class operator explicit(const a: BigInt): string;
+    class operator explicit(const a: BigInt): UBigInt;
+    // arithmetic
+    class operator +(const a, b: BigInt): BigInt;
+    class operator +(const a: BigInt; b: Int64): BigInt;
+    class operator +(a: Int64; const b: BigInt): BigInt;
+    class operator -(const a, b: BigInt): BigInt;
+    class operator -(const a: BigInt; b: Int64): BigInt;
+    class operator -(a: Int64; const b: BigInt): BigInt;
+    class operator *(const a, b: BigInt): BigInt;
+    class operator *(const a: BigInt; b: Int64): BigInt;
+    class operator *(a: Int64; const b: BigInt): BigInt;
+    class operator div(const a, b: BigInt): BigInt;
+    class operator div(const a: BigInt; b: Int64): BigInt;
+    class operator mod(const a, b: BigInt): BigInt;
+    class operator mod(const a: BigInt; b: Int64): BigInt;
+    // "/" is integer division here, same thing as div (C-family convention)
+    class operator /(const a, b: BigInt): BigInt;
+    class operator **(const a, b: BigInt): BigInt;
+    class operator **(const a: BigInt; e: Int64): BigInt;
+    class operator inc(const a: BigInt): BigInt;
+    class operator dec(const a: BigInt): BigInt;
+    // unary
+    class operator -(const a: BigInt): BigInt;
+    class operator +(const a: BigInt): BigInt;
+    // shifts: shl keeps the sign, shr is arithmetic (rounds toward -infinity)
+    class operator shl(const a: BigInt; n: Int64): BigInt;
+    class operator shr(const a: BigInt; n: Int64): BigInt;
+    // bitwise, two's complement with infinite sign extension; not x = -x-1
+    class operator and(const a, b: BigInt): BigInt;
+    class operator or(const a, b: BigInt): BigInt;
+    class operator xor(const a, b: BigInt): BigInt;
+    class operator not(const a: BigInt): BigInt;
+    // comparisons
+    class operator =(const a, b: BigInt): boolean;
+    class operator =(const a: BigInt; b: Int64): boolean;
+    class operator =(a: Int64; const b: BigInt): boolean;
+    class operator <>(const a, b: BigInt): boolean;
+    class operator <>(const a: BigInt; b: Int64): boolean;
+    class operator <>(a: Int64; const b: BigInt): boolean;
+    class operator <(const a, b: BigInt): boolean;
+    class operator <(const a: BigInt; b: Int64): boolean;
+    class operator <(a: Int64; const b: BigInt): boolean;
+    class operator <=(const a, b: BigInt): boolean;
+    class operator <=(const a: BigInt; b: Int64): boolean;
+    class operator <=(a: Int64; const b: BigInt): boolean;
+    class operator >(const a, b: BigInt): boolean;
+    class operator >(const a: BigInt; b: Int64): boolean;
+    class operator >(a: Int64; const b: BigInt): boolean;
+    class operator >=(const a, b: BigInt): boolean;
+    class operator >=(const a: BigInt; b: Int64): boolean;
+    class operator >=(a: Int64; const b: BigInt): boolean;
+
+    // formatting (negative values get a leading "-", also in hex/bin/oct)
+    function toString: string;
+    function toString(base: integer): string;
+    function toHex: string;
+    function toBin: string;
+    function toOct: string;
+    // numeric conversions (raise ERangeError when the value does not fit)
+    function toInt64: Int64;
+    function toQWord: QWord;
+    function toInteger: LongInt;
+    function toCardinal: LongWord;
+    function toDouble: Double;
+    function toUBigInt: UBigInt;
+    function fitsInInt64: boolean;
+    function fitsInQWord: boolean;
+    function fitsInInteger: boolean;
+    function fitsInCardinal: boolean;
+    // predicates
+    function isZero: boolean;
+    function isOne: boolean;
+    function isEven: boolean;
+    function isOdd: boolean;
+    function isNegative: boolean;
+    function isPositive: boolean;
+    function isPowerOfTwo: boolean;
+    function sign: integer;
+    // sign helpers
+    function abs: BigInt;
+    function magnitude: UBigInt;
+    procedure negate;
+    // bit access in two's complement (testBit of a negative sees infinite ones)
+    function bitLength: LongWord;
+    function popCount: LongWord;
+    function lowestSetBit: Int64;
+    function testBit(i: LongWord): boolean;
+    procedure setBit(i: LongWord);
+    procedure clearBit(i: LongWord);
+    procedure flipBit(i: LongWord);
+    property bits[i: LongWord]: boolean read getBitProp write putBitProp;
+    // comparison helpers
+    function compare(const other: BigInt): integer;
+    function equals(const other: BigInt): boolean;
+    function min(const other: BigInt): BigInt;
+    function max(const other: BigInt): BigInt;
+    // division helpers: divMod truncates (like div/mod), floor variants round
+    // toward -infinity (like Python), ceilDiv rounds toward +infinity
+    function divMod(const d: BigInt): (q, r: BigInt);
+    function floorDiv(const d: BigInt): BigInt;
+    function floorMod(const d: BigInt): BigInt;
+    function ceilDiv(const d: BigInt): BigInt;
+    // misc
+    procedure swap(var other: BigInt);
+    // parsing (sign plus the same prefixes and separators as UBigInt)
+    class function parse(const s: string): BigInt; static;
+    class function parse(const s: string; base: integer): BigInt; static;
+    class function tryParse(const s: string; out v: BigInt): boolean; static;
+    class function tryParse(const s: string; base: integer; out v: BigInt): boolean; static;
+    // bytes: minimal two's complement with sign bit, like Java toByteArray
+    function toBytesLE: TBytes;
+    function toBytesBE: TBytes;
+    class function fromBytesLE(const bytes: TBytes): BigInt; static;
+    class function fromBytesBE(const bytes: TBytes): BigInt; static;
+    // misc
+    function digitCount: LongWord;
+    function toStringGrouped(sep: char = '_'; groupSize: integer = 3): string;
+    function hashCode: DWord;
+    // constants and generators
+    class function zero: BigInt; static;
+    class function one: BigInt; static;
+    class function two: BigInt; static;
+    class function ten: BigInt; static;
+    class function minusOne: BigInt; static;
+    class function pow2(n: LongWord): BigInt; static;
+  end;
+
+  // declared after both records so UBigInt can offer a BigInt-returning method
+  TUBigIntBridge = record helper for UBigInt
+    function toBigInt: BigInt;
+  end;
+
 var
   // limb count above which multiplication and squaring switch from schoolbook
   // to Karatsuba; exposed for tuning and testing
@@ -2444,6 +2603,927 @@ end;
 class function UBigInt.pow2(n: LongWord): UBigInt;
 begin
   result.fLimbs := LShl(LFromQWord(1), n);
+end;
+
+// ---------------------------------------------------------------------------
+// BigInt
+// ---------------------------------------------------------------------------
+
+function LPopCount(const a: TLimbs): LongWord;
+begin
+  result := 0;
+  for var i := 0 to Length(a) - 1 do result := result + PopCnt(a[i]);
+end;
+
+function BFromI64(x: Int64): BigInt;
+begin
+  if x >= 0 then begin
+    result.fLimbs := LFromQWord(QWord(x));
+    result.fNeg := false;
+  end else begin
+    result.fLimbs := LFromQWord(NegAbs64(x));
+    result.fNeg := true;
+  end;
+end;
+
+// signed add of two sign/magnitude pairs
+function SAddPair(const am: TLimbs; an: boolean; const bm: TLimbs; bn: boolean): BigInt;
+var
+  m: TLimbs;
+begin
+  if an = bn then begin
+    m := LAdd(am, bm);
+    result.fLimbs := m;
+    result.fNeg := an and (Length(m) > 0);
+    exit;
+  end;
+  var c := LCmp(am, bm);
+  if c = 0 then exit(default(BigInt));
+  if c > 0 then begin
+    m := LSub(am, bm);
+    result.fLimbs := m;
+    result.fNeg := an;
+  end else begin
+    m := LSub(bm, am);
+    result.fLimbs := m;
+    result.fNeg := bn;
+  end;
+end;
+
+function SMulPair(const am: TLimbs; an: boolean; const bm: TLimbs; bn: boolean): BigInt;
+var
+  m: TLimbs;
+begin
+  m := LMul(am, bm);
+  result.fLimbs := m;
+  result.fNeg := (an xor bn) and (Length(m) > 0);
+end;
+
+// truncated division: quotient toward zero, remainder takes the dividend sign
+procedure SDivModPair(const am: TLimbs; an: boolean; const bm: TLimbs; bn: boolean; out q, r: BigInt);
+var
+  qm, rm: TLimbs;
+begin
+  LDivMod(am, bm, qm, rm);
+  q.fLimbs := qm;
+  q.fNeg := (an xor bn) and (Length(qm) > 0);
+  r.fLimbs := rm;
+  r.fNeg := an and (Length(rm) > 0);
+end;
+
+function BCmp(const a, b: BigInt): integer;
+begin
+  if a.fNeg <> b.fNeg then exit(if a.fNeg then -1 else 1);
+  var c := LCmp(a.fLimbs, b.fLimbs);
+  result := if a.fNeg then -c else c;
+end;
+
+function BCmpI64(const a: BigInt; v: Int64): integer;
+begin
+  var sa := if Length(a.fLimbs) = 0 then 0 else if a.fNeg then -1 else 1;
+  var sv := if v > 0 then 1 else if v < 0 then -1 else 0;
+  if sa <> sv then exit(if sa < sv then -1 else 1);
+  if sa = 0 then exit(0);
+  var c := LCmpQ(a.fLimbs, if v > 0 then QWord(v) else NegAbs64(v));
+  result := if sa < 0 then -c else c;
+end;
+
+// lowest nonzero limb index, -1 for zero
+function LLowestNZ(const m: TLimbs): SizeInt;
+begin
+  for var i := 0 to Length(m) - 1 do
+    if m[i] <> 0 then exit(i);
+  result := -1;
+end;
+
+// i-th limb of the infinite two's complement form of (m, neg)
+function TCLimbAt(const m: TLimbs; neg: boolean; lowNZ, i: SizeInt): TLimb; inline;
+begin
+  if not neg then result := if i < Length(m) then m[i] else 0
+  else if i < lowNZ then result := 0
+  else if i = lowNZ then result := (not m[i]) + 1
+  else if i < Length(m) then result := not m[i]
+  else result := High(TLimb);
+end;
+
+// negate a two's complement limb array in place (not + 1): limbs below the
+// lowest nonzero one stay zero, that one negates, everything above inverts
+procedure LTCNegateInPlace(var a: TLimbs);
+begin
+  var i := 0;
+  while (i < Length(a)) and (a[i] = 0) do inc(i);
+  if i >= Length(a) then exit;
+  a[i] := TLimb(0) - a[i];
+  for var j := i + 1 to Length(a) - 1 do a[j] := not a[j];
+end;
+
+type
+  TBitOp = (boAnd, boOr, boXor);
+
+function BBitOp(const a, b: BigInt; op: TBitOp): BigInt;
+var
+  res: TLimbs;
+begin
+  var la := Length(a.fLimbs);
+  var lb := Length(b.fLimbs);
+  // one limb above both operands captures the sign extension
+  var n := MaxS(la, lb) + 1;
+  var lowA := LLowestNZ(a.fLimbs);
+  var lowB := LLowestNZ(b.fLimbs);
+  SetLength(res, n);
+  for var i := 0 to n - 1 do begin
+    var x := TCLimbAt(a.fLimbs, a.fNeg, lowA, i);
+    var y := TCLimbAt(b.fLimbs, b.fNeg, lowB, i);
+    res[i] := case op of
+      boAnd: x and y;
+      boOr: x or y;
+      boXor: x xor y;
+    end;
+  end;
+  // the top limb came out either all zeros or all ones
+  var neg := res[n - 1] <> 0;
+  if neg then LTCNegateInPlace(res);
+  LNorm(res);
+  result.fLimbs := res;
+  result.fNeg := neg and (Length(res) > 0);
+end;
+
+// any nonzero bit among the n lowest bits (the bits a shr n drops)
+function LAnyDroppedBits(const a: TLimbs; n: LongWord): boolean;
+begin
+  var limbShift := SizeInt(n shr LIMB_SHIFT);
+  var bitShift := n and LIMB_MASK;
+  for var i := 0 to MinS(limbShift, Length(a)) - 1 do
+    if a[i] <> 0 then exit(true);
+  if (bitShift > 0) and (limbShift < Length(a)) then exit(a[limbShift] and ((TLimb(1) shl bitShift) - 1) <> 0);
+  result := false;
+end;
+
+class operator BigInt.:=(x: Int64): BigInt;
+begin
+  result := BFromI64(x);
+end;
+
+class operator BigInt.:=(x: QWord): BigInt;
+begin
+  result.fLimbs := LFromQWord(x);
+  result.fNeg := false;
+end;
+
+class operator BigInt.:=(const s: string): BigInt;
+begin
+  result := BigInt.parse(s);
+end;
+
+class operator BigInt.:=(const u: UBigInt): BigInt;
+begin
+  result.fLimbs := u.fLimbs;
+  result.fNeg := false;
+end;
+
+class operator BigInt.explicit(d: Double): BigInt;
+var
+  u: UBigInt;
+begin
+  if IsNan(d) or IsInfinite(d) then raise EConvertError.Create('cannot convert NaN or Inf to BigInt');
+  if d < 0 then begin
+    u := UBigInt(-d);
+    result.fLimbs := u.fLimbs;
+    result.fNeg := Length(u.fLimbs) > 0;
+  end else begin
+    u := UBigInt(d);
+    result.fLimbs := u.fLimbs;
+    result.fNeg := false;
+  end;
+end;
+
+class operator BigInt.explicit(x: Int64): BigInt;
+begin
+  result := BFromI64(x);
+end;
+
+class operator BigInt.explicit(x: QWord): BigInt;
+begin
+  result.fLimbs := LFromQWord(x);
+  result.fNeg := false;
+end;
+
+class operator BigInt.explicit(const a: BigInt): Int64;
+begin
+  result := a.toInt64;
+end;
+
+class operator BigInt.explicit(const a: BigInt): QWord;
+begin
+  result := a.toQWord;
+end;
+
+class operator BigInt.explicit(const a: BigInt): LongInt;
+begin
+  result := a.toInteger;
+end;
+
+class operator BigInt.explicit(const a: BigInt): LongWord;
+begin
+  result := a.toCardinal;
+end;
+
+class operator BigInt.explicit(const a: BigInt): Double;
+begin
+  result := a.toDouble;
+end;
+
+class operator BigInt.explicit(const a: BigInt): string;
+begin
+  result := a.toString;
+end;
+
+class operator BigInt.explicit(const a: BigInt): UBigInt;
+begin
+  result := a.toUBigInt;
+end;
+
+class operator BigInt.+(const a, b: BigInt): BigInt;
+begin
+  result := SAddPair(a.fLimbs, a.fNeg, b.fLimbs, b.fNeg);
+end;
+
+class operator BigInt.+(const a: BigInt; b: Int64): BigInt;
+begin
+  result := SAddPair(a.fLimbs, a.fNeg, LFromQWord(if b >= 0 then QWord(b) else NegAbs64(b)), b < 0);
+end;
+
+class operator BigInt.+(a: Int64; const b: BigInt): BigInt;
+begin
+  result := b + a;
+end;
+
+class operator BigInt.-(const a, b: BigInt): BigInt;
+begin
+  result := SAddPair(a.fLimbs, a.fNeg, b.fLimbs, not b.fNeg);
+end;
+
+class operator BigInt.-(const a: BigInt; b: Int64): BigInt;
+begin
+  result := SAddPair(a.fLimbs, a.fNeg, LFromQWord(if b >= 0 then QWord(b) else NegAbs64(b)), b >= 0);
+end;
+
+class operator BigInt.-(a: Int64; const b: BigInt): BigInt;
+begin
+  result := SAddPair(LFromQWord(if a >= 0 then QWord(a) else NegAbs64(a)), a < 0, b.fLimbs, not b.fNeg);
+end;
+
+class operator BigInt.*(const a, b: BigInt): BigInt;
+begin
+  result := SMulPair(a.fLimbs, a.fNeg, b.fLimbs, b.fNeg);
+end;
+
+class operator BigInt.*(const a: BigInt; b: Int64): BigInt;
+begin
+  result := SMulPair(a.fLimbs, a.fNeg, LFromQWord(if b >= 0 then QWord(b) else NegAbs64(b)), b < 0);
+end;
+
+class operator BigInt.*(a: Int64; const b: BigInt): BigInt;
+begin
+  result := b * a;
+end;
+
+class operator BigInt.div(const a, b: BigInt): BigInt;
+var
+  q, r: BigInt;
+begin
+  if Length(b.fLimbs) = 0 then RaiseDivByZero;
+  SDivModPair(a.fLimbs, a.fNeg, b.fLimbs, b.fNeg, q, r);
+  result := q;
+end;
+
+class operator BigInt.div(const a: BigInt; b: Int64): BigInt;
+begin
+  result := a div BFromI64(b);
+end;
+
+class operator BigInt.mod(const a, b: BigInt): BigInt;
+var
+  q, r: BigInt;
+begin
+  if Length(b.fLimbs) = 0 then RaiseDivByZero;
+  SDivModPair(a.fLimbs, a.fNeg, b.fLimbs, b.fNeg, q, r);
+  result := r;
+end;
+
+class operator BigInt.mod(const a: BigInt; b: Int64): BigInt;
+begin
+  result := a mod BFromI64(b);
+end;
+
+class operator BigInt./(const a, b: BigInt): BigInt;
+begin
+  result := a div b;
+end;
+
+class operator BigInt.**(const a, b: BigInt): BigInt;
+var
+  m: TLimbs;
+begin
+  if b.fNeg then raise EBigIntError.Create('negative exponent for integer power');
+  if Length(b.fLimbs) = 0 then begin
+    result.fLimbs := LFromQWord(1);
+    result.fNeg := false;
+    exit;
+  end;
+  if Length(a.fLimbs) = 0 then exit(default(BigInt));
+  m := UPowQ(a.fLimbs, b.toQWord);
+  result.fLimbs := m;
+  result.fNeg := a.fNeg and (b.fLimbs[0] and 1 = 1);
+end;
+
+class operator BigInt.**(const a: BigInt; e: Int64): BigInt;
+var
+  m: TLimbs;
+begin
+  if e < 0 then raise EBigIntError.Create('negative exponent for integer power');
+  if e = 0 then begin
+    result.fLimbs := LFromQWord(1);
+    result.fNeg := false;
+    exit;
+  end;
+  if Length(a.fLimbs) = 0 then exit(default(BigInt));
+  m := UPowQ(a.fLimbs, QWord(e));
+  result.fLimbs := m;
+  result.fNeg := a.fNeg and (e and 1 = 1);
+end;
+
+class operator BigInt.inc(const a: BigInt): BigInt;
+begin
+  result := a + 1;
+end;
+
+class operator BigInt.dec(const a: BigInt): BigInt;
+begin
+  result := a - 1;
+end;
+
+class operator BigInt.-(const a: BigInt): BigInt;
+begin
+  result.fLimbs := a.fLimbs;
+  result.fNeg := (not a.fNeg) and (Length(a.fLimbs) > 0);
+end;
+
+class operator BigInt.+(const a: BigInt): BigInt;
+begin
+  result := a;
+end;
+
+class operator BigInt.shl(const a: BigInt; n: Int64): BigInt;
+var
+  m: TLimbs;
+begin
+  if n < 0 then raise ERangeError.Create('negative shift count');
+  if Length(a.fLimbs) = 0 then exit(default(BigInt));
+  if n > High(LongWord) then raise EBigIntError.Create('shift count out of range');
+  m := LShl(a.fLimbs, LongWord(n));
+  result.fLimbs := m;
+  result.fNeg := a.fNeg;
+end;
+
+class operator BigInt.shr(const a: BigInt; n: Int64): BigInt;
+var
+  m: TLimbs;
+begin
+  if n < 0 then raise ERangeError.Create('negative shift count');
+  if Length(a.fLimbs) = 0 then exit(default(BigInt));
+  if not a.fNeg then begin
+    if n > High(LongWord) then exit(default(BigInt));
+    m := LShr(a.fLimbs, LongWord(n));
+    result.fLimbs := m;
+    result.fNeg := false;
+    exit;
+  end;
+  // negative: arithmetic shift rounds toward -infinity
+  if n > High(LongWord) then begin
+    result.fLimbs := LFromQWord(1);
+    result.fNeg := true;
+    exit;
+  end;
+  m := LShr(a.fLimbs, LongWord(n));
+  if LAnyDroppedBits(a.fLimbs, LongWord(n)) then m := LAdd(m, LFromQWord(1));
+  result.fLimbs := m;
+  result.fNeg := Length(m) > 0;
+end;
+
+class operator BigInt.and(const a, b: BigInt): BigInt;
+begin
+  result := BBitOp(a, b, boAnd);
+end;
+
+class operator BigInt.or(const a, b: BigInt): BigInt;
+begin
+  result := BBitOp(a, b, boOr);
+end;
+
+class operator BigInt.xor(const a, b: BigInt): BigInt;
+begin
+  result := BBitOp(a, b, boXor);
+end;
+
+class operator BigInt.not(const a: BigInt): BigInt;
+var
+  m: TLimbs;
+begin
+  if a.fNeg then begin
+    // not(-m) = m - 1
+    m := LSub(a.fLimbs, LFromQWord(1));
+    result.fLimbs := m;
+    result.fNeg := false;
+  end else begin
+    // not(m) = -(m + 1)
+    m := LAdd(a.fLimbs, LFromQWord(1));
+    result.fLimbs := m;
+    result.fNeg := true;
+  end;
+end;
+
+class operator BigInt.=(const a, b: BigInt): boolean;
+begin
+  result := BCmp(a, b) = 0;
+end;
+
+class operator BigInt.=(const a: BigInt; b: Int64): boolean;
+begin
+  result := BCmpI64(a, b) = 0;
+end;
+
+class operator BigInt.=(a: Int64; const b: BigInt): boolean;
+begin
+  result := BCmpI64(b, a) = 0;
+end;
+
+class operator BigInt.<>(const a, b: BigInt): boolean;
+begin
+  result := BCmp(a, b) <> 0;
+end;
+
+class operator BigInt.<>(const a: BigInt; b: Int64): boolean;
+begin
+  result := BCmpI64(a, b) <> 0;
+end;
+
+class operator BigInt.<>(a: Int64; const b: BigInt): boolean;
+begin
+  result := BCmpI64(b, a) <> 0;
+end;
+
+class operator BigInt.<(const a, b: BigInt): boolean;
+begin
+  result := BCmp(a, b) < 0;
+end;
+
+class operator BigInt.<(const a: BigInt; b: Int64): boolean;
+begin
+  result := BCmpI64(a, b) < 0;
+end;
+
+class operator BigInt.<(a: Int64; const b: BigInt): boolean;
+begin
+  result := BCmpI64(b, a) > 0;
+end;
+
+class operator BigInt.<=(const a, b: BigInt): boolean;
+begin
+  result := BCmp(a, b) <= 0;
+end;
+
+class operator BigInt.<=(const a: BigInt; b: Int64): boolean;
+begin
+  result := BCmpI64(a, b) <= 0;
+end;
+
+class operator BigInt.<=(a: Int64; const b: BigInt): boolean;
+begin
+  result := BCmpI64(b, a) >= 0;
+end;
+
+class operator BigInt.>(const a, b: BigInt): boolean;
+begin
+  result := BCmp(a, b) > 0;
+end;
+
+class operator BigInt.>(const a: BigInt; b: Int64): boolean;
+begin
+  result := BCmpI64(a, b) > 0;
+end;
+
+class operator BigInt.>(a: Int64; const b: BigInt): boolean;
+begin
+  result := BCmpI64(b, a) < 0;
+end;
+
+class operator BigInt.>=(const a, b: BigInt): boolean;
+begin
+  result := BCmp(a, b) >= 0;
+end;
+
+class operator BigInt.>=(const a: BigInt; b: Int64): boolean;
+begin
+  result := BCmpI64(a, b) >= 0;
+end;
+
+class operator BigInt.>=(a: Int64; const b: BigInt): boolean;
+begin
+  result := BCmpI64(b, a) <= 0;
+end;
+
+function BigInt.toString: string;
+begin
+  result := if fNeg then '-' + LToBase(fLimbs, 10) else LToBase(fLimbs, 10);
+end;
+
+function BigInt.toString(base: integer): string;
+begin
+  if (base < 2) or (base > 36) then raise EBigIntError.Create($'invalid base {base}, expected 2..36');
+  result := if fNeg then '-' + LToBase(fLimbs, base) else LToBase(fLimbs, base);
+end;
+
+function BigInt.toHex: string;
+begin
+  result := toString(16);
+end;
+
+function BigInt.toBin: string;
+begin
+  result := toString(2);
+end;
+
+function BigInt.toOct: string;
+begin
+  result := toString(8);
+end;
+
+function BigInt.toInt64: Int64;
+begin
+  if not fitsInInt64 then raise ERangeError.Create('BigInt value does not fit in Int64');
+  var q := LToQWord(fLimbs);
+  result := if fNeg then Int64((not q) + 1) else Int64(q);
+end;
+
+function BigInt.toQWord: QWord;
+begin
+  if not fitsInQWord then raise ERangeError.Create('BigInt value does not fit in QWord');
+  result := LToQWord(fLimbs);
+end;
+
+function BigInt.toInteger: LongInt;
+begin
+  if not fitsInInteger then raise ERangeError.Create('BigInt value does not fit in Integer');
+  result := LongInt(toInt64);
+end;
+
+function BigInt.toCardinal: LongWord;
+begin
+  if not fitsInCardinal then raise ERangeError.Create('BigInt value does not fit in Cardinal');
+  result := LongWord(LToQWord(fLimbs));
+end;
+
+function BigInt.toDouble: Double;
+begin
+  result := magnitude.toDouble;
+  if fNeg then result := -result;
+end;
+
+function BigInt.toUBigInt: UBigInt;
+begin
+  if fNeg then RaiseNegativeUnsigned;
+  result.fLimbs := fLimbs;
+end;
+
+function BigInt.fitsInInt64: boolean;
+begin
+  if Length(fLimbs) > LIMBS_PER_QWORD then exit(false);
+  var q := LToQWord(fLimbs);
+  result := if fNeg then q <= QWord($8000000000000000) else q <= QWord(High(Int64));
+end;
+
+function BigInt.fitsInQWord: boolean;
+begin
+  result := (not fNeg) and (Length(fLimbs) <= LIMBS_PER_QWORD);
+end;
+
+function BigInt.fitsInInteger: boolean;
+begin
+  if Length(fLimbs) > 1 then exit(false);
+  var q := LToQWord(fLimbs);
+  result := if fNeg then q <= QWord($80000000) else q <= QWord(High(LongInt));
+end;
+
+function BigInt.fitsInCardinal: boolean;
+begin
+  result := (not fNeg) and (Length(fLimbs) <= 1) and (LToQWord(fLimbs) <= QWord(High(LongWord)));
+end;
+
+function BigInt.isZero: boolean;
+begin
+  result := Length(fLimbs) = 0;
+end;
+
+function BigInt.isOne: boolean;
+begin
+  result := (not fNeg) and (Length(fLimbs) = 1) and (fLimbs[0] = 1);
+end;
+
+function BigInt.isEven: boolean;
+begin
+  result := (Length(fLimbs) = 0) or (fLimbs[0] and 1 = 0);
+end;
+
+function BigInt.isOdd: boolean;
+begin
+  result := (Length(fLimbs) > 0) and (fLimbs[0] and 1 = 1);
+end;
+
+function BigInt.isNegative: boolean;
+begin
+  result := fNeg;
+end;
+
+function BigInt.isPositive: boolean;
+begin
+  result := (not fNeg) and (Length(fLimbs) > 0);
+end;
+
+function BigInt.isPowerOfTwo: boolean;
+begin
+  result := (not fNeg) and (LPopCount(fLimbs) = 1);
+end;
+
+function BigInt.sign: integer;
+begin
+  result := if Length(fLimbs) = 0 then 0 else if fNeg then -1 else 1;
+end;
+
+function BigInt.abs: BigInt;
+begin
+  result.fLimbs := fLimbs;
+  result.fNeg := false;
+end;
+
+function BigInt.magnitude: UBigInt;
+begin
+  result.fLimbs := fLimbs;
+end;
+
+procedure BigInt.negate;
+begin
+  if Length(fLimbs) > 0 then fNeg := not fNeg;
+end;
+
+function BigInt.bitLength: LongWord;
+begin
+  result := LBitLen(fLimbs);
+  // for negatives the minimal two's complement form of -2^k needs one bit less
+  if fNeg and (LPopCount(fLimbs) = 1) then dec(result);
+end;
+
+function BigInt.popCount: LongWord;
+begin
+  // for negatives: bits that differ from the (one) sign bit, like Java bitCount
+  result := if fNeg then LPopCount(LSub(fLimbs, LFromQWord(1))) else LPopCount(fLimbs);
+end;
+
+function BigInt.lowestSetBit: Int64;
+begin
+  // two's complement negation keeps the lowest set bit in place
+  for var i := 0 to Length(fLimbs) - 1 do
+    if fLimbs[i] <> 0 then exit(Int64(i) * LIMB_BITS + LimbBsf(fLimbs[i]));
+  result := -1;
+end;
+
+function BigInt.testBit(i: LongWord): boolean;
+begin
+  if not fNeg then exit(LTestBit(fLimbs, i));
+  var v := TCLimbAt(fLimbs, true, LLowestNZ(fLimbs), SizeInt(i shr LIMB_SHIFT));
+  result := (v shr (i and LIMB_MASK)) and 1 <> 0;
+end;
+
+procedure BigInt.setBit(i: LongWord);
+begin
+  if not fNeg then begin
+    var limb := SizeInt(i shr LIMB_SHIFT);
+    SetLength(fLimbs, MaxS(Length(fLimbs), limb + 1)); // also un-shares the array
+    fLimbs[limb] := fLimbs[limb] or (TLimb(1) shl (i and LIMB_MASK));
+  end else self := self or (BigInt(1) shl i);
+end;
+
+procedure BigInt.clearBit(i: LongWord);
+begin
+  if not fNeg then begin
+    var limb := SizeInt(i shr LIMB_SHIFT);
+    if limb >= Length(fLimbs) then exit;
+    SetLength(fLimbs, Length(fLimbs));
+    fLimbs[limb] := fLimbs[limb] and not (TLimb(1) shl (i and LIMB_MASK));
+    LNorm(fLimbs);
+  end else self := self and not (BigInt(1) shl i);
+end;
+
+procedure BigInt.flipBit(i: LongWord);
+begin
+  if not fNeg then begin
+    var limb := SizeInt(i shr LIMB_SHIFT);
+    SetLength(fLimbs, MaxS(Length(fLimbs), limb + 1));
+    fLimbs[limb] := fLimbs[limb] xor (TLimb(1) shl (i and LIMB_MASK));
+    LNorm(fLimbs);
+  end else self := self xor (BigInt(1) shl i);
+end;
+
+function BigInt.getBitProp(i: LongWord): boolean;
+begin
+  result := testBit(i);
+end;
+
+procedure BigInt.putBitProp(i: LongWord; v: boolean);
+begin
+  if v then setBit(i) else clearBit(i);
+end;
+
+function BigInt.compare(const other: BigInt): integer;
+begin
+  result := BCmp(self, other);
+end;
+
+function BigInt.equals(const other: BigInt): boolean;
+begin
+  result := BCmp(self, other) = 0;
+end;
+
+function BigInt.min(const other: BigInt): BigInt;
+begin
+  result := if BCmp(self, other) <= 0 then self else other;
+end;
+
+function BigInt.max(const other: BigInt): BigInt;
+begin
+  result := if BCmp(self, other) >= 0 then self else other;
+end;
+
+function BigInt.divMod(const d: BigInt): (q, r: BigInt);
+var
+  qq, rr: BigInt;
+begin
+  if Length(d.fLimbs) = 0 then RaiseDivByZero;
+  SDivModPair(fLimbs, fNeg, d.fLimbs, d.fNeg, qq, rr);
+  exit(qq, rr);
+end;
+
+function BigInt.floorDiv(const d: BigInt): BigInt;
+begin
+  var (q, r) := divMod(d);
+  result := if r.isZero or (fNeg = d.fNeg) then q else q - 1;
+end;
+
+function BigInt.floorMod(const d: BigInt): BigInt;
+begin
+  var (q, r) := divMod(d);
+  result := if r.isZero or (fNeg = d.fNeg) then r else r + d;
+end;
+
+function BigInt.ceilDiv(const d: BigInt): BigInt;
+begin
+  var (q, r) := divMod(d);
+  result := if r.isZero or (fNeg <> d.fNeg) then q else q + 1;
+end;
+
+procedure BigInt.swap(var other: BigInt);
+begin
+  SwapValues(fLimbs, other.fLimbs);
+  SwapValues(fNeg, other.fNeg);
+end;
+
+class function BigInt.parse(const s: string): BigInt;
+begin
+  if not tryParse(s, result) then RaiseParseError(s);
+end;
+
+class function BigInt.parse(const s: string; base: integer): BigInt;
+begin
+  if not tryParse(s, base, result) then RaiseParseError(s);
+end;
+
+class function BigInt.tryParse(const s: string; out v: BigInt): boolean;
+var
+  neg: boolean;
+begin
+  result := TryParseLimbs(s, 0, v.fLimbs, neg);
+  v.fNeg := result and neg and (Length(v.fLimbs) <> 0);
+end;
+
+class function BigInt.tryParse(const s: string; base: integer; out v: BigInt): boolean;
+var
+  neg: boolean;
+begin
+  if (base < 2) or (base > 36) then raise EBigIntError.Create($'invalid base {base}, expected 2..36');
+  result := TryParseLimbs(s, base, v.fLimbs, neg);
+  v.fNeg := result and neg and (Length(v.fLimbs) <> 0);
+end;
+
+function TUBigIntBridge.toBigInt: BigInt;
+begin
+  result.fLimbs := fLimbs;
+  result.fNeg := false;
+end;
+
+function BigInt.toBytesLE: TBytes;
+var
+  res: TBytes;
+begin
+  // minimal two's complement including the sign bit
+  var n := SizeInt(bitLength div 8) + 1;
+  SetLength(res, n);
+  var low := LLowestNZ(fLimbs);
+  for var i := 0 to n - 1 do res[i] := byte(TCLimbAt(fLimbs, fNeg, low, i shr BYTES_SHIFT) shr ((i and BYTES_MASK) * 8));
+  result := res;
+end;
+
+function BigInt.toBytesBE: TBytes;
+begin
+  result := toBytesLE;
+  for var i := 0 to (Length(result) shr 1) - 1 do SwapValues(result[i], result[High(result) - i]);
+end;
+
+class function BigInt.fromBytesLE(const bytes: TBytes): BigInt;
+var
+  res: TLimbs;
+begin
+  var n := Length(bytes);
+  if n = 0 then exit(default(BigInt));
+  var neg := bytes[n - 1] >= $80;
+  var limbCount := (n + BYTES_MASK) shr BYTES_SHIFT;
+  SetLength(res, limbCount);
+  // sign-extend the incomplete top limb (a full top limb gets all its bytes)
+  if neg and (n and BYTES_MASK <> 0) then res[limbCount - 1] := High(TLimb) shl ((n and BYTES_MASK) * 8);
+  for var i := 0 to n - 1 do res[i shr BYTES_SHIFT] := res[i shr BYTES_SHIFT] or (TLimb(bytes[i]) shl ((i and BYTES_MASK) * 8));
+  if neg then LTCNegateInPlace(res);
+  LNorm(res);
+  result.fLimbs := res;
+  result.fNeg := neg and (Length(res) > 0);
+end;
+
+class function BigInt.fromBytesBE(const bytes: TBytes): BigInt;
+var
+  tmp: TBytes;
+begin
+  tmp := Copy(bytes);
+  for var i := 0 to (Length(tmp) shr 1) - 1 do SwapValues(tmp[i], tmp[High(tmp) - i]);
+  result := fromBytesLE(tmp);
+end;
+
+function BigInt.digitCount: LongWord;
+begin
+  result := LongWord(Length(LToBase(fLimbs, 10)));
+end;
+
+function BigInt.toStringGrouped(sep: char; groupSize: integer): string;
+begin
+  result := GroupDigits(toString, sep, groupSize);
+end;
+
+function BigInt.hashCode: DWord;
+begin
+  result := magnitude.hashCode;
+  if fNeg then result := not result;
+end;
+
+class function BigInt.zero: BigInt;
+begin
+  result := default(BigInt);
+end;
+
+class function BigInt.one: BigInt;
+begin
+  result.fLimbs := LFromQWord(1);
+  result.fNeg := false;
+end;
+
+class function BigInt.two: BigInt;
+begin
+  result.fLimbs := LFromQWord(2);
+  result.fNeg := false;
+end;
+
+class function BigInt.ten: BigInt;
+begin
+  result.fLimbs := LFromQWord(10);
+  result.fNeg := false;
+end;
+
+class function BigInt.minusOne: BigInt;
+begin
+  result.fLimbs := LFromQWord(1);
+  result.fNeg := true;
+end;
+
+class function BigInt.pow2(n: LongWord): BigInt;
+begin
+  result.fLimbs := LShl(LFromQWord(1), n);
+  result.fNeg := false;
 end;
 
 {$ifdef BIGINT_ASM}
