@@ -178,9 +178,16 @@ type
     function modInverse(const m: UBigInt): UBigInt;
     function gcd(const other: UBigInt): UBigInt;
     function lcm(const other: UBigInt): UBigInt;
+    // extras: number theory
+    function jacobi(const n: UBigInt): integer;
+    function modSqrt(const p: UBigInt): UBigInt;
+    function isPerfectSquare: boolean;
+    function sqrtRem: (root, rem: UBigInt);
+    function factorize: array of (p: UBigInt; e: LongWord);
     // primes (Miller-Rabin; deterministic witnesses below 3.3e24, then random rounds)
     function isProbablePrime(rounds: integer = 24): boolean;
     function nextPrime: UBigInt;
+    function prevPrime: UBigInt;
     // bytes, little/big endian magnitude; zero gives an empty array
     function toBytesLE: TBytes;
     function toBytesBE: TBytes;
@@ -199,8 +206,13 @@ type
     class function random(bits: LongWord): UBigInt; static;
     class function randomBelow(const bound: UBigInt): UBigInt; static;
     class function randomRange(const lo, hi: UBigInt): UBigInt; static;
+    class function randomPrime(bits: LongWord; rounds: integer = 24): UBigInt; static;
     class function factorial(n: LongWord): UBigInt; static;
     class function fibonacci(n: LongWord): UBigInt; static;
+    class function lucas(n: LongWord): UBigInt; static;
+    class function binomial(n, k: LongWord): UBigInt; static;
+    class function catalan(n: LongWord): UBigInt; static;
+    class function primorial(n: LongWord): UBigInt; static;
   end;
 
   { BigInt - signed arbitrary precision integer, sign-magnitude storage;
@@ -350,9 +362,17 @@ type
     function modInverse(const m: BigInt): BigInt;
     function gcd(const other: BigInt): BigInt;
     function lcm(const other: BigInt): BigInt;
+    // extras: number theory (factorize works on the absolute value)
+    function gcdExt(const other: BigInt): (g, x, y: BigInt);
+    function jacobi(const n: BigInt): integer;
+    function modSqrt(const p: BigInt): BigInt;
+    function isPerfectSquare: boolean;
+    function sqrtRem: (root, rem: BigInt);
+    function factorize: array of (p: BigInt; e: LongWord);
     // primes: negative values are never prime, nextPrime returns the first prime > self
     function isProbablePrime(rounds: integer = 24): boolean;
     function nextPrime: BigInt;
+    function prevPrime: BigInt;
     // bytes: minimal two's complement with sign bit, like Java toByteArray
     function toBytesLE: TBytes;
     function toBytesBE: TBytes;
@@ -372,8 +392,15 @@ type
     class function random(bits: LongWord): BigInt; static;
     class function randomBelow(const bound: BigInt): BigInt; static;
     class function randomRange(const lo, hi: BigInt): BigInt; static;
+    class function randomPrime(bits: LongWord; rounds: integer = 24): BigInt; static;
+    // Chinese remainder theorem for pairwise coprime positive moduli
+    class function crt(const remainders, moduli: array of BigInt): BigInt; static;
     class function factorial(n: LongWord): BigInt; static;
     class function fibonacci(n: LongWord): BigInt; static;
+    class function lucas(n: LongWord): BigInt; static;
+    class function binomial(n, k: LongWord): BigInt; static;
+    class function catalan(n: LongWord): BigInt; static;
+    class function primorial(n: LongWord): BigInt; static;
   end;
 
   // declared after both records so UBigInt can offer a BigInt-returning method
@@ -2843,6 +2870,209 @@ begin
   result := c;
 end;
 
+function UBigInt.prevPrime: UBigInt;
+begin
+  if self <= 2 then raise EBigIntError.Create('no prime below 2');
+  if self = 3 then exit(UBigInt(2));
+  var c := self - 1;
+  if c.isEven then c := c - 1;
+  while not c.isProbablePrime do c := c - 2;
+  result := c;
+end;
+
+// Jacobi symbol (a/m) for odd positive m
+function UJacobi(a, m: UBigInt): integer;
+begin
+  a := a mod m;
+  result := 1;
+  while not a.isZero do begin
+    var z := a.lowestSetBit;
+    if z and 1 = 1 then begin
+      // (2/m) = -1 exactly for m = 3, 5 (mod 8)
+      var m8 := m.fLimbs[0] and 7;
+      if (m8 = 3) or (m8 = 5) then result := -result;
+    end;
+    a := a shr z;
+    // both odd here: quadratic reciprocity
+    if (a.fLimbs[0] and 3 = 3) and (m.fLimbs[0] and 3 = 3) then result := -result;
+    a.swap(m);
+    a := a mod m;
+  end;
+  if not m.isOne then result := 0;
+end;
+
+function UBigInt.jacobi(const n: UBigInt): integer;
+begin
+  if not n.isOdd then raise EBigIntError.Create('jacobi symbol needs an odd positive modulus');
+  result := UJacobi(self, n);
+end;
+
+function UBigInt.modSqrt(const p: UBigInt): UBigInt;
+begin
+  if p.isZero then RaiseDivByZero;
+  if p = 2 then exit(if isOdd then UBigInt.one else default(UBigInt));
+  if not p.isOdd then raise EBigIntError.Create('modSqrt needs an odd prime modulus');
+  var a := self mod p;
+  if a.isZero then exit(default(UBigInt));
+  if UJacobi(a, p) <> 1 then raise EBigIntError.Create('value has no square root for this modulus');
+  // p = 3 (mod 4): a^((p+1)/4) is a root directly
+  if p.fLimbs[0] and 3 = 3 then exit(a.modPow((p + 1) shr 2, p));
+  // Tonelli-Shanks for p = 1 (mod 4)
+  var q := p - 1;
+  var s := q.lowestSetBit;
+  q := q shr s;
+  var z := UBigInt.two;
+  while UJacobi(z, p) <> -1 do z := z + 1;
+  var m := s;
+  var c := z.modPow(q, p);
+  var t := a.modPow(q, p);
+  result := a.modPow((q + 1) shr 1, p);
+  while not t.isOne do begin
+    // least i with t^(2^i) = 1
+    var i: Int64 := 0;
+    var t2 := t;
+    while not t2.isOne do begin
+      t2 := t2.sqr mod p;
+      inc(i);
+      if i = m then raise EBigIntError.Create('modSqrt needs a prime modulus');
+    end;
+    var b := c;
+    for var j := 1 to m - i - 1 do b := b.sqr mod p;
+    m := i;
+    c := b.sqr mod p;
+    t := (t * c) mod p;
+    result := (result * b) mod p;
+  end;
+end;
+
+function UBigInt.sqrtRem: (root, rem: UBigInt);
+begin
+  var r := sqrt;
+  exit(r, self - r.sqr);
+end;
+
+function UBigInt.isPerfectSquare: boolean;
+begin
+  if isZero then exit(true);
+  // squares are 0, 1, 4 or 9 mod 16
+  if not (byte(fLimbs[0] and 15) in [0, 1, 4, 9]) then exit(false);
+  var (_, rem) := sqrtRem;
+  result := rem.isZero;
+end;
+
+// Brent's cycle variant of Pollard rho: a nontrivial factor of an odd
+// composite n; expected runtime grows with the square root of the smallest
+// prime factor, so hard semiprimes take long
+function UPollardBrent(const n: UBigInt): UBigInt;
+begin
+  repeat
+    var y := UBigInt.randomBelow(n - 3) + 2;
+    var c := UBigInt.randomBelow(n - 3) + 1;
+    var g := UBigInt.one;
+    var q := UBigInt.one;
+    var x := y;
+    var ys := y;
+    var r: Int64 := 1;
+    while g.isOne do begin
+      x := y;
+      for var i := 1 to r do y := (y.sqr + c) mod n;
+      var k: Int64 := 0;
+      while (k < r) and g.isOne do begin
+        ys := y;
+        for var i := 1 to MinS(128, SizeInt(r - k)) do begin
+          y := (y.sqr + c) mod n;
+          q := (q * (if x > y then x - y else y - x)) mod n;
+        end;
+        g := q.gcd(n);
+        k := k + 128;
+      end;
+      r := r * 2;
+    end;
+    if g = n then begin
+      // the batch overshot: replay one step at a time
+      repeat
+        ys := (ys.sqr + c) mod n;
+        var d := if x > ys then x - ys else ys - x;
+        g := d.gcd(n);
+      until not g.isOne;
+    end;
+    if g <> n then exit(g);
+  until false;
+end;
+
+function UBigInt.factorize: array of (p: UBigInt; e: LongWord);
+var
+  factors: array of UBigInt;
+  res: array of (p: UBigInt; e: LongWord);
+
+  procedure push(const f: UBigInt);
+  begin
+    SetLength(factors, Length(factors) + 1);
+    factors[High(factors)] := f;
+  end;
+
+  procedure split(const v: UBigInt);
+  begin
+    if v.isOne then exit;
+    if v.isProbablePrime then begin
+      push(v);
+      exit;
+    end;
+    var f := UPollardBrent(v);
+    split(f);
+    split(v div f);
+  end;
+
+begin
+  var n := self;
+  if n <= 1 then exit(nil);
+  // powers of two straight from the bit count
+  var z := n.lowestSetBit;
+  if z > 0 then begin
+    SetLength(res, 1);
+    res[0] := (UBigInt.two, LongWord(z));
+    n := n shr z;
+  end;
+  // small trial division
+  var d: Int64 := 3;
+  while (d <= 9999) and (n > 1) do begin
+    if n < d * d then break;
+    var cnt: LongWord := 0;
+    while (n mod d).isZero do begin
+      n := n div d;
+      inc(cnt);
+    end;
+    if cnt > 0 then begin
+      SetLength(res, Length(res) + 1);
+      res[High(res)] := (UBigInt(d), cnt);
+    end;
+    inc(d, 2);
+  end;
+  if n > 1 then begin
+    if n < d * d then push(n) // a cofactor below the trial bound squared is prime
+    else split(n);
+    // sort the collected factors, then merge equal ones
+    for var i := 1 to High(factors) do begin
+      var f := factors[i];
+      var j := i - 1;
+      while (j >= 0) and (factors[j] > f) do begin
+        factors[j + 1] := factors[j];
+        dec(j);
+      end;
+      factors[j + 1] := f;
+    end;
+    var i := 0;
+    while i <= High(factors) do begin
+      var cnt: LongWord := 1;
+      while (i + SizeInt(cnt) <= High(factors)) and (factors[i + SizeInt(cnt)] = factors[i]) do inc(cnt);
+      SetLength(res, Length(res) + 1);
+      res[High(res)] := (factors[i], cnt);
+      i := i + SizeInt(cnt);
+    end;
+  end;
+  result := res;
+end;
+
 function UBigInt.toBytesLE: TBytes;
 var
   res: TBytes;
@@ -3105,6 +3335,18 @@ begin
   result := lo + randomBelow(hi - lo + 1);
 end;
 
+class function UBigInt.randomPrime(bits: LongWord; rounds: integer): UBigInt;
+begin
+  if bits < 2 then raise EBigIntError.Create('randomPrime needs at least 2 bits');
+  if bits = 2 then exit(UBigInt(2) + randomBelow(UBigInt(2)));
+  repeat
+    // exact bit count: top bit set, odd
+    result := random(bits);
+    result.setBit(bits - 1);
+    result.setBit(0);
+  until result.isProbablePrime(rounds);
+end;
+
 // balanced product of lo..hi, far fewer big*big multiplications than a plain loop
 function UProdRange(lo, hi: LongWord): UBigInt;
 begin
@@ -3150,6 +3392,82 @@ var
 begin
   UFibPair(n, result, f1);
 end;
+
+class function UBigInt.lucas(n: LongWord): UBigInt;
+var
+  fn, fn1: UBigInt;
+begin
+  // L(n) = 2F(n+1) - F(n)
+  UFibPair(n, fn, fn1);
+  result := (fn1 shl 1) - fn;
+end;
+
+class function UBigInt.binomial(n, k: LongWord): UBigInt;
+begin
+  if k > n then exit(default(UBigInt));
+  if k > n - k then k := n - k;
+  // multiplicative form; every intermediate division is exact
+  result := UBigInt.one;
+  for var i := 1 to k do begin
+    result := result * Int64(n - k + i);
+    result := result div Int64(i);
+  end;
+end;
+
+class function UBigInt.catalan(n: LongWord): UBigInt;
+begin
+  if n > High(LongWord) div 2 then raise EBigIntError.Create('catalan argument out of range');
+  result := binomial(2 * n, n) div Int64(n + 1);
+end;
+
+// balanced product of a prime list slice
+function UProdPrimes(const primes: array of LongWord; lo, hi: SizeInt): UBigInt;
+begin
+  if hi - lo < 8 then begin
+    result := QWord(primes[lo]);
+    for var i := lo + 1 to hi do result := result * Int64(primes[i]);
+    exit;
+  end;
+  var mid := lo + (hi - lo) shr 1;
+  result := UProdPrimes(primes, lo, mid) * UProdPrimes(primes, mid + 1, hi);
+end;
+
+class function UBigInt.primorial(n: LongWord): UBigInt;
+var
+  comp: array of boolean;
+  primes: array of LongWord;
+begin
+  if n < 2 then exit(UBigInt.one);
+  // sieve over odd numbers: index i stands for 2i+1
+  var half := SizeInt((n - 1) div 2);
+  SetLength(comp, half + 1);
+  var i: SizeInt := 1;
+  repeat
+    var p := QWord(2 * i + 1);
+    if p * p > n then break;
+    if not comp[i] then begin
+      var j := SizeInt((p * p - 1) div 2);
+      while j <= half do begin
+        comp[j] := true;
+        inc(j, SizeInt(p));
+      end;
+    end;
+    inc(i);
+  until false;
+  var cnt: SizeInt := 1; // the prime 2
+  for var k := 1 to half do
+    if not comp[k] then inc(cnt);
+  SetLength(primes, cnt);
+  primes[0] := 2;
+  var idx: SizeInt := 1;
+  for var k := 1 to half do
+    if not comp[k] then begin
+      primes[idx] := LongWord(2 * k + 1);
+      inc(idx);
+    end;
+  result := UProdPrimes(primes, 0, cnt - 1);
+end;
+
 
 // ---------------------------------------------------------------------------
 // BigInt
@@ -4037,6 +4355,70 @@ begin
   result := magnitude.nextPrime.toBigInt;
 end;
 
+function BigInt.prevPrime: BigInt;
+begin
+  if self <= 2 then raise EBigIntError.Create('no prime below 2');
+  result := magnitude.prevPrime.toBigInt;
+end;
+
+function BigInt.gcdExt(const other: BigInt): (g, x, y: BigInt);
+begin
+  // extended Euclid: g = self*x + other*y with g >= 0
+  var oldR := self;
+  var r := other;
+  var oldS := BigInt.one;
+  var s := BigInt.zero;
+  var oldT := BigInt.zero;
+  var t := BigInt.one;
+  while not r.isZero do begin
+    var (q, rem) := oldR.divMod(r);
+    oldR := r;
+    r := rem;
+    (oldS, s) := (s, oldS - q * s);
+    (oldT, t) := (t, oldT - q * t);
+  end;
+  if oldR.isNegative then begin
+    oldR.negate;
+    oldS.negate;
+    oldT.negate;
+  end;
+  exit(oldR, oldS, oldT);
+end;
+
+function BigInt.jacobi(const n: BigInt): integer;
+begin
+  if n.fNeg or not n.isOdd then raise EBigIntError.Create('jacobi symbol needs an odd positive modulus');
+  result := UJacobi(floorMod(n).toUBigInt, n.magnitude);
+end;
+
+function BigInt.modSqrt(const p: BigInt): BigInt;
+begin
+  if p.sign <= 0 then raise EBigIntError.Create('modulus must be positive');
+  result := floorMod(p).toUBigInt.modSqrt(p.toUBigInt).toBigInt;
+end;
+
+function BigInt.sqrtRem: (root, rem: BigInt);
+begin
+  if fNeg then raise EBigIntError.Create('square root of a negative value');
+  var (r, m) := magnitude.sqrtRem;
+  exit(r.toBigInt, m.toBigInt);
+end;
+
+function BigInt.isPerfectSquare: boolean;
+begin
+  result := (not fNeg) and magnitude.isPerfectSquare;
+end;
+
+function BigInt.factorize: array of (p: BigInt; e: LongWord);
+var
+  res: array of (p: BigInt; e: LongWord);
+begin
+  var uf := magnitude.factorize;
+  SetLength(res, Length(uf));
+  for var i := 0 to High(uf) do res[i] := (uf[i].p.toBigInt, uf[i].e);
+  result := res;
+end;
+
 function BigInt.toBytesLE: TBytes;
 var
   res: TBytes;
@@ -4150,6 +4532,28 @@ begin
   result := lo + UBigInt.randomBelow((hi - lo + 1).toUBigInt).toBigInt;
 end;
 
+class function BigInt.randomPrime(bits: LongWord; rounds: integer): BigInt;
+begin
+  result := UBigInt.randomPrime(bits, rounds).toBigInt;
+end;
+
+class function BigInt.crt(const remainders, moduli: array of BigInt): BigInt;
+begin
+  if Length(remainders) <> Length(moduli) then raise EBigIntError.Create('crt needs one remainder per modulus');
+  if Length(moduli) = 0 then exit(default(BigInt));
+  var m := moduli[0];
+  if m.sign <= 0 then raise EBigIntError.Create('crt moduli must be positive');
+  var x := remainders[0].floorMod(m);
+  for var i := 1 to High(moduli) do begin
+    if moduli[i].sign <= 0 then raise EBigIntError.Create('crt moduli must be positive');
+    // solve x + m*k = r_i (mod m_i); non-coprime moduli fail in modInverse
+    var k := ((remainders[i] - x) * m.modInverse(moduli[i])).floorMod(moduli[i]);
+    x := x + m * k;
+    m := m * moduli[i];
+  end;
+  result := x;
+end;
+
 class function BigInt.factorial(n: LongWord): BigInt;
 begin
   result := UBigInt.factorial(n).toBigInt;
@@ -4158,6 +4562,26 @@ end;
 class function BigInt.fibonacci(n: LongWord): BigInt;
 begin
   result := UBigInt.fibonacci(n).toBigInt;
+end;
+
+class function BigInt.lucas(n: LongWord): BigInt;
+begin
+  result := UBigInt.lucas(n).toBigInt;
+end;
+
+class function BigInt.binomial(n, k: LongWord): BigInt;
+begin
+  result := UBigInt.binomial(n, k).toBigInt;
+end;
+
+class function BigInt.catalan(n: LongWord): BigInt;
+begin
+  result := UBigInt.catalan(n).toBigInt;
+end;
+
+class function BigInt.primorial(n: LongWord): BigInt;
+begin
+  result := UBigInt.primorial(n).toBigInt;
 end;
 
 {$ifdef BIGINT_ASM}
