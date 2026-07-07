@@ -36,6 +36,10 @@ type
   // parse errors raise EConvertError - same classes plain integers use)
   EBigIntError = class(Exception);
 
+  // generator behind random/randomBelow/randomRange/randomPrime; rngSystem is
+  // the RandSeed-driven System.Random stream, rngOS reads OS entropy per call
+  TBigIntRngAlgo = (rngXoshiro256ss, rngPcg64, rngSplitMix64, rngSystem, rngOS);
+
   // internal storage: little-endian array of limbs (64-bit on x86_64, 32-bit
   // elsewhere), highest limb nonzero, nil = 0
   {$ifdef BIGINT_ASM}
@@ -180,6 +184,9 @@ type
     class function two: UBigInt; static;
     class function ten: UBigInt; static;
     class function pow2(n: LongWord): UBigInt; static;
+    class function random(bits: LongWord): UBigInt; static;
+    class function randomBelow(const bound: UBigInt): UBigInt; static;
+    class function randomRange(const lo, hi: UBigInt): UBigInt; static;
   end;
 
   { BigInt - signed arbitrary precision integer, sign-magnitude storage;
@@ -334,6 +341,9 @@ type
     class function ten: BigInt; static;
     class function minusOne: BigInt; static;
     class function pow2(n: LongWord): BigInt; static;
+    class function random(bits: LongWord): BigInt; static;
+    class function randomBelow(const bound: BigInt): BigInt; static;
+    class function randomRange(const lo, hi: BigInt): BigInt; static;
   end;
 
   // declared after both records so UBigInt can offer a BigInt-returning method
@@ -349,6 +359,14 @@ var
   // limb count above which balanced multiplication and squaring switch from
   // Karatsuba to Toom-3; exposed for tuning and testing
   BigIntToom3Threshold: integer = 200;
+
+  // generator used by random/randomBelow/randomRange/randomPrime
+  BigIntRngAlgo: TBigIntRngAlgo = rngXoshiro256ss;
+
+// deterministic seeding of every generator (also sets RandSeed for rngSystem)
+procedure BigIntRandomSeed(seed: QWord);
+// seed all generators from OS entropy
+procedure BigIntRandomize;
 
 implementation
 
@@ -2606,6 +2624,179 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
+// random generators
+// ---------------------------------------------------------------------------
+
+var
+  // deterministic nonzero defaults, so unseeded runs reproduce (like RandSeed = 0)
+  xoshiroState: array[4] of QWord = ($01D353E5F3993BB0, $7B9C0DF6CB193B20, QWord($FDFCAA91110765B6), $2D24CBE0D19C4C17);
+  pcgHi: QWord = $0DA3E39CB94B95BB;
+  pcgLo: QWord = QWord($853C49E6748FEA9B);
+  splitmixState: QWord = QWord($9E3779B97F4A7C15);
+
+function SplitMix64(var s: QWord): QWord;
+begin
+  s := s + QWord($9E3779B97F4A7C15);
+  var z := s;
+  z := (z xor (z shr 30)) * QWord($BF58476D1CE4E5B9);
+  z := (z xor (z shr 27)) * QWord($94D049BB133111EB);
+  result := z xor (z shr 31);
+end;
+
+function RotL64(x: QWord; k: integer): QWord; inline;
+begin
+  result := (x shl k) or (x shr (64 - k));
+end;
+
+// xoshiro256** by Blackman/Vigna
+function XoshiroNext: QWord;
+begin
+  result := RotL64(xoshiroState[1] * 5, 7) * 9;
+  var t := xoshiroState[1] shl 17;
+  xoshiroState[2] := xoshiroState[2] xor xoshiroState[0];
+  xoshiroState[3] := xoshiroState[3] xor xoshiroState[1];
+  xoshiroState[1] := xoshiroState[1] xor xoshiroState[2];
+  xoshiroState[0] := xoshiroState[0] xor xoshiroState[3];
+  xoshiroState[2] := xoshiroState[2] xor t;
+  xoshiroState[3] := RotL64(xoshiroState[3], 45);
+end;
+
+// portable 64x64 -> 128 product (independent of the limb width)
+procedure Mul64x64(a, b: QWord; out hi, lo: QWord);
+begin
+  var a0 := a and $FFFFFFFF;
+  var a1 := a shr 32;
+  var b0 := b and $FFFFFFFF;
+  var b1 := b shr 32;
+  var p00 := a0 * b0;
+  var p10 := a1 * b0 + (p00 shr 32);
+  var p01 := a0 * b1 + (p10 and $FFFFFFFF);
+  hi := a1 * b1 + (p10 shr 32) + (p01 shr 32);
+  lo := (p01 shl 32) or (p00 and $FFFFFFFF);
+end;
+
+// PCG XSL-RR 128/64 with the reference multiplier and stream
+function PcgNext: QWord;
+const
+  mHi = QWord($2360ED051FC65DA4);
+  mLo = QWord($4385DF649FCCF645);
+  aHi = QWord($5851F42D4C957F2D);
+  aLo = QWord($14057B7EF767814F);
+begin
+  var oldHi := pcgHi;
+  var oldLo := pcgLo;
+  // 128-bit state * mult + inc
+  var hi, lo: QWord;
+  Mul64x64(oldLo, mLo, hi, lo);
+  hi := hi + oldHi * mLo + oldLo * mHi;
+  var newLo := lo + aLo;
+  if newLo < lo then inc(hi);
+  pcgHi := hi + aHi;
+  pcgLo := newLo;
+  // output from the pre-advance state
+  var rot := integer(oldHi shr 58);
+  var x := oldHi xor oldLo;
+  result := (x shr rot) or (x shl ((64 - rot) and 63));
+end;
+
+{$ifdef windows}
+// RtlGenRandom, the loader-light OS entropy source
+function SystemFunction036(buffer: Pointer; len: LongWord): ByteBool; stdcall; external 'advapi32' name 'SystemFunction036';
+{$endif}
+
+procedure OsEntropy(buf: PByte; len: SizeInt);
+begin
+  {$ifdef windows}
+  if SystemFunction036(buf, LongWord(len)) then exit;
+  {$else}
+  var h := FileOpen('/dev/urandom', fmOpenRead);
+  if h <> THandle(-1) then begin
+    var got := FileRead(h, buf^, len);
+    FileClose(h);
+    if got = len then exit;
+  end;
+  {$endif}
+  // last-resort fallback: time-mixed splitmix stream
+  var s := QWord(GetTickCount64) xor (QWord(PtrUInt(buf)) shl 24);
+  for var i := 0 to len - 1 do buf[i] := byte(SplitMix64(s) shr 13);
+end;
+
+function OsEntropy64: QWord;
+begin
+  OsEntropy(@result, SizeOf(result));
+end;
+
+procedure BigIntRandomSeed(seed: QWord);
+begin
+  splitmixState := seed;
+  var s := seed;
+  for var i := 0 to 3 do xoshiroState[i] := SplitMix64(s);
+  // xoshiro must never sit in the all-zero state
+  if (xoshiroState[0] or xoshiroState[1] or xoshiroState[2] or xoshiroState[3]) = 0 then xoshiroState[0] := QWord($9E3779B97F4A7C15);
+  pcgLo := SplitMix64(s);
+  pcgHi := SplitMix64(s);
+  RandSeed := LongInt(seed xor (seed shr 32));
+end;
+
+procedure BigIntRandomize;
+begin
+  BigIntRandomSeed(OsEntropy64);
+end;
+
+function RngNext64: QWord;
+begin
+  result := case BigIntRngAlgo of
+    rngPcg64: PcgNext;
+    rngSplitMix64: SplitMix64(splitmixState);
+    rngOS: OsEntropy64;
+  else XoshiroNext;
+end;
+
+// one limb of bits from the selected generator
+function RandomLimb: TLimb;
+begin
+  if BigIntRngAlgo = rngSystem then begin
+    // the historical System.Random layout: 16-bit pieces, low half first
+    result := (TLimb(System.Random($10000)) shl 16) or TLimb(System.Random($10000));
+    {$if LIMB_BITS = 64}
+    result := result or (((TLimb(System.Random($10000)) shl 16) or TLimb(System.Random($10000))) shl 32);
+    {$endif}
+    exit;
+  end;
+  result := TLimb(RngNext64);
+end;
+
+class function UBigInt.random(bits: LongWord): UBigInt;
+var
+  res: TLimbs;
+begin
+  if bits = 0 then exit(default(UBigInt));
+  var n := SizeInt((QWord(bits) + LIMB_MASK) shr LIMB_SHIFT);
+  SetLength(res, n);
+  for var i := 0 to n - 1 do res[i] := RandomLimb;
+  var top := bits and LIMB_MASK;
+  if top <> 0 then res[n - 1] := res[n - 1] and (High(TLimb) shr (LIMB_BITS - top));
+  LNorm(res);
+  result.fLimbs := res;
+end;
+
+class function UBigInt.randomBelow(const bound: UBigInt): UBigInt;
+begin
+  if bound.isZero then raise EBigIntError.Create('randomBelow needs a positive bound');
+  // rejection sampling: below two expected draws
+  var bits := bound.bitLength;
+  repeat
+    result := random(bits);
+  until result < bound;
+end;
+
+class function UBigInt.randomRange(const lo, hi: UBigInt): UBigInt;
+begin
+  if lo > hi then raise EBigIntError.Create('randomRange needs lo <= hi');
+  result := lo + randomBelow(hi - lo + 1);
+end;
+
+// ---------------------------------------------------------------------------
 // BigInt
 // ---------------------------------------------------------------------------
 
@@ -3524,6 +3715,23 @@ class function BigInt.pow2(n: LongWord): BigInt;
 begin
   result.fLimbs := LShl(LFromQWord(1), n);
   result.fNeg := false;
+end;
+
+class function BigInt.random(bits: LongWord): BigInt;
+begin
+  result := UBigInt.random(bits).toBigInt;
+end;
+
+class function BigInt.randomBelow(const bound: BigInt): BigInt;
+begin
+  if bound.sign <= 0 then raise EBigIntError.Create('randomBelow needs a positive bound');
+  result := UBigInt.randomBelow(bound.toUBigInt).toBigInt;
+end;
+
+class function BigInt.randomRange(const lo, hi: BigInt): BigInt;
+begin
+  if lo > hi then raise EBigIntError.Create('randomRange needs lo <= hi');
+  result := lo + UBigInt.randomBelow((hi - lo + 1).toUBigInt).toBigInt;
 end;
 
 {$ifdef BIGINT_ASM}
