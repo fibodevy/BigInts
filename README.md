@@ -145,7 +145,7 @@ The backend behind `random` and friends is selected with the `BigIntRngAlgo` var
 | `rngSystem` | the historical `RandSeed`-driven `System.Random` stream |
 | `rngOS` | fresh OS entropy on every call (RtlGenRandom, /dev/urandom); pick this for key material |
 
-`BigIntRandomSeed(seed)` seeds every generator deterministically (it also sets `RandSeed`, so `rngSystem` follows along); `BigIntRandomize` seeds them from OS entropy. Unseeded runs are deterministic, the same way `System.Random` behaves with `RandSeed = 0`.
+The generator state is per-thread (`threadvar`): the first random draw in a thread seeds itself from OS entropy, so unseeded values differ every run and threads have independent streams - no shared state, no lock. `BigIntRandomSeed(seed)` makes the calling thread reproducible (it also sets `RandSeed`, so the `rngSystem` mode follows along); `BigIntRandomize` reseeds it from OS entropy. Seed each thread separately if you need reproducibility across threads. The `rngSystem` mode keeps the plain `System.Random` contract (driven by `RandSeed`, which the lazy auto-seed leaves untouched).
 
 ### Number theory
 

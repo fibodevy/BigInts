@@ -3870,12 +3870,15 @@ end;
 // random generators
 // ---------------------------------------------------------------------------
 
-var
-  // deterministic nonzero defaults, so unseeded runs reproduce (like RandSeed = 0)
-  xoshiroState: array[4] of QWord = ($01D353E5F3993BB0, $7B9C0DF6CB193B20, QWord($FDFCAA91110765B6), $2D24CBE0D19C4C17);
-  pcgHi: QWord = $0DA3E39CB94B95BB;
-  pcgLo: QWord = QWord($853C49E6748FEA9B);
-  splitmixState: QWord = QWord($9E3779B97F4A7C15);
+threadvar
+  // per-thread generator state (zero-initialized per thread); the first random
+  // draw in a thread lazily seeds from OS entropy (see LazySeed), so unseeded
+  // values differ every run and across threads. BigIntRandomSeed makes the
+  // calling thread reproducible
+  xoshiroState: array[4] of QWord;
+  pcgHi: QWord;
+  pcgLo: QWord;
+  splitmixState: QWord;
 
 function SplitMix64(var s: QWord): QWord;
 begin
@@ -3969,7 +3972,8 @@ begin
   OsEntropy(@result, SizeOf(result));
 end;
 
-procedure BigIntRandomSeed(seed: QWord);
+// seed the native generators (leaves RandSeed alone) from a 64-bit value
+procedure SeedGenerators(seed: QWord);
 begin
   splitmixState := seed;
   var s := seed;
@@ -3978,12 +3982,28 @@ begin
   if (xoshiroState[0] or xoshiroState[1] or xoshiroState[2] or xoshiroState[3]) = 0 then xoshiroState[0] := QWord($9E3779B97F4A7C15);
   pcgLo := SplitMix64(s);
   pcgHi := SplitMix64(s);
+end;
+
+procedure BigIntRandomSeed(seed: QWord);
+begin
+  SeedGenerators(seed);
   RandSeed := LongInt(seed xor (seed shr 32));
 end;
 
 procedure BigIntRandomize;
 begin
   BigIntRandomSeed(OsEntropy64);
+end;
+
+// pull OS entropy for this thread on its first draw, unless BigIntRandomSeed
+// already primed the state (SeedGenerators never leaves xoshiro all-zero, so an
+// all-zero state means "untouched"). RandSeed is left alone, keeping the
+// rngSystem mode on the plain System.Random contract. Driven once per thread by
+// the threadstatic guard in RandomLimb
+function LazySeed: boolean;
+begin
+  if (xoshiroState[0] or xoshiroState[1] or xoshiroState[2] or xoshiroState[3]) = 0 then SeedGenerators(OsEntropy64);
+  result := true;
 end;
 
 function RngNext64: QWord;
@@ -3998,6 +4018,8 @@ end;
 // one limb of bits from the selected generator
 function RandomLimb: TLimb;
 begin
+  // the compiler's per-thread guard runs LazySeed once per thread
+  threadstatic primed := LazySeed;
   if BigIntRngAlgo = rngSystem then begin
     // the historical System.Random layout: 16-bit pieces, low half first
     result := (TLimb(System.Random($10000)) shl 16) or TLimb(System.Random($10000));

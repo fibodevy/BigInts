@@ -1442,9 +1442,11 @@ begin
   checkEq(BigDecimal.fromDoubleExact(3).toString, '3', 'dec exact integer');
   checkEq(BigDecimal.fromSingle(Single(0.1)).toString, '0.1', 'dec fromSingle 0.1');
   checkEq(BigDecimal.fromSingleExact(Single(0.5)).toString, '0.5', 'dec fromSingleExact');
-  check(BigDecimal('0.1').toDouble = 0.1, 'dec toDouble 0.1');
+  // compare bit patterns, not values: on i386 a bare `0.1` literal is 80-bit
+  // Extended and never equals the 64-bit Double result even when it is correct
+  check(dblBits(BigDecimal('0.1').toDouble) = dblBits(0.1), 'dec toDouble 0.1');
   check(BigDecimal('0.1').toSingle = Single(0.1), 'dec toSingle 0.1');
-  check(BigDecimal('12345678901234567890').toDouble = 12345678901234567890.0, 'dec toDouble big');
+  check(dblBits(BigDecimal('12345678901234567890').toDouble) = dblBits(12345678901234567890.0), 'dec toDouble big');
   check(BigDecimal('1E400').toDouble > 1e300, 'dec toDouble overflow is infinite');
   check(BigDecimal('1E-400').toDouble = 0.0, 'dec toDouble underflow is zero');
   check(dblBits(BigDecimal('1e-320').toDouble) = dblBits(1e-320), 'dec toDouble subnormal');
@@ -2145,6 +2147,9 @@ end;
 
 begin
   RandSeed := 20260706;
+  // the native RNG now auto-seeds from OS entropy per thread; seed it explicitly
+  // so the whole run is reproducible
+  BigIntRandomSeed(20260706);
   testUBasics;
   testUArithmeticSmall;
   testUCarryChains;
