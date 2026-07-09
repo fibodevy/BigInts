@@ -452,6 +452,7 @@ type
     class operator div(const a, b: BigDecimal): BigDecimal;
     class operator mod(const a, b: BigDecimal): BigDecimal;
     class operator **(const a: BigDecimal; e: Int64): BigDecimal;
+    class operator **(const a, b: BigDecimal): BigDecimal;
     class operator inc(const a: BigDecimal): BigDecimal;
     class operator dec(const a: BigDecimal): BigDecimal;
     // unary
@@ -538,8 +539,20 @@ type
     // gcd(0.25, 0.15) = 0.05
     function sqrt(precision: integer = 18): BigDecimal;
     function pow(e: Int64): BigDecimal;
+    function pow(const y: BigDecimal; precision: integer = 18): BigDecimal;
+    function nthRoot(n: LongWord; precision: integer = 18): BigDecimal;
     function gcd(const other: BigDecimal): BigDecimal;
     function lcm(const other: BigDecimal): BigDecimal;
+    // transcendentals: `precision` fractional digits (and at least that many
+    // significant digits for tiny results) behind the same hidden guard
+    // digit as divide; computed over scaled integers with extra working
+    // digits. log10 is exact for powers of ten, log2 for powers of two,
+    // a fractional pow goes through exp(y * ln x)
+    function exp(precision: integer = 18): BigDecimal;
+    function ln(precision: integer = 18): BigDecimal;
+    function log2(precision: integer = 18): BigDecimal;
+    function log10(precision: integer = 18): BigDecimal;
+    function logBase(const b: BigDecimal; precision: integer = 18): BigDecimal;
     // float builders: plain takes the shortest round-tripping decimal,
     // exact the full binary expansion
     class function fromDouble(d: Double): BigDecimal; static;
@@ -558,6 +571,9 @@ type
     class function one: BigDecimal; static;
     class function two: BigDecimal; static;
     class function ten: BigDecimal; static;
+    // famous constants at any precision (pi is cached, Chudnovsky splitting)
+    class function pi(precision: integer = 18): BigDecimal; static;
+    class function e(precision: integer = 18): BigDecimal; static;
   end;
 
 var
@@ -5885,6 +5901,387 @@ begin
   result := default(BigDecimal);
   result.fMan := 1;
   result.fExp := 1;
+end;
+
+// ---------------------------------------------------------------------------
+// BigDecimal transcendentals
+// ---------------------------------------------------------------------------
+
+// the transcendental functions run on plain integers scaled by 10^w, with w
+// a couple dozen digits above the requested precision; series terms and
+// divisions truncate, the surplus digits absorb the accumulated error
+
+var
+  // pi, ln 2 and ln 10 caches (scaled integers, grown on demand)
+  PiCache: UBigInt;
+  PiCacheW: Int64 = -1;
+  Ln2Cache: UBigInt;
+  Ln2CacheW: Int64 = -1;
+  Ln10Cache: UBigInt;
+  Ln10CacheW: Int64 = -1;
+
+function UScaleDown(const v: UBigInt; k: Int64): UBigInt;
+begin
+  if k <= 0 then exit(v);
+  var q, r: TLimbs;
+  LDivMod(v.fLimbs, UPow10(LongWord(k)).fLimbs, q, r);
+  result.fLimbs := q;
+end;
+
+// value * 10^w, truncated toward zero
+function DecToScaled(const a: BigDecimal; w: Int64): BigInt;
+begin
+  var t := Int64(a.fExp) + w;
+  if t >= 0 then result.fLimbs := LScale10(a.fMan.fLimbs, t)
+  else begin
+    var q, r: TLimbs;
+    LDivMod(a.fMan.fLimbs, UPow10(LongWord(-t)).fLimbs, q, r);
+    result.fLimbs := q;
+  end;
+  result.fNeg := a.fMan.fNeg and (Length(result.fLimbs) > 0);
+end;
+
+// wrap a scaled result: v * 10^-w cut to p fractional digits (or p
+// significant digits for small values) plus the hidden guard digit
+function DecFromScaled(const v: BigInt; w: Int64; p: integer): BigDecimal;
+begin
+  if Length(v.fLimbs) = 0 then exit(default(BigDecimal));
+  // exponent of the leading digit, bounded from below
+  var msdLo := (Int64(LBitLen(v.fLimbs)) - 1) * 1233 div 4096 - w;
+  var er := -Int64(p) - 1;
+  if msdLo - p < er then er := msdLo - p;
+  if er < -(w - 8) then er := -(w - 8);
+  var m: BigInt;
+  if w + er > 0 then begin
+    var q, r: TLimbs;
+    LDivMod(v.fLimbs, UPow10(LongWord(w + er)).fLimbs, q, r);
+    m.fLimbs := q;
+  end else m.fLimbs := v.fLimbs;
+  m.fNeg := v.fNeg and (Length(m.fLimbs) > 0);
+  result := DecMake(m, er, true);
+end;
+
+// cut an already computed value down to `p` fractional digits the same way
+function DecGuardCut(const a: BigDecimal; p: integer): BigDecimal;
+begin
+  if (Length(a.fMan.fLimbs) = 0) or (a.fExp >= 0) then exit(a);
+  result := DecFromScaled(a.fMan, -Int64(a.fExp), p);
+end;
+
+// Chudnovsky binary splitting for pi
+procedure ChudPQT(a, b: LongWord; out p, q, t: BigInt);
+begin
+  if b - a = 1 then begin
+    if a = 0 then begin
+      p := 1;
+      q := 1;
+    end else begin
+      p := BigInt(Int64(6) * a - 5) * (Int64(2) * a - 1) * (Int64(6) * a - 1);
+      q := BigInt(Int64(a)) * Int64(a) * Int64(a) * Int64(10939058860032000);
+    end;
+    t := p * (Int64(13591409) + Int64(545140134) * a);
+    if a and 1 = 1 then t.negate;
+  end else begin
+    var m := (a + b) div 2;
+    var p1, q1, t1, p2, q2, t2: BigInt;
+    ChudPQT(a, m, p1, q1, t1);
+    ChudPQT(m, b, p2, q2, t2);
+    p := p1 * p2;
+    q := q1 * q2;
+    t := t1 * q2 + p1 * t2;
+  end;
+end;
+
+// pi * 10^w (each Chudnovsky term is worth 14.18 digits)
+function PiScaled(w: Int64): UBigInt;
+begin
+  if PiCacheW < w then begin
+    var wc := w + 32;
+    var p, q, t: BigInt;
+    ChudPQT(0, LongWord(wc div 14) + 2, p, q, t);
+    var sq := (UBigInt(10005) * UPow10(LongWord(2 * wc))).sqrt;
+    PiCache := UBigInt(426880) * sq * q.magnitude div t.magnitude;
+    PiCacheW := wc;
+  end;
+  result := UScaleDown(PiCache, PiCacheW - w);
+end;
+
+// artanh(1/q) * 10^w by the direct series, two cheap passes per term
+function UArtanhInv(q, w: Int64): UBigInt;
+begin
+  var wc := w + 24;
+  var t := UPow10(LongWord(wc)) div q;
+  var s := t;
+  var q2 := q * q;
+  var j: Int64 := 1;
+  repeat
+    t := t div q2;
+    if t.isZero then break;
+    j := j + 2;
+    s := s + t div j;
+  until false;
+  result := UScaleDown(s, wc - w);
+end;
+
+// ln 2 = 2 artanh(1/3) and ln 10 = 3 ln 2 + 2 artanh(1/9), both scaled
+function Ln2Scaled(w: Int64): UBigInt;
+begin
+  if Ln2CacheW < w then begin
+    Ln2Cache := UArtanhInv(3, w + 32) * 2;
+    Ln2CacheW := w + 32;
+  end;
+  result := UScaleDown(Ln2Cache, Ln2CacheW - w);
+end;
+
+function Ln10Scaled(w: Int64): UBigInt;
+begin
+  if Ln10CacheW < w then begin
+    var wc := w + 32;
+    Ln10Cache := Ln2Scaled(wc) * 3 + UArtanhInv(9, wc) * 2;
+    Ln10CacheW := wc;
+  end;
+  result := UScaleDown(Ln10Cache, Ln10CacheW - w);
+end;
+
+// e^(X / 10^w) * 10^w: the argument is halved into (-1/2, 1/2), the Taylor
+// sum runs on scaled integers and the halvings are squared back
+function ExpScaled(const X: BigInt; w: Int64): UBigInt;
+begin
+  var p10 := UPow10(LongWord(w));
+  if Length(X.fLimbs) = 0 then exit(p10);
+  var xu: UBigInt;
+  xu.fLimbs := X.fLimbs;
+  var k := Int64(LBitLen(X.fLimbs)) + 2 - LBitLen(p10.fLimbs);
+  if k < 0 then k := 0;
+  if k > 0 then xu := xu shr k;
+  var t := p10;
+  var s := p10;
+  var i: Int64 := 1;
+  repeat
+    t := t * xu div p10 div i;
+    if t.isZero then break;
+    s := s + t;
+    inc(i);
+  until false;
+  for var j := 1 to k do s := s.sqr div p10;
+  if X.fNeg then s := UPow10(LongWord(2 * w)) div s;
+  result := s;
+end;
+
+class function BigDecimal.pi(precision: integer): BigDecimal;
+begin
+  var p := precision;
+  if p < 0 then p := 0;
+  var w := Int64(p) + 10;
+  var v: BigInt;
+  v.fLimbs := PiScaled(w).fLimbs;
+  v.fNeg := false;
+  result := DecFromScaled(v, w, p);
+end;
+
+class function BigDecimal.e(precision: integer): BigDecimal;
+begin
+  var p := precision;
+  if p < 0 then p := 0;
+  var w := Int64(p) + 16;
+  var t := UPow10(LongWord(w));
+  var s := t;
+  var i: Int64 := 1;
+  repeat
+    t := t div i;
+    if t.isZero then break;
+    s := s + t;
+    inc(i);
+  until false;
+  var v: BigInt;
+  v.fLimbs := s.fLimbs;
+  v.fNeg := false;
+  result := DecFromScaled(v, w, p);
+end;
+
+function BigDecimal.exp(precision: integer): BigDecimal;
+begin
+  var p := precision;
+  if p < 0 then p := 0;
+  if fMan.isZero then exit(BigDecimal.one);
+  var lo, hi: Int64;
+  DecMagBounds(fMan.fLimbs, fExp, lo, hi);
+  // e^(10^10) does not fit a 32-bit decimal exponent anymore
+  if hi >= 10 then RaiseDecExpRange;
+  var ax := toDouble;
+  if ax < 0 then ax := -ax;
+  // integer digits of the result (leading zeros for a negative argument)
+  var d := System.Trunc(ax * 0.4342944819032518) + 2;
+  var w := Int64(p) + d + 24;
+  var s: BigInt;
+  s.fLimbs := ExpScaled(DecToScaled(self, w), w).fLimbs;
+  s.fNeg := false;
+  result := DecFromScaled(s, w, p);
+end;
+
+function BigDecimal.ln(precision: integer): BigDecimal;
+begin
+  var p := precision;
+  if p < 0 then p := 0;
+  if fMan.fNeg or fMan.isZero then raise EBigIntError.Create('logarithm of a non-positive value');
+  if isOne then exit(default(BigDecimal));
+  var w := Int64(p) + 28;
+  var p10 := UPow10(LongWord(w));
+  // mantissa scaled into [1, 10) at w digits; f is the leading-digit exponent
+  var m: TLimbs;
+  var e: Int64;
+  DecCanon(self, m, e);
+  var dc := Int64(Length(LToBase(m, 10)));
+  var f := e + dc - 1;
+  var t := w - (dc - 1);
+  var mu: UBigInt;
+  if t >= 0 then mu.fLimbs := LScale10(m, t)
+  else begin
+    var q, r: TLimbs;
+    LDivMod(m, UPow10(LongWord(-t)).fLimbs, q, r);
+    mu.fLimbs := q;
+  end;
+  // halve into (0.707, 1.415], then six square roots pull it against 1,
+  // so the artanh series below gains five digits per term
+  var j2 := 0;
+  var s2 := (UBigInt(2) * UPow10(LongWord(2 * w))).sqrt;
+  while mu > s2 do begin
+    mu := mu shr 1;
+    inc(j2);
+  end;
+  for var i := 1 to 6 do mu := (mu * p10).sqrt;
+  // z = (y - 1) / (y + 1), ln y = 2^7 artanh(z) after the six roots
+  var zneg := mu < p10;
+  var zu := (if zneg then p10 - mu else mu - p10) * p10 div (mu + p10);
+  var s := zu;
+  var tt := zu;
+  var z2 := zu.sqr div p10;
+  var j: Int64 := 1;
+  repeat
+    tt := tt * z2 div p10;
+    if tt.isZero then break;
+    j := j + 2;
+    s := s + tt div j;
+  until false;
+  var r: BigInt;
+  r.fLimbs := (s shl 7).fLimbs;
+  r.fNeg := zneg and (Length(r.fLimbs) > 0);
+  if j2 <> 0 then r := r + BigInt(Int64(j2)) * Ln2Scaled(w).toBigInt;
+  if f <> 0 then r := r + BigInt(f) * Ln10Scaled(w).toBigInt;
+  result := DecFromScaled(r, w, p);
+end;
+
+function BigDecimal.log2(precision: integer): BigDecimal;
+begin
+  var p := precision;
+  if p < 0 then p := 0;
+  if fMan.fNeg or fMan.isZero then raise EBigIntError.Create('logarithm of a non-positive value');
+  var m: TLimbs;
+  var e: Int64;
+  DecCanon(self, m, e);
+  // exact powers of two: man * 10^e = 2^k needs man = 2^(k-e) * 5^(-e)
+  if (e <= 0) and ((-e) * 699 div 1000 + 1 <= Int64(LBitLen(m)) * 1233 div 4096 + 1) then begin
+    var u: UBigInt;
+    u.fLimbs := m;
+    if e < 0 then begin
+      var (q5, r5) := u.divMod(UBigInt(5).pow(LongWord(-e)));
+      if r5.isZero then u := q5 else u := UBigInt.zero;
+    end;
+    if u.isPowerOfTwo then begin
+      result := BFromI64(u.lowestSetBit + e);
+      exit;
+    end;
+  end;
+  var w := Int64(p) + 20;
+  var lnr := DecToScaled(ln(p + 12), w);
+  var q: BigInt;
+  q.fLimbs := (lnr.magnitude * UPow10(LongWord(w)) div Ln2Scaled(w)).fLimbs;
+  q.fNeg := lnr.fNeg and (Length(q.fLimbs) > 0);
+  result := DecFromScaled(q, w, p);
+end;
+
+function BigDecimal.log10(precision: integer): BigDecimal;
+begin
+  var p := precision;
+  if p < 0 then p := 0;
+  if fMan.fNeg or fMan.isZero then raise EBigIntError.Create('logarithm of a non-positive value');
+  var m: TLimbs;
+  var e: Int64;
+  DecCanon(self, m, e);
+  // exact powers of ten
+  if (Length(m) = 1) and (m[0] = 1) then begin
+    result := BFromI64(e);
+    exit;
+  end;
+  var w := Int64(p) + 20;
+  var lnr := DecToScaled(ln(p + 12), w);
+  var q: BigInt;
+  q.fLimbs := (lnr.magnitude * UPow10(LongWord(w)) div Ln10Scaled(w)).fLimbs;
+  q.fNeg := lnr.fNeg and (Length(q.fLimbs) > 0);
+  result := DecFromScaled(q, w, p);
+end;
+
+function BigDecimal.logBase(const b: BigDecimal; precision: integer): BigDecimal;
+begin
+  var p := precision;
+  if p < 0 then p := 0;
+  if b.isOne then raise EBigIntError.Create('logarithm base one');
+  result := DecGuardCut(ln(p + 12).divide(b.ln(p + 12), p + 4), p);
+end;
+
+function BigDecimal.pow(const y: BigDecimal; precision: integer): BigDecimal;
+begin
+  var p := precision;
+  if p < 0 then p := 0;
+  if y.isIntegral and y.fitsInInt64 then exit(pow(y.toInt64));
+  if fMan.isZero then begin
+    if y.isNegative then RaiseDivByZero;
+    exit(default(BigDecimal));
+  end;
+  if fMan.fNeg then raise EBigIntError.Create('fractional power of a negative value');
+  if isOne then exit(BigDecimal.one);
+  // magnitude of y*ln(x) drives the extra working digits
+  var yd := y.toDouble;
+  if yd < 0 then yd := -yd;
+  var zd := yd * (System.Abs(Double(mostSignificantExponent)) + 1.0) * 2.302585092994046;
+  if IsNan(zd) or (zd > 4.6E9) then RaiseDecExpRange;
+  var d := System.Trunc(zd * 0.4342944819032518) + 2;
+  var dy := y.mostSignificantExponent + 1;
+  if dy < 0 then dy := 0;
+  result := (y * ln(p + d + dy + 12)).exp(p);
+end;
+
+function BigDecimal.nthRoot(n: LongWord; precision: integer): BigDecimal;
+begin
+  if n = 0 then raise EBigIntError.Create('zeroth root is undefined');
+  var p := precision;
+  if p < 0 then p := 0;
+  if fMan.isZero then exit(default(BigDecimal));
+  if fMan.fNeg and (n and 1 = 0) then raise EBigIntError.Create('even root of a negative value');
+  if n = 1 then exit(self);
+  var p1 := Int64(p) + 1;
+  var k := Int64(fExp) + Int64(n) * p1;
+  if (k > High(integer)) or (k < -Int64(High(integer))) then RaiseDecExpRange;
+  var nu: UBigInt;
+  var exact := true;
+  if k >= 0 then nu.fLimbs := LScale10(fMan.fLimbs, k)
+  else begin
+    var q, r: TLimbs;
+    LDivMod(fMan.fLimbs, UPow10(LongWord(-k)).fLimbs, q, r);
+    nu.fLimbs := q;
+    exact := Length(r) = 0;
+  end;
+  var root := nu.nthRoot(n);
+  if exact then exact := root.pow(n) = nu;
+  var m: BigInt;
+  m.fLimbs := root.fLimbs;
+  m.fNeg := fMan.fNeg and (Length(root.fLimbs) > 0);
+  result := DecMake(m, -p1, not exact);
+end;
+
+class operator BigDecimal.**(const a, b: BigDecimal): BigDecimal;
+begin
+  result := a.pow(b);
 end;
 
 {$ifdef BIGINT_ASM}
