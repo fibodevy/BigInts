@@ -467,9 +467,11 @@ type
     class operator >=(const a, b: BigDecimal): boolean;
 
     // formatting: toString is plain decimal (-123.45), toScientific keeps
-    // one leading digit (-1.2345E2)
+    // one leading digit (-1.2345E2), toEngineering an exponent that is a
+    // multiple of three (-123.45E0, 12.5E3)
     function toString: string;
     function toScientific: string;
+    function toEngineering: string;
     // exact conversions (raise ERangeError unless integral and in range;
     // use trunc/floor/ceil/round for the lossy ones)
     function toInt64: Int64;
@@ -509,6 +511,9 @@ type
     function ceil: BigInt;
     function round: BigInt;
     function frac: BigDecimal;
+    // exact rational view: self = num / den with a reduced power-of-ten
+    // denominator, so 0.375 gives (3, 8)
+    function toFraction: (num, den: BigInt);
     // decimal introspection: precision counts significant digits, getDigit
     // returns the digit at 10^i of the absolute value (0 outside)
     function precision: integer;
@@ -519,9 +524,12 @@ type
     function shifted10(n: integer): BigDecimal;
     // round to a decimal position: toDigit 0 = integer, -2 = cents, 3 = thousands
     function rounded(toDigit: integer = 0; mode: TBigDecimalRounding = bdrRound): BigDecimal;
+    // round to the nearest multiple of an arbitrary step, e.g. 0.05
+    function quantize(const step: BigDecimal; mode: TBigDecimalRounding = bdrRound): BigDecimal;
     // comparison helpers
     function compare(const other: BigDecimal): integer;
     function equals(const other: BigDecimal): boolean;
+    function approxEquals(const other, epsilon: BigDecimal): boolean;
     function min(const other: BigDecimal): BigDecimal;
     function max(const other: BigDecimal): BigDecimal;
     // division: the quotient carries `precision` fractional digits (more when
@@ -6642,6 +6650,79 @@ begin
   v.fLimbs := ((p10 - u) * p10 div (p10 + u)).fLimbs;
   v.fNeg := fMan.fNeg;
   result := DecFromScaled(v, w, p);
+end;
+
+function BigDecimal.toEngineering: string;
+var
+  m: TLimbs;
+  e: Int64;
+begin
+  DecDisplay(self, m, e);
+  if Length(m) = 0 then exit('0');
+  var digits := LToBase(m, 10);
+  var l := Length(digits);
+  var realExp := e + l - 1;
+  var fm := realExp mod 3;
+  if fm < 0 then fm := fm + 3;
+  var before := integer(fm) + 1;
+  if l <= before then result := digits + StringOfChar('0', before - l)
+  else result := Copy(digits, 1, before) + '.' + Copy(digits, before + 1, l - before);
+  result := result + 'E' + IntToStr(realExp - fm);
+  if fMan.fNeg then result := '-' + result;
+end;
+
+function BigDecimal.toFraction: (num, den: BigInt);
+var
+  m: TLimbs;
+  e: Int64;
+  nn, dd: BigInt;
+begin
+  DecCanon(self, m, e);
+  if e >= 0 then begin
+    nn.fLimbs := LScale10(m, e);
+    nn.fNeg := fMan.fNeg and (Length(nn.fLimbs) > 0);
+    dd := 1;
+  end else begin
+    // the canonical mantissa shares only twos and fives with 10^-e
+    var u: UBigInt;
+    u.fLimbs := m;
+    var dv := UPow10(LongWord(-e));
+    var g := u.gcd(dv);
+    nn.fLimbs := (u div g).fLimbs;
+    nn.fNeg := fMan.fNeg;
+    dd.fLimbs := (dv div g).fLimbs;
+    dd.fNeg := false;
+  end;
+  exit(nn, dd);
+end;
+
+function BigDecimal.quantize(const step: BigDecimal; mode: TBigDecimalRounding): BigDecimal;
+begin
+  var (q, r) := divMod(step);
+  if r.isZero then exit(q * step);
+  // the mode acts on the exact ratio self/step; "up" grows its magnitude
+  var rhoNeg := fMan.fNeg <> step.fMan.fNeg;
+  var up := false;
+  if mode = bdrCeil then up := not rhoNeg
+  else if mode = bdrFloor then up := rhoNeg
+  else if mode <> bdrTrunc then begin
+    var c := (r.abs + r.abs).compare(step.abs);
+    if c > 0 then up := true
+    else if c = 0 then begin
+      if mode = bdrRound then up := true
+      else if mode = bdrHalfUp then up := not rhoNeg
+      else up := q.isOdd;
+    end;
+  end;
+  if up then begin
+    if rhoNeg then q := q - 1 else q := q + 1;
+  end;
+  result := q * step;
+end;
+
+function BigDecimal.approxEquals(const other, epsilon: BigDecimal): boolean;
+begin
+  result := (self - other).abs.compare(epsilon.abs) <= 0;
 end;
 
 {$ifdef BIGINT_ASM}
