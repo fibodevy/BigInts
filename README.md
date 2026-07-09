@@ -1,6 +1,6 @@
 # BigInts
 
-Arbitrary precision integers for Pascal in a single self-contained unit, `BigInts` ([bigints.pas](bigints.pas)). Two value types, every operator a plain integer has, no size limits beyond available memory, no dependencies beyond the RTL.
+Arbitrary precision integers and decimals for Pascal in a single self-contained unit, `BigInts` ([bigints.pas](bigints.pas)). Three value types, every operator a plain number has, no size limits beyond available memory, no dependencies beyond the RTL.
 
 > **Requires a compiler that understands `{$mode unleashed}`.** The unit and the examples below lean on inline variables, tuples, statement expressions and interpolated strings, so a stock compiler will not build them.
 
@@ -8,6 +8,7 @@ Arbitrary precision integers for Pascal in a single self-contained unit, `BigInt
 |---|---|
 | `BigInt` | signed; bitwise operators use two's complement semantics with infinite sign extension, like Python ints |
 | `UBigInt` | unsigned; anything that would drop below zero raises `ERangeError` |
+| `BigDecimal` | decimal float: a `BigInt` mantissa times a power of ten; exact `+ - *`, division at a chosen precision |
 
 ## Capabilities
 
@@ -22,6 +23,7 @@ Arbitrary precision integers for Pascal in a single self-contained unit, `BigInt
 - number theory and combinatorics: Lehmer `gcd`, `gcdExt` (Bezout coefficients), `lcm`, `jacobi`, `factorial`, `fibonacci`, `lucas`, `binomial`, `catalan`, `primorial`
 - randomness: pluggable generators (xoshiro256**, PCG64, splitmix64, `System.Random`, OS entropy), deterministic seeding, uniform `randomBelow`/`randomRange`
 - interop: byte serialization in both endiannesses, `hashCode`, digit-grouped output
+- decimals: exact decimal arithmetic (`0.1 + 0.2 = 0.3`), division and square root at any precision, six rounding modes, shortest and exact float conversions in both directions (the BigDecimal chapter below)
 - speed: measured 1.4-4x of GMP on x64 for the core operations (benchmarks below); assembler inner loops with a pure Pascal fallback behind a `USEASM` define
 
 ## Quick start
@@ -163,6 +165,59 @@ The backend behind `random` and friends is selected with the `BigIntRngAlgo` var
 | `binomial(n, k)` | multiplicative form, every intermediate division exact |
 | `catalan(n)` | `binomial(2n, n) div (n + 1)` |
 | `primorial(n)` | product of all primes up to `n`, odd sieve plus balanced multiplication |
+
+## BigDecimal
+
+Arbitrary precision decimal floats on the same integer core: a value is a `BigInt` mantissa times a power of ten, kept canonical (no trailing zero digits). `0.1` is exactly `0.1`, money maths never drifts, and the mantissa gets the full speed of the integer engine.
+
+- `+ - *` are always exact, and so are `div`/`mod` (integer quotient, exact remainder).
+- `/` rounds to 18 fractional digits by default; `divide(b, precision)` chooses. The quotient always keeps the full integer part and at least `precision` significant digits, and carries one hidden guard digit that `toString` rounds away, so `(1/3) * 3` prints as `1`. Exact quotients stay exact: `1 / 8` is `0.125`.
+- Comparisons are numeric (`0.5 = 5E-1`) and see the stored guard digit, so `(1/3) * 3 < 1` holds even though it prints as `1`.
+- Mixed expressions with integers, strings, `BigInt` and `UBigInt` convert implicitly; floats convert only through explicit casts or the `from*` builders, so no binary rounding error sneaks in unannounced.
+
+```pascal
+program decimals;
+
+{$mode unleashed}
+
+uses BigInts;
+
+begin
+  var price: BigDecimal := '19.99';
+  writeln($'{price * 3}');                       // 59.97
+  writeln($'{BigDecimal(1) / 3}');               // 0.333333333333333333
+  writeln($'{BigDecimal(1) / 3 * 3}');           // 1
+  writeln($'{BigDecimal(2).sqrt(30)}');          // 1.41421356237309504880168872421
+  writeln($'{BigDecimal.fromDouble(0.1)}');      // 0.1
+  writeln($'{BigDecimal.fromDoubleExact(0.1)}'); // 0.1000000000000000055511151231257827021181583404541015625
+  var pi: BigDecimal := '3.14159265';
+  writeln($'{pi.rounded(-2)}  {pi.rounded(-2, bdrCeil)}  {pi.trunc}'); // 3.14  3.15  3
+  writeln($'{BigDecimal('123456.789').toScientific}');                // 1.23456789E5
+  {$ifdef WINDOWS}readln;{$endif}
+end.
+```
+
+| method | notes |
+|---|---|
+| `parse(s)`, `tryParse(s, out v)`, `:=` from string | `[sign]digits[.digits][E[sign]digits]`, `_` separators allowed |
+| `toString`, `toScientific` | plain `-123.45` / normalized `-1.2345E2` |
+| `toInt64`, `toQWord`, `toInteger`, `toCardinal`, `toBigInt`, `fitsIn*` | exact conversions: raise `ERangeError` unless integral and in range |
+| `trunc`, `floor`, `ceil`, `round` | to `BigInt`: toward zero, toward -inf, toward +inf, halves to even (like Pascal `round`) |
+| `frac` | what `trunc` drops, so `self = trunc + frac` |
+| `rounded(toDigit = 0, mode = bdrRound)` | rounding at any decimal position: `0` = integer, `-2` = cents, `3` = thousands; modes `bdrTrunc bdrCeil bdrFloor bdrRound bdrHalfUp bdrHalfEven` |
+| `divide(b, precision = 18)`, `divMod(d)` | division at a chosen precision / integer quotient with the exact remainder |
+| `fromDouble`, `fromSingle`, explicit float casts | the shortest decimal that reads back to the same float: `0.1` gives `0.1` |
+| `fromDoubleExact`, `fromSingleExact` | the exact binary value: `0.1` gives all 55 digits of it |
+| `toDouble`, `toSingle` | correctly rounded to the nearest float, ties to even; overflow gives infinity, underflow zero |
+| `toExtended`, `fromExtended`, `fromExtendedExact` | on targets with the 80-bit type |
+| `sqrt(precision = 18)` | `precision` fractional digits with the same hidden guard digit as divide |
+| `pow(e)`, `**` | exact for `e >= 0`; a negative exponent divides at the default precision |
+| `gcd`, `lcm` | on the decimal lattice: `gcd(0.25, 0.15) = 0.05` |
+| `precision`, `mostSignificantExponent`, `getDigit(i)` | significant digit count, exponent of the leading digit, digit at `10^i` |
+| `shift10(n)`, `shifted10(n)` | multiply by a power of ten without touching the mantissa |
+| `isZero`, `isOne`, `isIntegral`, `isEven`, `isOdd`, `isNegative`, `isPositive`, `sign`, `abs`, `negate` | predicates and sign helpers; a fractional value is neither even nor odd |
+| `compare`, `equals`, `min`, `max`, `hashCode`, `swap` | plus the full operator and comparison set |
+| `zero`, `one`, `two`, `ten` | class constants |
 
 ## Semantics worth knowing
 
