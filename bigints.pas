@@ -1,8 +1,9 @@
 { BigInts - arbitrary precision integers for Unleashed Pascal
 
- Two value types with full operator coverage and no size limit:
+ Three value types with full operator coverage and no size limit:
    UBigInt - unsigned big integer (raises ERangeError on negative results)
-   BigInt  - signed big integer, two's complement semantics for bitwise ops }
+   BigInt  - signed big integer, two's complement semantics for bitwise ops
+   BigDecimal - decimal float over the same core: BigInt mantissa * 10^exp }
 
 { Copyright (c) 2026 @fibodevy / https://github.com/fibodevy
   This Source Code Form is subject to the terms of the Mozilla Public
@@ -406,6 +407,157 @@ type
   // declared after both records so UBigInt can offer a BigInt-returning method
   TUBigIntBridge = record helper for UBigInt
     function toBigInt: BigInt;
+  end;
+
+  // rounding modes for BigDecimal.rounded: bdrRound rounds halves away from
+  // zero, bdrHalfUp rounds halves toward +infinity, bdrHalfEven to the even
+  // neighbor (banker's rounding)
+  TBigDecimalRounding = (bdrTrunc, bdrCeil, bdrFloor, bdrRound, bdrHalfUp, bdrHalfEven);
+
+  { BigDecimal - arbitrary precision decimal float: value = mantissa * 10^exp
+    with a BigInt mantissa, kept canonical (no trailing zero digits).
+    + - * are exact; / rounds to a chosen number of fractional digits and
+    keeps one hidden guard digit, so (1/3)*3 still prints as 1 }
+
+  BigDecimal = record
+  private
+    fMan: BigInt;     // decimal mantissa
+    fExp: integer;    // value = fMan * 10^fExp
+    fHidden: boolean; // last mantissa digit is a division guard, hidden by toString
+  public
+    // conversions in
+    class operator :=(x: Int64): BigDecimal;
+    class operator :=(x: QWord): BigDecimal;
+    class operator :=(const s: string): BigDecimal;
+    class operator :=(const a: BigInt): BigDecimal;
+    class operator :=(const a: UBigInt): BigDecimal;
+    // float casts take the shortest decimal that reads back to the same
+    // float (0.1 gives 0.1); fromDoubleExact gives the exact binary value
+    class operator explicit(d: Double): BigDecimal;
+    class operator explicit(s: Single): BigDecimal;
+    // exact integer paths for typecasts, so BigDecimal(q) never rounds via Double
+    class operator explicit(x: Int64): BigDecimal;
+    class operator explicit(x: QWord): BigDecimal;
+    // conversions out (the BigInt cast raises ERangeError unless integral)
+    class operator explicit(const a: BigDecimal): Double;
+    class operator explicit(const a: BigDecimal): Single;
+    class operator explicit(const a: BigDecimal): string;
+    class operator explicit(const a: BigDecimal): BigInt;
+    // arithmetic: + - * are exact, / rounds to 18 fractional digits (see
+    // divide), div/mod are the integer quotient and the exact remainder
+    class operator +(const a, b: BigDecimal): BigDecimal;
+    class operator -(const a, b: BigDecimal): BigDecimal;
+    class operator *(const a, b: BigDecimal): BigDecimal;
+    class operator /(const a, b: BigDecimal): BigDecimal;
+    class operator div(const a, b: BigDecimal): BigDecimal;
+    class operator mod(const a, b: BigDecimal): BigDecimal;
+    class operator **(const a: BigDecimal; e: Int64): BigDecimal;
+    class operator inc(const a: BigDecimal): BigDecimal;
+    class operator dec(const a: BigDecimal): BigDecimal;
+    // unary
+    class operator -(const a: BigDecimal): BigDecimal;
+    class operator +(const a: BigDecimal): BigDecimal;
+    // comparisons (numeric: 0.5 = 5E-1 whatever the representation)
+    class operator =(const a, b: BigDecimal): boolean;
+    class operator <>(const a, b: BigDecimal): boolean;
+    class operator <(const a, b: BigDecimal): boolean;
+    class operator <=(const a, b: BigDecimal): boolean;
+    class operator >(const a, b: BigDecimal): boolean;
+    class operator >=(const a, b: BigDecimal): boolean;
+
+    // formatting: toString is plain decimal (-123.45), toScientific keeps
+    // one leading digit (-1.2345E2)
+    function toString: string;
+    function toScientific: string;
+    // exact conversions (raise ERangeError unless integral and in range;
+    // use trunc/floor/ceil/round for the lossy ones)
+    function toInt64: Int64;
+    function toQWord: QWord;
+    function toInteger: LongInt;
+    function toCardinal: LongWord;
+    function toBigInt: BigInt;
+    function fitsInInt64: boolean;
+    function fitsInQWord: boolean;
+    function fitsInInteger: boolean;
+    function fitsInCardinal: boolean;
+    // correctly rounded to the nearest float (ties to even); overflow gives
+    // infinity, underflow gives zero
+    function toDouble: Double;
+    function toSingle: Single;
+    {$ifdef FPC_HAS_TYPE_EXTENDED}
+    function toExtended: Extended;
+    {$endif}
+    // predicates
+    function isZero: boolean;
+    function isOne: boolean;
+    function isIntegral: boolean;
+    // parity of integral values; a fractional value is neither even nor odd
+    function isEven: boolean;
+    function isOdd: boolean;
+    function isNegative: boolean;
+    function isPositive: boolean;
+    function sign: integer;
+    // sign helpers
+    function abs: BigDecimal;
+    procedure negate;
+    // integer parts: trunc cuts toward zero, floor toward -infinity, ceil
+    // toward +infinity, round takes halves to even (like Pascal round);
+    // frac is what trunc drops, so self = trunc + frac
+    function trunc: BigInt;
+    function floor: BigInt;
+    function ceil: BigInt;
+    function round: BigInt;
+    function frac: BigDecimal;
+    // decimal introspection: precision counts significant digits, getDigit
+    // returns the digit at 10^i of the absolute value (0 outside)
+    function precision: integer;
+    function mostSignificantExponent: integer;
+    function getDigit(i: integer): integer;
+    // multiply by a power of ten
+    procedure shift10(n: integer);
+    function shifted10(n: integer): BigDecimal;
+    // round to a decimal position: toDigit 0 = integer, -2 = cents, 3 = thousands
+    function rounded(toDigit: integer = 0; mode: TBigDecimalRounding = bdrRound): BigDecimal;
+    // comparison helpers
+    function compare(const other: BigDecimal): integer;
+    function equals(const other: BigDecimal): boolean;
+    function min(const other: BigDecimal): BigDecimal;
+    function max(const other: BigDecimal): BigDecimal;
+    // division: the quotient carries `precision` fractional digits (more when
+    // the operands are finer, always the full integer part) plus a hidden
+    // guard digit; exact quotients stay exact. divMod gives the integer
+    // quotient and the exact remainder
+    function divide(const other: BigDecimal; precision: integer = 18): BigDecimal;
+    function divMod(const d: BigDecimal): (q, r: BigDecimal);
+    // parsing: [sign]digits[.digits][E[sign]digits], "_" separators allowed
+    class function parse(const s: string): BigDecimal; static;
+    class function tryParse(const s: string; out v: BigDecimal): boolean; static;
+    // math: sqrt keeps `precision` fractional digits plus the same hidden
+    // guard digit as divide; pow with a negative exponent divides at the
+    // default precision; gcd/lcm work on the decimal lattice, so
+    // gcd(0.25, 0.15) = 0.05
+    function sqrt(precision: integer = 18): BigDecimal;
+    function pow(e: Int64): BigDecimal;
+    function gcd(const other: BigDecimal): BigDecimal;
+    function lcm(const other: BigDecimal): BigDecimal;
+    // float builders: plain takes the shortest round-tripping decimal,
+    // exact the full binary expansion
+    class function fromDouble(d: Double): BigDecimal; static;
+    class function fromDoubleExact(d: Double): BigDecimal; static;
+    class function fromSingle(s: Single): BigDecimal; static;
+    class function fromSingleExact(s: Single): BigDecimal; static;
+    {$ifdef FPC_HAS_TYPE_EXTENDED}
+    class function fromExtended(e: Extended): BigDecimal; static;
+    class function fromExtendedExact(e: Extended): BigDecimal; static;
+    {$endif}
+    // misc
+    function hashCode: DWord;
+    procedure swap(var other: BigDecimal);
+    // constants
+    class function zero: BigDecimal; static;
+    class function one: BigDecimal; static;
+    class function two: BigDecimal; static;
+    class function ten: BigDecimal; static;
   end;
 
 var
@@ -4582,6 +4734,1157 @@ end;
 class function BigInt.primorial(n: LongWord): BigInt;
 begin
   result := UBigInt.primorial(n).toBigInt;
+end;
+
+// ---------------------------------------------------------------------------
+// BigDecimal
+// ---------------------------------------------------------------------------
+
+const
+  // powers of ten up to the largest fitting a QWord
+  POW10Q: array[0..19] of QWord = (1, 10, 100, 1000, 10000, 100000, 1000000,
+    10000000, 100000000, 1000000000, 10000000000, 100000000000, 1000000000000,
+    10000000000000, 100000000000000, 1000000000000000, 10000000000000000,
+    100000000000000000, 1000000000000000000, 10000000000000000000);
+  // largest power of ten in one limb, the chunk size for base-10 scaling
+  {$if LIMB_BITS = 64}
+  DEC_CHUNK = TLimb(10000000000000000000);
+  DEC_CHUNK_POW = 19;
+  {$else}
+  DEC_CHUNK = TLimb(1000000000);
+  DEC_CHUNK_POW = 9;
+  {$endif}
+
+procedure RaiseDecParseError(const s: string);
+begin
+  raise EConvertError.Create($'"{s}" is not a valid decimal value');
+end;
+
+procedure RaiseDecExpRange;
+begin
+  raise ERangeError.Create('BigDecimal exponent out of range');
+end;
+
+function UPow10(n: LongWord): UBigInt;
+begin
+  if n <= 19 then result.fLimbs := LFromQWord(POW10Q[n])
+  else result.fLimbs := UPowQ(LFromQWord(10), n);
+end;
+
+// multiply a magnitude by 10^k
+function LScale10(const a: TLimbs; k: Int64): TLimbs;
+begin
+  result := a;
+  if (k <= 0) or (Length(a) = 0) then exit;
+  if k <= 2 * DEC_CHUNK_POW then begin
+    var r := a;
+    while k >= DEC_CHUNK_POW do begin
+      r := LMulW(r, DEC_CHUNK);
+      k := k - DEC_CHUNK_POW;
+    end;
+    if k > 0 then r := LMulW(r, TLimb(POW10Q[k]));
+    result := r;
+  end else result := LMul(a, UPow10(LongWord(k)).fLimbs);
+end;
+
+// strip trailing decimal zeros of a magnitude, bumping the exponent
+procedure LStrip10(var m: TLimbs; var e: Int64);
+begin
+  while (Length(m) > 0) and (m[0] and 1 = 0) do begin
+    var r := LModW(m, DEC_CHUNK);
+    var z: integer;
+    if r = 0 then z := DEC_CHUNK_POW
+    else begin
+      z := 0;
+      while r mod 10 = 0 do begin
+        r := r div 10;
+        inc(z);
+      end;
+      if z = 0 then exit;
+    end;
+    var rem: TLimb;
+    m := LDivModW(m, TLimb(POW10Q[z]), rem);
+    e := e + z;
+    if z < DEC_CHUNK_POW then exit;
+  end;
+end;
+
+// range-checked decimal exponent
+function DecExp(e: Int64): integer;
+begin
+  if (e > High(integer)) or (e < Low(integer)) then RaiseDecExpRange;
+  result := integer(e);
+end;
+
+// assemble a value: canonical (no trailing zeros) unless it keeps a guard digit
+function DecMake(const m: BigInt; e: Int64; hidden: boolean): BigDecimal;
+begin
+  result.fMan := m;
+  result.fHidden := hidden and (Length(m.fLimbs) > 0);
+  if Length(m.fLimbs) = 0 then begin
+    result.fExp := 0;
+    exit;
+  end;
+  if not result.fHidden then LStrip10(result.fMan.fLimbs, e);
+  result.fExp := DecExp(e);
+end;
+
+// stored value as a canonical mantissa/exponent pair (guard digit kept,
+// trailing zeros stripped)
+procedure DecCanon(const a: BigDecimal; out m: TLimbs; out e: Int64);
+begin
+  m := a.fMan.fLimbs;
+  e := a.fExp;
+  if a.fHidden then LStrip10(m, e);
+end;
+
+// value as shown: the guard digit is dropped and rounds the magnitude up when
+// it is 5 or more - this is what makes (1/3)*3 print as 1
+procedure DecDisplay(const a: BigDecimal; out m: TLimbs; out e: Int64);
+begin
+  m := a.fMan.fLimbs;
+  e := a.fExp;
+  if a.fHidden then begin
+    var r: TLimb;
+    m := LDivModW(m, 10, r);
+    e := e + 1;
+    if r >= 5 then m := LAdd(m, LFromQWord(1));
+  end;
+  LStrip10(m, e);
+end;
+
+// bounds for the exponent of the leading decimal digit (1233/4096 < log10 2)
+procedure DecMagBounds(const m: TLimbs; e: Int64; out lo, hi: Int64);
+begin
+  var bl := Int64(LBitLen(m));
+  lo := (bl - 1) * 1233 div 4096 + e;
+  hi := bl * 1233 div 4096 + 1 + e;
+end;
+
+function DecCmp(const a, b: BigDecimal): integer;
+begin
+  var sa := a.fMan.sign;
+  var sb := b.fMan.sign;
+  if sa <> sb then exit(if sa < sb then -1 else 1);
+  if sa = 0 then exit(0);
+  // disjoint leading-digit positions decide without aligning
+  var loA, hiA, loB, hiB: Int64;
+  DecMagBounds(a.fMan.fLimbs, a.fExp, loA, hiA);
+  DecMagBounds(b.fMan.fLimbs, b.fExp, loB, hiB);
+  var c: integer;
+  if hiA < loB then c := -1
+  else if hiB < loA then c := 1
+  else begin
+    var d := Int64(a.fExp) - b.fExp;
+    if d >= 0 then c := LCmp(LScale10(a.fMan.fLimbs, d), b.fMan.fLimbs)
+    else c := LCmp(a.fMan.fLimbs, LScale10(b.fMan.fLimbs, -d));
+  end;
+  result := if sa < 0 then -c else c;
+end;
+
+function DecAddSub(const a, b: BigDecimal; negateB: boolean): BigDecimal;
+begin
+  if Length(b.fMan.fLimbs) = 0 then exit(a);
+  if Length(a.fMan.fLimbs) = 0 then begin
+    result := b;
+    if negateB then result.fMan := -result.fMan;
+    exit;
+  end;
+  // align both mantissas to the smaller exponent
+  var e := if Int64(a.fExp) < b.fExp then Int64(a.fExp) else Int64(b.fExp);
+  var am := LScale10(a.fMan.fLimbs, Int64(a.fExp) - e);
+  var bm := LScale10(b.fMan.fLimbs, Int64(b.fExp) - e);
+  result := DecMake(SAddPair(am, a.fMan.fNeg, bm, b.fMan.fNeg xor negateB), e, a.fHidden or b.fHidden);
+end;
+
+class operator BigDecimal.:=(x: Int64): BigDecimal;
+begin
+  result := DecMake(BFromI64(x), 0, false);
+end;
+
+class operator BigDecimal.:=(x: QWord): BigDecimal;
+begin
+  var m: BigInt;
+  m.fLimbs := LFromQWord(x);
+  m.fNeg := false;
+  result := DecMake(m, 0, false);
+end;
+
+class operator BigDecimal.:=(const s: string): BigDecimal;
+begin
+  if not tryParse(s, result) then RaiseDecParseError(s);
+end;
+
+class operator BigDecimal.:=(const a: BigInt): BigDecimal;
+begin
+  result := DecMake(a, 0, false);
+end;
+
+class operator BigDecimal.:=(const a: UBigInt): BigDecimal;
+begin
+  var m: BigInt;
+  m.fLimbs := a.fLimbs;
+  m.fNeg := false;
+  result := DecMake(m, 0, false);
+end;
+
+class operator BigDecimal.explicit(d: Double): BigDecimal;
+begin
+  result := fromDouble(d);
+end;
+
+class operator BigDecimal.explicit(s: Single): BigDecimal;
+begin
+  result := fromSingle(s);
+end;
+
+class operator BigDecimal.explicit(x: Int64): BigDecimal;
+begin
+  result := DecMake(BFromI64(x), 0, false);
+end;
+
+class operator BigDecimal.explicit(x: QWord): BigDecimal;
+begin
+  var m: BigInt;
+  m.fLimbs := LFromQWord(x);
+  m.fNeg := false;
+  result := DecMake(m, 0, false);
+end;
+
+class operator BigDecimal.explicit(const a: BigDecimal): Double;
+begin
+  result := a.toDouble;
+end;
+
+class operator BigDecimal.explicit(const a: BigDecimal): Single;
+begin
+  result := a.toSingle;
+end;
+
+class operator BigDecimal.explicit(const a: BigDecimal): string;
+begin
+  result := a.toString;
+end;
+
+class operator BigDecimal.explicit(const a: BigDecimal): BigInt;
+begin
+  result := a.toBigInt;
+end;
+
+class operator BigDecimal.+(const a, b: BigDecimal): BigDecimal;
+begin
+  result := DecAddSub(a, b, false);
+end;
+
+class operator BigDecimal.-(const a, b: BigDecimal): BigDecimal;
+begin
+  result := DecAddSub(a, b, true);
+end;
+
+class operator BigDecimal.*(const a, b: BigDecimal): BigDecimal;
+begin
+  result := DecMake(SMulPair(a.fMan.fLimbs, a.fMan.fNeg, b.fMan.fLimbs, b.fMan.fNeg), Int64(a.fExp) + b.fExp, a.fHidden or b.fHidden);
+end;
+
+class operator BigDecimal./(const a, b: BigDecimal): BigDecimal;
+begin
+  result := a.divide(b);
+end;
+
+class operator BigDecimal.div(const a, b: BigDecimal): BigDecimal;
+begin
+  var (q, r) := a.divMod(b);
+  result := q;
+end;
+
+class operator BigDecimal.mod(const a, b: BigDecimal): BigDecimal;
+begin
+  var (q, r) := a.divMod(b);
+  result := r;
+end;
+
+class operator BigDecimal.**(const a: BigDecimal; e: Int64): BigDecimal;
+begin
+  result := a.pow(e);
+end;
+
+class operator BigDecimal.inc(const a: BigDecimal): BigDecimal;
+begin
+  result := DecAddSub(a, BigDecimal.one, false);
+end;
+
+class operator BigDecimal.dec(const a: BigDecimal): BigDecimal;
+begin
+  result := DecAddSub(a, BigDecimal.one, true);
+end;
+
+class operator BigDecimal.-(const a: BigDecimal): BigDecimal;
+begin
+  result := a;
+  result.fMan := -result.fMan;
+end;
+
+class operator BigDecimal.+(const a: BigDecimal): BigDecimal;
+begin
+  result := a;
+end;
+
+class operator BigDecimal.=(const a, b: BigDecimal): boolean;
+begin
+  result := DecCmp(a, b) = 0;
+end;
+
+class operator BigDecimal.<>(const a, b: BigDecimal): boolean;
+begin
+  result := DecCmp(a, b) <> 0;
+end;
+
+class operator BigDecimal.<(const a, b: BigDecimal): boolean;
+begin
+  result := DecCmp(a, b) < 0;
+end;
+
+class operator BigDecimal.<=(const a, b: BigDecimal): boolean;
+begin
+  result := DecCmp(a, b) <= 0;
+end;
+
+class operator BigDecimal.>(const a, b: BigDecimal): boolean;
+begin
+  result := DecCmp(a, b) > 0;
+end;
+
+class operator BigDecimal.>=(const a, b: BigDecimal): boolean;
+begin
+  result := DecCmp(a, b) >= 0;
+end;
+
+function BigDecimal.toString: string;
+var
+  m: TLimbs;
+  e: Int64;
+begin
+  DecDisplay(self, m, e);
+  if Length(m) = 0 then exit('0');
+  var digits := LToBase(m, 10);
+  var l := Length(digits);
+  if e >= 0 then result := digits + StringOfChar('0', e)
+  else begin
+    var f := -e;
+    if l > f then result := Copy(digits, 1, l - f) + '.' + Copy(digits, l - f + 1, f)
+    else result := '0.' + StringOfChar('0', f - l) + digits;
+  end;
+  if fMan.fNeg then result := '-' + result;
+end;
+
+function BigDecimal.toScientific: string;
+var
+  m: TLimbs;
+  e: Int64;
+begin
+  DecDisplay(self, m, e);
+  if Length(m) = 0 then exit('0');
+  var digits := LToBase(m, 10);
+  var l := Length(digits);
+  var rest := if l > 1 then Copy(digits, 2, l - 1) else '0';
+  result := digits[1] + '.' + rest + 'E' + IntToStr(e + l - 1);
+  if fMan.fNeg then result := '-' + result;
+end;
+
+function BigDecimal.toInt64: Int64;
+begin
+  result := toBigInt.toInt64;
+end;
+
+function BigDecimal.toQWord: QWord;
+begin
+  result := toBigInt.toQWord;
+end;
+
+function BigDecimal.toInteger: LongInt;
+begin
+  result := toBigInt.toInteger;
+end;
+
+function BigDecimal.toCardinal: LongWord;
+begin
+  result := toBigInt.toCardinal;
+end;
+
+function BigDecimal.toBigInt: BigInt;
+begin
+  if not isIntegral then raise ERangeError.Create('BigDecimal value is not integral');
+  result := trunc;
+end;
+
+function BigDecimal.fitsInInt64: boolean;
+begin
+  result := isIntegral and trunc.fitsInInt64;
+end;
+
+function BigDecimal.fitsInQWord: boolean;
+begin
+  result := isIntegral and trunc.fitsInQWord;
+end;
+
+function BigDecimal.fitsInInteger: boolean;
+begin
+  result := isIntegral and trunc.fitsInInteger;
+end;
+
+function BigDecimal.fitsInCardinal: boolean;
+begin
+  result := isIntegral and trunc.fitsInCardinal;
+end;
+
+function BigDecimal.isZero: boolean;
+begin
+  result := Length(fMan.fLimbs) = 0;
+end;
+
+function BigDecimal.isOne: boolean;
+var
+  m: TLimbs;
+  e: Int64;
+begin
+  if fMan.fNeg then exit(false);
+  DecCanon(self, m, e);
+  result := (e = 0) and (Length(m) = 1) and (m[0] = 1);
+end;
+
+function BigDecimal.isIntegral: boolean;
+var
+  m: TLimbs;
+  e: Int64;
+begin
+  if fExp >= 0 then exit(true);
+  DecCanon(self, m, e);
+  result := (Length(m) = 0) or (e >= 0);
+end;
+
+function BigDecimal.isEven: boolean;
+var
+  m: TLimbs;
+  e: Int64;
+begin
+  DecCanon(self, m, e);
+  if e > 0 then exit(true);
+  if e < 0 then exit(false);
+  result := (Length(m) = 0) or (m[0] and 1 = 0);
+end;
+
+function BigDecimal.isOdd: boolean;
+var
+  m: TLimbs;
+  e: Int64;
+begin
+  DecCanon(self, m, e);
+  result := (e = 0) and (Length(m) > 0) and (m[0] and 1 = 1);
+end;
+
+function BigDecimal.isNegative: boolean;
+begin
+  result := fMan.isNegative;
+end;
+
+function BigDecimal.isPositive: boolean;
+begin
+  result := fMan.isPositive;
+end;
+
+function BigDecimal.sign: integer;
+begin
+  result := fMan.sign;
+end;
+
+function BigDecimal.abs: BigDecimal;
+begin
+  result := self;
+  result.fMan := result.fMan.abs;
+end;
+
+procedure BigDecimal.negate;
+begin
+  fMan.negate;
+end;
+
+function BigDecimal.trunc: BigInt;
+begin
+  if fExp >= 0 then begin
+    result.fLimbs := LScale10(fMan.fLimbs, fExp);
+    result.fNeg := fMan.fNeg;
+  end else begin
+    var q, r: TLimbs;
+    LDivMod(fMan.fLimbs, UPow10(LongWord(-Int64(fExp))).fLimbs, q, r);
+    result.fLimbs := q;
+    result.fNeg := fMan.fNeg and (Length(q) > 0);
+  end;
+end;
+
+function BigDecimal.floor: BigInt;
+begin
+  result := trunc;
+  if fMan.fNeg and not isIntegral then result := result - 1;
+end;
+
+function BigDecimal.ceil: BigInt;
+begin
+  result := trunc;
+  if not fMan.fNeg and not isIntegral then result := result + 1;
+end;
+
+function BigDecimal.round: BigInt;
+begin
+  result := rounded(0, bdrHalfEven).trunc;
+end;
+
+function BigDecimal.frac: BigDecimal;
+begin
+  if fExp >= 0 then exit(default(BigDecimal));
+  var q, r: TLimbs;
+  LDivMod(fMan.fLimbs, UPow10(LongWord(-Int64(fExp))).fLimbs, q, r);
+  var m: BigInt;
+  m.fLimbs := r;
+  m.fNeg := fMan.fNeg and (Length(r) > 0);
+  result := DecMake(m, fExp, false);
+end;
+
+function BigDecimal.precision: integer;
+var
+  m: TLimbs;
+  e: Int64;
+begin
+  DecCanon(self, m, e);
+  if Length(m) = 0 then exit(0);
+  result := integer(Length(LToBase(m, 10)));
+end;
+
+function BigDecimal.mostSignificantExponent: integer;
+var
+  m: TLimbs;
+  e: Int64;
+begin
+  DecCanon(self, m, e);
+  if Length(m) = 0 then exit(0);
+  result := DecExp(e + Length(LToBase(m, 10)) - 1);
+end;
+
+function BigDecimal.getDigit(i: integer): integer;
+begin
+  var pos := Int64(i) - fExp;
+  if (pos < 0) or fMan.isZero then exit(0);
+  // cheap digit-count bound skips the division for positions above the top
+  if pos > Int64(LBitLen(fMan.fLimbs)) * 1233 div 4096 + 1 then exit(0);
+  var q, r: TLimbs;
+  if pos = 0 then q := fMan.fLimbs
+  else LDivMod(fMan.fLimbs, UPow10(LongWord(pos)).fLimbs, q, r);
+  result := integer(LModW(q, 10));
+end;
+
+procedure BigDecimal.shift10(n: integer);
+begin
+  if not fMan.isZero then fExp := DecExp(Int64(fExp) + n);
+end;
+
+function BigDecimal.shifted10(n: integer): BigDecimal;
+begin
+  result := self;
+  result.shift10(n);
+end;
+
+function BigDecimal.rounded(toDigit: integer; mode: TBigDecimalRounding): BigDecimal;
+begin
+  if fMan.isZero then exit(default(BigDecimal));
+  if fExp >= toDigit then exit(self);
+  var delta := Int64(toDigit) - fExp;
+  var neg := fMan.fNeg;
+  var dcMax := Int64(LBitLen(fMan.fLimbs)) * 1233 div 4096 + 1;
+  var qm, rm, p10: TLimbs;
+  if delta > dcMax then begin
+    // every digit is dropped: quotient 0, remainder is the whole mantissa,
+    // and the remainder is always far below half of 10^delta
+    qm := nil;
+    rm := fMan.fLimbs;
+  end else begin
+    p10 := UPow10(LongWord(delta)).fLimbs;
+    LDivMod(fMan.fLimbs, p10, qm, rm);
+  end;
+  var up := false;
+  if Length(rm) > 0 then begin
+    if mode = bdrCeil then up := not neg
+    else if mode = bdrFloor then up := neg
+    else if mode <> bdrTrunc then begin
+      // half modes compare twice the remainder against 10^delta
+      var c := if delta > dcMax then -1 else LCmp(LShl(rm, 1), p10);
+      if c > 0 then up := true
+      else if c = 0 then begin
+        if mode = bdrRound then up := true
+        else if mode = bdrHalfUp then up := not neg
+        else up := (Length(qm) > 0) and (qm[0] and 1 = 1);
+      end;
+    end;
+  end;
+  var m: BigInt;
+  m.fLimbs := if up then LAdd(qm, LFromQWord(1)) else qm;
+  m.fNeg := neg and (Length(m.fLimbs) > 0);
+  result := DecMake(m, toDigit, false);
+end;
+
+function BigDecimal.compare(const other: BigDecimal): integer;
+begin
+  result := DecCmp(self, other);
+end;
+
+function BigDecimal.equals(const other: BigDecimal): boolean;
+begin
+  result := DecCmp(self, other) = 0;
+end;
+
+function BigDecimal.min(const other: BigDecimal): BigDecimal;
+begin
+  result := if DecCmp(self, other) <= 0 then self else other;
+end;
+
+function BigDecimal.max(const other: BigDecimal): BigDecimal;
+begin
+  result := if DecCmp(self, other) >= 0 then self else other;
+end;
+
+function BigDecimal.divide(const other: BigDecimal; precision: integer): BigDecimal;
+begin
+  if other.fMan.isZero then RaiseDivByZero;
+  if fMan.isZero then exit(default(BigDecimal));
+  if precision < 0 then precision := 0;
+  // guard position: below the requested fractional digits, both operands'
+  // last digits, and `precision` significant digits of a small quotient
+  var ms := (Int64(LBitLen(fMan.fLimbs)) - LBitLen(other.fMan.fLimbs) - 1) * 1233;
+  ms := (if ms >= 0 then ms div 4096 else -((-ms + 4095) div 4096)) + fExp - other.fExp;
+  var er := -Int64(precision);
+  if fExp < er then er := fExp;
+  if other.fExp < er then er := other.fExp;
+  if ms - precision + 1 < er then er := ms - precision + 1;
+  er := er - 1;
+  var t := Int64(fExp) - other.fExp - er;
+  var n, dm: TLimbs;
+  if t >= 0 then begin
+    n := LScale10(fMan.fLimbs, t);
+    dm := other.fMan.fLimbs;
+  end else begin
+    n := fMan.fLimbs;
+    dm := LScale10(other.fMan.fLimbs, -t);
+  end;
+  var q, r: TLimbs;
+  LDivMod(n, dm, q, r);
+  var m: BigInt;
+  m.fLimbs := q;
+  m.fNeg := (fMan.fNeg xor other.fMan.fNeg) and (Length(q) > 0);
+  result := DecMake(m, er, Length(r) > 0);
+end;
+
+function BigDecimal.divMod(const d: BigDecimal): (q, r: BigDecimal);
+var
+  qq, rr: BigDecimal;
+begin
+  if d.fMan.isZero then RaiseDivByZero;
+  var t := Int64(fExp) - d.fExp;
+  var n, dm: TLimbs;
+  if t >= 0 then begin
+    n := LScale10(fMan.fLimbs, t);
+    dm := d.fMan.fLimbs;
+  end else begin
+    n := fMan.fLimbs;
+    dm := LScale10(d.fMan.fLimbs, -t);
+  end;
+  var qm, rm: TLimbs;
+  LDivMod(n, dm, qm, rm);
+  var bq, br: BigInt;
+  bq.fLimbs := qm;
+  bq.fNeg := (fMan.fNeg xor d.fMan.fNeg) and (Length(qm) > 0);
+  br.fLimbs := rm;
+  br.fNeg := fMan.fNeg and (Length(rm) > 0);
+  qq := DecMake(bq, 0, false);
+  rr := DecMake(br, if t >= 0 then Int64(d.fExp) else Int64(fExp), false);
+  exit(qq, rr);
+end;
+
+class function BigDecimal.parse(const s: string): BigDecimal;
+begin
+  if not tryParse(s, result) then RaiseDecParseError(s);
+end;
+
+class function BigDecimal.tryParse(const s: string; out v: BigDecimal): boolean;
+begin
+  v := default(BigDecimal);
+  result := false;
+  var i: SizeInt := 1;
+  var len := Length(s);
+  while (i <= len) and (s[i] in [' ', #9]) do inc(i);
+  while (len >= i) and (s[len] in [' ', #9]) do dec(len);
+  if i > len then exit;
+  var neg := false;
+  if s[i] in ['+', '-'] then begin
+    neg := s[i] = '-';
+    inc(i);
+  end;
+  var digits: TBytes;
+  SetLength(digits, len - i + 1);
+  var count: SizeInt := 0;
+  var fracDigits: Int64 := 0;
+  var seenDot := false;
+  while i <= len do begin
+    var c: char := s[i];
+    if c = '_' then begin
+      inc(i);
+      continue;
+    end;
+    if (c = '.') and not seenDot then begin
+      seenDot := true;
+      inc(i);
+      continue;
+    end;
+    if not (c in ['0'..'9']) then break;
+    digits[count] := byte(Ord(c) - Ord('0'));
+    inc(count);
+    if seenDot then inc(fracDigits);
+    inc(i);
+  end;
+  if count = 0 then exit;
+  var expPart: Int64 := 0;
+  if (i <= len) and (s[i] in ['e', 'E']) then begin
+    inc(i);
+    var eneg := false;
+    if (i <= len) and (s[i] in ['+', '-']) then begin
+      eneg := s[i] = '-';
+      inc(i);
+    end;
+    var any := false;
+    while (i <= len) and ((s[i] = '_') or (s[i] in ['0'..'9'])) do begin
+      if s[i] <> '_' then begin
+        any := true;
+        // clamp far past the exponent range, the final check rejects it
+        if expPart < 1000000000000 then expPart := expPart * 10 + (Ord(s[i]) - Ord('0'));
+      end;
+      inc(i);
+    end;
+    if not any then exit;
+    if eneg then expPart := -expPart;
+  end;
+  if i <= len then exit;
+  SetLength(digits, count);
+  var m: BigInt;
+  m.fLimbs := LFromDigits(digits, 10);
+  m.fNeg := neg and (Length(m.fLimbs) > 0);
+  var e := expPart - fracDigits;
+  LStrip10(m.fLimbs, e);
+  if Length(m.fLimbs) = 0 then e := 0;
+  if (e > High(integer)) or (e < Low(integer)) then exit;
+  v.fMan := m;
+  v.fExp := integer(e);
+  result := true;
+end;
+
+function BigDecimal.sqrt(precision: integer): BigDecimal;
+begin
+  if fMan.fNeg then raise EBigIntError.Create('square root of a negative value');
+  if fMan.isZero then exit(default(BigDecimal));
+  if precision < 0 then precision := 0;
+  // scale to an integer carrying 2*(precision+1) fractional digits and take
+  // the integer root: the extra digit is a truncated guard, hidden like
+  // divide's, so toString shows `precision` rounded digits
+  var p1 := Int64(precision) + 1;
+  var k := Int64(fExp) + 2 * p1;
+  var n: UBigInt;
+  var exact := true;
+  if k >= 0 then n.fLimbs := LScale10(fMan.fLimbs, k)
+  else begin
+    var q, r: TLimbs;
+    LDivMod(fMan.fLimbs, UPow10(LongWord(-k)).fLimbs, q, r);
+    n.fLimbs := q;
+    exact := Length(r) = 0;
+  end;
+  var (root, rem) := n.sqrtRem;
+  var m: BigInt;
+  m.fLimbs := root.fLimbs;
+  m.fNeg := false;
+  result := DecMake(m, -p1, not (exact and rem.isZero));
+end;
+
+function BigDecimal.pow(e: Int64): BigDecimal;
+begin
+  if e = 0 then exit(BigDecimal.one);
+  if fMan.isZero then begin
+    if e < 0 then RaiseDivByZero;
+    exit(default(BigDecimal));
+  end;
+  var mag: QWord := if e > 0 then QWord(e) else NegAbs64(e);
+  var m: BigInt;
+  m.fLimbs := UPowQ(fMan.fLimbs, mag);
+  m.fNeg := fMan.fNeg and (mag and 1 = 1);
+  var pe: Int64 := 0;
+  if fExp <> 0 then begin
+    var ae: QWord := if fExp < 0 then QWord(-Int64(fExp)) else QWord(fExp);
+    if mag > QWord(High(Int64)) div ae then RaiseDecExpRange;
+    pe := Int64(fExp) * Int64(mag);
+  end;
+  result := DecMake(m, pe, fHidden);
+  if e < 0 then result := BigDecimal.one.divide(result);
+end;
+
+function BigDecimal.gcd(const other: BigDecimal): BigDecimal;
+begin
+  if fMan.isZero then exit(other.abs);
+  if other.fMan.isZero then exit(abs);
+  // align to the common scale and reduce the integer pair
+  var e := if Int64(fExp) < other.fExp then Int64(fExp) else Int64(other.fExp);
+  var ua, ub: UBigInt;
+  ua.fLimbs := LScale10(fMan.fLimbs, Int64(fExp) - e);
+  ub.fLimbs := LScale10(other.fMan.fLimbs, Int64(other.fExp) - e);
+  var m: BigInt;
+  m.fLimbs := ua.gcd(ub).fLimbs;
+  m.fNeg := false;
+  result := DecMake(m, e, false);
+end;
+
+function BigDecimal.lcm(const other: BigDecimal): BigDecimal;
+begin
+  if fMan.isZero or other.fMan.isZero then exit(default(BigDecimal));
+  var e := if Int64(fExp) < other.fExp then Int64(fExp) else Int64(other.fExp);
+  var am := LScale10(fMan.fLimbs, Int64(fExp) - e);
+  var bm := LScale10(other.fMan.fLimbs, Int64(other.fExp) - e);
+  var ua, ub: UBigInt;
+  ua.fLimbs := am;
+  ub.fLimbs := bm;
+  var q, r: TLimbs;
+  LDivMod(am, ua.gcd(ub).fLimbs, q, r);
+  var m: BigInt;
+  m.fLimbs := LMul(q, bm);
+  m.fNeg := false;
+  result := DecMake(m, e, false);
+end;
+
+// float bit split: value = (-1)^neg * m * 2^e2, raises on NaN and infinity
+procedure SplitDouble(d: Double; out neg: boolean; out m: QWord; out e2: integer);
+begin
+  var bits: QWord;
+  Move(d, bits, 8);
+  neg := bits shr 63 = 1;
+  var be := integer((bits shr 52) and $7FF);
+  m := bits and ((QWord(1) shl 52) - 1);
+  if be = $7FF then raise EConvertError.Create('cannot convert NaN or infinity to BigDecimal');
+  if be = 0 then e2 := -1074
+  else begin
+    m := m or (QWord(1) shl 52);
+    e2 := be - 1075;
+  end;
+end;
+
+procedure SplitSingle(s: Single; out neg: boolean; out m: QWord; out e2: integer);
+begin
+  var bits: DWord;
+  Move(s, bits, 4);
+  neg := bits shr 31 = 1;
+  var be := integer((bits shr 23) and $FF);
+  m := bits and ((1 shl 23) - 1);
+  if be = $FF then raise EConvertError.Create('cannot convert NaN or infinity to BigDecimal');
+  if be = 0 then e2 := -149
+  else begin
+    m := m or (1 shl 23);
+    e2 := be - 150;
+  end;
+end;
+
+{$ifdef FPC_HAS_TYPE_EXTENDED}
+procedure SplitExtended(x: Extended; out neg: boolean; out m: QWord; out e2: integer);
+begin
+  // 80-bit layout: 64-bit mantissa with an explicit integer bit + 15-bit exponent
+  var hi: Word;
+  Move(x, m, 8);
+  Move(PByte(@x)[8], hi, 2);
+  neg := hi shr 15 = 1;
+  var be := integer(hi and $7FFF);
+  if be = $7FFF then raise EConvertError.Create('cannot convert NaN or infinity to BigDecimal');
+  if be = 0 then e2 := -16445
+  else e2 := be - 16446;
+end;
+{$endif}
+
+// exact decimal expansion of m * 2^e2 (m * 5^-e2 * 10^e2 for negative e2)
+function DecFromFloatExact(neg: boolean; m: QWord; e2: integer): BigDecimal;
+begin
+  if m = 0 then exit(default(BigDecimal));
+  var b: BigInt;
+  var e10: Int64 := 0;
+  if e2 >= 0 then b.fLimbs := LShl(LFromQWord(m), LongWord(e2))
+  else begin
+    b.fLimbs := LMul(LFromQWord(m), UPowQ(LFromQWord(5), LongWord(-e2)));
+    e10 := e2;
+  end;
+  b.fNeg := neg;
+  result := DecMake(b, e10, false);
+end;
+
+// shortest decimal digits that read back to exactly m * 2^e2 under round to
+// nearest, ties to even: value = 0.d1..dn * 10^k. The classic long-division
+// loop over exact integers with the half-gap boundaries (Steele & White)
+function ShortestDigits(m: QWord; e2: integer; lowHalf: boolean; out k: Int64): TBytes;
+begin
+  var even := m and 1 = 0;
+  var r, s, mp: UBigInt;
+  if e2 >= 0 then begin
+    mp := UBigInt.pow2(LongWord(e2));
+    r := UBigInt(m) * mp * 2;
+    s := 2;
+  end else begin
+    r := UBigInt(m) * 2;
+    s := UBigInt.pow2(LongWord(1 - e2));
+    mp := 1;
+  end;
+  var mm := mp;
+  if lowHalf then begin
+    // the gap below a power-of-two mantissa is half the gap above it
+    r := r * 2;
+    s := s * 2;
+    mp := mp * 2;
+  end;
+  // scale so the value sits in [1/10, 1): digits then come out one per step
+  // (an even mantissa owns its boundaries, so ties count as inside)
+  var hiIncl := if even then 0 else 1;
+  k := 0;
+  while (r + mp).compare(s) >= hiIncl do begin
+    s := s * 10;
+    inc(k);
+  end;
+  while ((r + mp) * 10).compare(s) < hiIncl do begin
+    r := r * 10;
+    mp := mp * 10;
+    mm := mm * 10;
+    dec(k);
+  end;
+  var digs: TBytes;
+  SetLength(digs, 24);
+  var count: SizeInt := 0;
+  repeat
+    r := r * 10;
+    mp := mp * 10;
+    mm := mm * 10;
+    var (d, rr) := r.divMod(s);
+    r := rr;
+    var dv := byte(d.toQWord);
+    var low := if even then r.compare(mm) <= 0 else r.compare(mm) < 0;
+    var high := if even then (r + mp).compare(s) >= 0 else (r + mp).compare(s) > 0;
+    if count = Length(digs) then SetLength(digs, count * 2);
+    if low or high then begin
+      // terminal digit: pick the closer side, ties round up
+      if (high and not low) or (high and low and ((r * 2).compare(s) >= 0)) then inc(dv);
+      digs[count] := dv;
+      inc(count);
+      break;
+    end;
+    digs[count] := dv;
+    inc(count);
+  until false;
+  // a rounded-up 10 carries into the digits above
+  var i := count - 1;
+  while (i >= 0) and (digs[i] = 10) do begin
+    digs[i] := 0;
+    dec(i);
+    if i >= 0 then inc(digs[i]);
+  end;
+  if i < 0 then begin
+    // all nines rolled over: a single 1, one power of ten higher
+    digs[0] := 1;
+    count := 1;
+    inc(k);
+  end;
+  while (count > 1) and (digs[count - 1] = 0) do dec(count);
+  var start: SizeInt := 0;
+  while (start < count - 1) and (digs[start] = 0) do begin
+    inc(start);
+    dec(k);
+  end;
+  result := Copy(digs, start, count - start);
+end;
+
+function DecFromShortest(neg: boolean; m: QWord; e2: integer; lowHalf: boolean): BigDecimal;
+begin
+  if m = 0 then exit(default(BigDecimal));
+  var k: Int64;
+  var digs := ShortestDigits(m, e2, lowHalf, k);
+  var b: BigInt;
+  b.fLimbs := LFromDigits(digs, 10);
+  b.fNeg := neg;
+  result := DecMake(b, k - Length(digs), false);
+end;
+
+// correctly rounded binary conversion: p mantissa bits, [emin, emax] the
+// exponent range; ties to even, overflow gives infinity, underflow zero
+function DecToFloat(const a: BigDecimal; p, emin, emax: integer): Extended;
+begin
+  if Length(a.fMan.fLimbs) = 0 then exit(0.0);
+  var sgn: Extended := if a.fMan.fNeg then -1.0 else 1.0;
+  var lo, hi: Int64;
+  DecMagBounds(a.fMan.fLimbs, a.fExp, lo, hi);
+  // decimal guards keep absurd exponents from materializing huge powers
+  if lo > 4940 then exit(sgn * Infinity);
+  if hi < -4970 then exit(sgn * 0.0);
+  var n, dm: TLimbs;
+  if a.fExp >= 0 then begin
+    n := LScale10(a.fMan.fLimbs, a.fExp);
+    dm := LFromQWord(1);
+  end else begin
+    n := a.fMan.fLimbs;
+    dm := UPow10(LongWord(-Int64(a.fExp))).fLimbs;
+  end;
+  // scale so the quotient carries p+1..p+3 bits, then round with the remainder
+  var s := Int64(p) + 2 - (Int64(LBitLen(n)) - Int64(LBitLen(dm)));
+  if s >= 0 then n := LShl(n, LongWord(s))
+  else dm := LShl(dm, LongWord(-s));
+  var q, r: TLimbs;
+  LDivMod(n, dm, q, r);
+  var qb := Int64(LBitLen(q));
+  var vexp := qb - 1 - s;
+  if vexp < Int64(emin) - p then exit(sgn * 0.0);
+  // subnormals keep fewer bits: positions vexp down to emin - p + 1
+  var targetP := vexp - Int64(emin) + p;
+  if targetP > p then targetP := p;
+  var excess := qb - targetP;
+  var keep := LToQWord(LShr(q, LongWord(excess)));
+  var roundBit := LTestBit(q, LongWord(excess - 1));
+  var rest := Length(r) > 0;
+  if not rest then begin
+    var uq: UBigInt;
+    uq.fLimbs := q;
+    var lsb := uq.lowestSetBit;
+    rest := (lsb >= 0) and (lsb < excess - 1);
+  end;
+  if roundBit and (rest or (keep and 1 = 1)) then begin
+    if keep = High(QWord) then begin
+      // 64-bit mantissa rolled over to 2^64
+      if vexp + 1 > emax then exit(sgn * Infinity);
+      exit(sgn * ldexp(2.0, integer(vexp)));
+    end;
+    inc(keep);
+  end;
+  if keep = 0 then exit(sgn * 0.0);
+  var fe := vexp - targetP + 1;
+  if Int64(BsrQWord(keep)) + fe > emax then exit(sgn * Infinity);
+  result := sgn * ldexp(Extended(keep), integer(fe));
+end;
+
+function BigDecimal.toDouble: Double;
+begin
+  result := Double(DecToFloat(self, 53, -1022, 1023));
+end;
+
+function BigDecimal.toSingle: Single;
+begin
+  result := Single(DecToFloat(self, 24, -126, 127));
+end;
+
+{$ifdef FPC_HAS_TYPE_EXTENDED}
+function BigDecimal.toExtended: Extended;
+begin
+  result := DecToFloat(self, 64, -16382, 16383);
+end;
+{$endif}
+
+class function BigDecimal.fromDouble(d: Double): BigDecimal;
+begin
+  var neg: boolean;
+  var m: QWord;
+  var e2: integer;
+  SplitDouble(d, neg, m, e2);
+  result := DecFromShortest(neg, m, e2, (m = QWord(1) shl 52) and (e2 > -1074));
+end;
+
+class function BigDecimal.fromDoubleExact(d: Double): BigDecimal;
+begin
+  var neg: boolean;
+  var m: QWord;
+  var e2: integer;
+  SplitDouble(d, neg, m, e2);
+  result := DecFromFloatExact(neg, m, e2);
+end;
+
+class function BigDecimal.fromSingle(s: Single): BigDecimal;
+begin
+  var neg: boolean;
+  var m: QWord;
+  var e2: integer;
+  SplitSingle(s, neg, m, e2);
+  result := DecFromShortest(neg, m, e2, (m = 1 shl 23) and (e2 > -149));
+end;
+
+class function BigDecimal.fromSingleExact(s: Single): BigDecimal;
+begin
+  var neg: boolean;
+  var m: QWord;
+  var e2: integer;
+  SplitSingle(s, neg, m, e2);
+  result := DecFromFloatExact(neg, m, e2);
+end;
+
+{$ifdef FPC_HAS_TYPE_EXTENDED}
+class function BigDecimal.fromExtended(e: Extended): BigDecimal;
+begin
+  var neg: boolean;
+  var m: QWord;
+  var e2: integer;
+  SplitExtended(e, neg, m, e2);
+  result := DecFromShortest(neg, m, e2, (m = QWord(1) shl 63) and (e2 > -16445));
+end;
+
+class function BigDecimal.fromExtendedExact(e: Extended): BigDecimal;
+begin
+  var neg: boolean;
+  var m: QWord;
+  var e2: integer;
+  SplitExtended(e, neg, m, e2);
+  result := DecFromFloatExact(neg, m, e2);
+end;
+{$endif}
+
+function BigDecimal.hashCode: DWord;
+var
+  m: TLimbs;
+  e: Int64;
+begin
+  DecCanon(self, m, e);
+  var b: BigInt;
+  b.fLimbs := m;
+  b.fNeg := fMan.fNeg and (Length(m) > 0);
+  result := b.hashCode xor (DWord(e) * 16777619);
+end;
+
+procedure BigDecimal.swap(var other: BigDecimal);
+begin
+  fMan.swap(other.fMan);
+  SwapValues(fExp, other.fExp);
+  SwapValues(fHidden, other.fHidden);
+end;
+
+class function BigDecimal.zero: BigDecimal;
+begin
+  result := default(BigDecimal);
+end;
+
+class function BigDecimal.one: BigDecimal;
+begin
+  result := default(BigDecimal);
+  result.fMan := 1;
+end;
+
+class function BigDecimal.two: BigDecimal;
+begin
+  result := default(BigDecimal);
+  result.fMan := 2;
+end;
+
+class function BigDecimal.ten: BigDecimal;
+begin
+  result := default(BigDecimal);
+  result.fMan := 1;
+  result.fExp := 1;
 end;
 
 {$ifdef BIGINT_ASM}
