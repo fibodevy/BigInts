@@ -17,13 +17,13 @@ Arbitrary precision integers and decimals for Pascal in a single self-contained 
 - literals of any size with `_` separators and `$ 0x % 0b & 0o` prefixes; parsing and formatting in every base 2..36
 - multiplication: schoolbook, Karatsuba and Toom-3, picked by tunable thresholds, with dedicated squaring paths
 - division: Knuth algorithm D, plus divide-and-conquer base conversion for long numbers
-- modular arithmetic: Montgomery `modPow` with a windowed exponent, `modInverse`, `modSqrt` (Tonelli-Shanks), `crt`
-- primes: Miller-Rabin `isProbablePrime` (deterministic below 3.3e24), `nextPrime`/`prevPrime`, `randomPrime` with an exact bit length
-- factorization: trial division plus Pollard-Brent rho, exponents grouped into `(p, e)` tuples
-- number theory and combinatorics: Lehmer `gcd`, `gcdExt` (Bezout coefficients), `lcm`, `jacobi`, `factorial`, `fibonacci`, `lucas`, `binomial`, `catalan`, `primorial`
+- modular arithmetic: Montgomery `modPow` (plus a constant-time `modPowSec`), `modInverse`, `modSqrt` (Tonelli-Shanks), `sqrtModN`, `crt`, `discreteLog`
+- primes: Miller-Rabin `isProbablePrime` (deterministic below 3.3e24), Baillie-PSW `isPrime`, `nextPrime`/`prevPrime`, `randomPrime`/`randomSafePrime`/`randomStrongPrime`, exact `primePi`/`primeCount`
+- factorization: trial division plus Pollard-Brent rho, exponents grouped into `(p, e)` tuples; the multiplicative functions `eulerPhi`, `carmichaelLambda`, `moebius`, `sigma`, `tau`, `divisors`, `radical` follow from it
+- number theory and combinatorics: Lehmer `gcd`, `gcdExt`, `jacobi`, `kronecker`, `continuedFraction`, and `factorial`, `fibonacci`, `lucas`, `binomial`, `multinomial`, `catalan`, `bell`, `stirling1`/`stirling2`, `bernoulli`, `partitions`, `subfactorial`, `primorial`
 - randomness: pluggable generators (xoshiro256**, PCG64, splitmix64, `System.Random`, OS entropy), deterministic seeding, uniform `randomBelow`/`randomRange`
 - interop: byte serialization in both endiannesses, `hashCode`, digit-grouped output
-- decimals: exact decimal arithmetic (`0.1 + 0.2 = 0.3`), division and roots at any precision, six rounding modes, shortest and exact float conversions in both directions, and the whole analytic toolbox - `pi`, `exp`, `ln`, `log`, fractional powers, trigonometry and hyperbolics at any precision (the BigDecimal chapter below)
+- decimals: exact decimal arithmetic (`0.1 + 0.2 = 0.3`), division and roots at any precision, six rounding modes, shortest and exact float conversions in both directions, and the whole analytic toolbox - `pi`, `exp`, `ln`, `log`, fractional powers, trigonometry, hyperbolics, `gamma`, `erf`, `atan2`, `hypot`, `agm` at any precision (the BigDecimal chapter below)
 - speed: measured 1.4-4x of GMP on x64 for the core operations (benchmarks below); assembler inner loops with a pure Pascal fallback behind a `USEASM` define
 
 ## Quick start
@@ -100,12 +100,15 @@ Everything is camelCase and discoverable through code completion. Methods live o
 
 | method | notes |
 |---|---|
-| `sqr`, `sqrt`, `nthRoot(n)` | squaring and integer (floor) roots |
+| `sqr`, `sqrt`, `nthRoot(n)`, `nthRootRem(n)` | squaring and integer (floor) roots; `nthRootRem` also returns the remainder |
+| `isKthPower(k)` | whether the value is an exact `k`-th power |
 | `pow(e)`, `**` | plain powers |
 | `modPow(e, m)` | Montgomery with a windowed exponent for odd `m`; on `BigInt` the modulus must be positive, the result lands in `0..m-1` and a negative exponent goes through the modular inverse |
+| `modPowSec(e, m)` | same result as `modPow`, but the operation sequence does not branch on the exponent bits (side-channel resistant, for secret exponents) |
 | `modInverse(m)` | raises `EBigIntError` when no inverse exists |
 | `gcd`, `lcm` | Lehmer gcd |
 | `isProbablePrime(rounds = 24)` | Miller-Rabin; deterministic witnesses below 3.3e24, random rounds above |
+| `isPrime` | Baillie-PSW (deterministic small-range test, then strong base-2 Miller-Rabin plus a strong Lucas test); no known counterexample |
 | `nextPrime` | first prime above self |
 
 ### Constants and generators (class functions)
@@ -129,6 +132,8 @@ The optional math layer on top of the core arithmetic.
 | `randomBelow(bound)` | uniform in `0..bound-1`, rejection sampling |
 | `randomRange(lo, hi)` | uniform in `lo..hi`, both ends included; negative bounds work on `BigInt` |
 | `randomPrime(bits, rounds = 24)` | exact bit length: top bit set, odd, Miller-Rabin tested |
+| `randomSafePrime(bits)` | a safe prime `p` where `(p-1)/2` is also prime |
+| `randomStrongPrime(bits)` | Gordon's algorithm: `p-1` and `p+1` each carry a large prime factor |
 
 The backend behind `random` and friends is selected with the `BigIntRngAlgo` variable:
 
@@ -148,7 +153,10 @@ The backend behind `random` and friends is selected with the `BigIntRngAlgo` var
 |---|---|
 | `gcdExt(other)` | `BigInt` only; extended Euclid returning the `(g, x, y)` tuple with `a*x + b*y = g` |
 | `jacobi(n)` | Jacobi symbol for an odd positive `n`, returns -1, 0 or 1 |
+| `kronecker(n)` | Kronecker symbol, the full extension of Jacobi to any integers (handles the factor 2 and negative arguments) |
 | `modSqrt(p)` | square root modulo a prime (Tonelli-Shanks); raises `EBigIntError` for a non-residue |
+| `sqrtModN(n)` | every square root modulo a composite `n` (factor, lift, CRT); needs `gcd(self, n) = 1`, empty array for a non-residue |
+| `discreteLog(target, m)` | baby-step giant-step: least `x` with `self^x = target (mod m)`, or -1; `Int64`, for small instances |
 | `crt(remainders, moduli)` | `BigInt` class function; Chinese remainder theorem for pairwise coprime positive moduli |
 | `isPerfectSquare` | quick mod-16 filter, then an exact root check |
 | `sqrtRem` | returns the `(root, rem)` tuple with `self = root^2 + rem` |
@@ -157,14 +165,55 @@ The backend behind `random` and friends is selected with the `BigIntRngAlgo` var
 
 `factorize` runtime grows with the square root of the second-largest prime factor, so a product of two large random primes will grind for a very long time - that is the nature of factoring, not a bug.
 
+These read straight off the factorization (so they cost what `factorize` costs):
+
+| method | notes |
+|---|---|
+| `eulerPhi` | Euler totient, the count of integers up to `n` coprime to it |
+| `carmichaelLambda` | the group exponent: the least `k` with `a^k = 1 (mod n)` for every coprime `a` |
+| `moebius` | Moebius function, returns -1, 0 or 1 |
+| `sigma(k = 1)` | sum of the `k`-th powers of the divisors; `sigma(0)` is `tau` |
+| `tau` | number of divisors |
+| `radical` | product of the distinct prime factors |
+| `divisors` | every divisor in ascending order |
+| `isSquarefree`, `isPerfect`, `isCarmichael` | the matching predicates |
+
+Prime counting and rational approximation (`BigInt`/`UBigInt` class functions):
+
+| method | notes |
+|---|---|
+| `primePi(n)` | exact number of primes `<= n` by a segmented sieve (`QWord`, practical to ~1e10) |
+| `primeCount(lo, hi)` | exact number of primes in `lo..hi` |
+| `continuedFraction(num, den)` | the coefficients of the continued fraction of `num/den` |
+| `fromContinuedFraction(cf)` | evaluate coefficients back to a reduced `(num, den)`; slice `cf` for convergents |
+
 ### Combinatorics
+
+All class functions.
 
 | method | notes |
 |---|---|
 | `lucas(n)` | companion sequence to Fibonacci, one fast-doubling run |
 | `binomial(n, k)` | multiplicative form, every intermediate division exact |
+| `multinomial(ks)` | `(sum ks)! / prod(ks[i]!)`, as a product of binomials |
 | `catalan(n)` | `binomial(2n, n) div (n + 1)` |
 | `primorial(n)` | product of all primes up to `n`, odd sieve plus balanced multiplication |
+| `risingFactorial(x, n)`, `fallingFactorial(x, n)` | Pochhammer symbols; `BigInt` accepts a negative base |
+| `subfactorial(n)` | derangement count `!n` |
+| `bell(n)` | Bell number, via the Bell triangle |
+| `stirling1(n, k)` | signed Stirling number of the first kind (`BigInt`) |
+| `stirling2(n, k)` | Stirling number of the second kind |
+| `partitions(n)` | integer partition count `p(n)`, Euler pentagonal recurrence |
+| `bernoulli(n)` | `BigInt` class function; the Bernoulli number as an exact reduced `(num, den)` fraction |
+
+### Roman numerals and words
+
+`BigInt` and `UBigInt` also format themselves for humans:
+
+| method | notes |
+|---|---|
+| `toRoman` | Roman numerals for a value in `1..3999` |
+| `toWords` | English short-scale words (`one million two hundred thirty-four thousand ...`), up to `10^66` |
 
 ## BigDecimal
 
@@ -241,7 +290,13 @@ end.
 | `exp`, `ln`, `log2`, `log10`, `logBase(b)` | all take `(precision = 18)`; `log10` is exact for powers of ten, `log2` for powers of two |
 | `sin`, `cos`, `tan`, `arcsin`, `arccos`, `arctan` | radians; big arguments reduce modulo pi/2 at a matching precision |
 | `sinh`, `cosh`, `tanh` | hyperbolics over the same exponential core |
+| `gamma`, `lnGamma` | the gamma function (reflection covers negatives) and its logarithm (positive argument) |
+| `factorial` | the real factorial `x! = gamma(x+1)`, exact for small non-negative integers |
+| `erf`, `erfc` | the error function and its complement; `erfc` uses a continued fraction for large arguments |
+| `continuedFraction(maxTerms = 0)` | the (finite, exact) continued fraction of the value; great for best rational approximations |
+| `roundToSignificant(digits, mode = bdrRound)` | round to a count of significant digits rather than a decimal position |
 | `pi(precision)`, `e(precision)` | class functions; pi is cached between calls |
+| `atan2(y, x, precision)`, `hypot(x, y, precision)`, `agm(a, b, precision)` | class functions: quadrant-aware arctangent, Euclidean length, arithmetic-geometric mean |
 | `gcd`, `lcm` | on the decimal lattice: `gcd(0.25, 0.15) = 0.05` |
 | `precision`, `mostSignificantExponent`, `getDigit(i)` | significant digit count, exponent of the leading digit, digit at `10^i` |
 | `shift10(n)`, `shifted10(n)` | multiply by a power of ten without touching the mantissa |
