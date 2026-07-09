@@ -438,3 +438,5 @@ end.
 ## License
 
 This project is licensed under the Mozilla Public License 2.0 (MPL-2.0). See the LICENSE file for details.
+
+The example programs under `examples/` are free to use without restriction; copy from them into your own projects freely, with no MPL obligations.
