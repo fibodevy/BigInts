@@ -1848,6 +1848,301 @@ begin
   check(BigDecimal('0.3').approxEquals(BigDecimal('0.1') + BigDecimal('0.2'), BigDecimal(0)), 'dec approx exact decimals');
 end;
 
+procedure testDecSpecial;
+
+  procedure near(const v, ref: BigDecimal; tol: integer; const name: string);
+  begin
+    check((v - ref).abs < BigDecimal.one.shifted10(-tol), name);
+  end;
+
+const
+  SQRTPI = '1.7724538509055160272981674833411451827975494561224';
+  SQRTPI_HALF = '0.88622692545275801364908374167057259139877472806119';
+  ERF_1 = '0.84270079294971486934122063508260925929606699796630';
+  ERFC_3 = '0.0000220904969985854413727761295823203798477559552253';
+  AGM_1_2 = '1.4567910310469068691864323832650819749738639432213';
+begin
+  section('BigDecimal special functions');
+  // gamma against closed forms
+  near(BigDecimal('0.5').gamma(45), BigDecimal(SQRTPI), 43, 'gamma(1/2) = sqrt(pi)');
+  near(BigDecimal('1.5').gamma(45), BigDecimal(SQRTPI_HALF), 43, 'gamma(3/2)');
+  near(BigDecimal('-0.5').gamma(40), BigDecimal(SQRTPI) * (-2), 37, 'gamma(-1/2)');
+  check(BigDecimal(5).gamma(20) = BigDecimal(24), 'gamma(5) = 4!');
+  check(BigDecimal(10).gamma(20) = BigDecimal(362880), 'gamma(10) = 9!');
+  // gamma(x+1) = x gamma(x) on random arguments
+  for var i := 1 to 20 do begin
+    var x := BigDecimal(Random(1900) + 100).divide(BigDecimal(100), 12); // 1..20
+    near(x.gamma(35) * x, (x + 1).gamma(35), 30, 'gamma recurrence');
+  end;
+  // lnGamma = ln(gamma) where gamma is positive
+  near(BigDecimal(10).lnGamma(40), BigDecimal(362880).ln(45), 36, 'lnGamma(10)');
+  near(BigDecimal('3.5').lnGamma(40), BigDecimal('3.5').gamma(45).ln(45), 35, 'lnGamma = ln gamma');
+  near(BigDecimal(100).lnGamma(40), BigDecimal(UBigInt.factorial(99)).ln(45), 35, 'lnGamma(100)');
+  // factorial on fractions and integers
+  near(BigDecimal('0.5').factorial(40), BigDecimal(SQRTPI_HALF), 38, '0.5! = gamma(1.5)');
+  check(BigDecimal(6).factorial(20) = BigDecimal(720), '6! = 720');
+  check(BigDecimal(20).factorial(20) = BigDecimal(UBigInt.factorial(20)), '20! exact');
+  // erf and erfc
+  checkEq(BigDecimal(0).erf.toString, '0', 'erf(0) = 0');
+  near(BigDecimal(1).erf(45), BigDecimal(ERF_1), 43, 'erf(1)');
+  near(BigDecimal('-1').erf(45), -BigDecimal(ERF_1), 43, 'erf odd');
+  near(BigDecimal(3).erfc(45), BigDecimal(ERFC_3), 43, 'erfc(3)');
+  check(BigDecimal(30).erf(30) = BigDecimal.one, 'erf saturates');
+  for var i := 1 to 15 do begin
+    var x := BigDecimal(Random(500) - 250).divide(BigDecimal(100), 10);   // -2.5..2.5
+    near(x.erf(40) + x.erfc(40), BigDecimal.one, 36, 'erf + erfc = 1');
+  end;
+  // agm
+  near(BigDecimal.agm(BigDecimal(1), BigDecimal(2), 45), BigDecimal(AGM_1_2), 43, 'agm(1,2)');
+  check(BigDecimal.agm(BigDecimal(7), BigDecimal(7), 20) = BigDecimal(7), 'agm(a,a) = a');
+  // atan2 across all quadrants
+  var pi := BigDecimal.pi(45);
+  near(BigDecimal.atan2(BigDecimal(1), BigDecimal(1), 40), pi.divide(4, 42), 37, 'atan2 Q1');
+  near(BigDecimal.atan2(BigDecimal(1), BigDecimal(-1), 40), pi * 3 / 4, 37, 'atan2 Q2');
+  near(BigDecimal.atan2(BigDecimal(-1), BigDecimal(-1), 40), -pi * 3 / 4, 37, 'atan2 Q3');
+  near(BigDecimal.atan2(BigDecimal(-1), BigDecimal(1), 40), -pi.divide(4, 42), 37, 'atan2 Q4');
+  near(BigDecimal.atan2(BigDecimal(1), BigDecimal(0), 40), pi.divide(2, 42), 37, 'atan2 +y axis');
+  near(BigDecimal.atan2(BigDecimal(-1), BigDecimal(0), 40), -pi.divide(2, 42), 37, 'atan2 -y axis');
+  near(BigDecimal.atan2(BigDecimal(0), BigDecimal(-1), 40), pi, 37, 'atan2 -x axis');
+  check(BigDecimal.atan2(BigDecimal(0), BigDecimal(0), 20).isZero, 'atan2(0,0) = 0');
+  // atan2(sin, cos) recovers the angle
+  for var i := 1 to 15 do begin
+    var t := BigDecimal(Random(600) - 300).divide(BigDecimal(100), 10);   // -3..3
+    near(BigDecimal.atan2(t.sin(40), t.cos(40), 35), t, 30, 'atan2 of sin,cos');
+  end;
+  // hypot
+  check(BigDecimal.hypot(BigDecimal(3), BigDecimal(4), 20) = BigDecimal(5), 'hypot 3,4,5');
+  check(BigDecimal.hypot(BigDecimal(8), BigDecimal(15), 20) = BigDecimal(17), 'hypot 8,15,17');
+  near(BigDecimal.hypot(BigDecimal(1), BigDecimal(1), 40), BigDecimal(2).sqrt(42), 37, 'hypot(1,1) = sqrt2');
+  // roundToSignificant
+  checkEq(BigDecimal('123.456').roundToSignificant(2).toString, '120', 'sig 2');
+  checkEq(BigDecimal('123.456').roundToSignificant(4).toString, '123.5', 'sig 4');
+  checkEq(BigDecimal('0.00123456').roundToSignificant(3).toString, '0.00123', 'sig small');
+  checkEq(BigDecimal('0.0996').roundToSignificant(2).toString, '0.1', 'sig carry');
+  checkEq(BigDecimal('-98765').roundToSignificant(2, bdrTrunc).toString, '-98000', 'sig trunc negative');
+  checkRaises(procedure begin var z := BigDecimal(5).roundToSignificant(0); end, EBigIntError, 'sig zero digits');
+  // error paths
+  checkRaises(procedure begin var z := BigDecimal(0).gamma; end, EBigIntError, 'gamma pole at 0');
+  checkRaises(procedure begin var z := BigDecimal(-3).gamma; end, EBigIntError, 'gamma pole at -3');
+  checkRaises(procedure begin var z := BigDecimal(-1).lnGamma; end, EBigIntError, 'lnGamma negative');
+  checkRaises(procedure begin var z := BigDecimal.agm(BigDecimal(-1), BigDecimal(2)); end, EBigIntError, 'agm negative');
+end;
+
+procedure testExtrasMultiplicative;
+begin
+  section('extras: multiplicative functions');
+  check(UBigInt(1).eulerPhi = 1, 'phi(1)');
+  check(UBigInt(360).eulerPhi = 96, 'phi(360)');
+  check(UBigInt(97).eulerPhi = 96, 'phi(prime)');
+  // phi via the product formula matches a direct coprime count for small n
+  for var n := 1 to 200 do begin
+    var cnt := 0;
+    for var k := 1 to n do if UBigInt(k).gcd(UBigInt(n)).isOne then inc(cnt);
+    check(UBigInt(n).eulerPhi = cnt, 'phi count ' + IntToStr(n));
+  end;
+  check(UBigInt(12).sigma(1) = 28, 'sigma1(12)');
+  check(UBigInt(6).sigma(1) = 12, 'sigma1(6)');
+  check(UBigInt(10).sigma(2) = 130, 'sigma2(10)'); // 1+4+25+100
+  check(UBigInt(12).tau = 6, 'tau(12)');
+  check(UBigInt(360).sigma(0) = UBigInt(360).tau, 'sigma0 = tau');
+  // sum of divisors matches sigma, count matches tau
+  for var n := 1 to 100 do begin
+    var d := UBigInt(n).divisors;
+    var s := UBigInt.zero;
+    for var x in d do s := s + x;
+    check(UBigInt(Int64(Length(d))) = UBigInt(n).tau, 'divisor count ' + IntToStr(n));
+    check(s = UBigInt(n).sigma(1), 'divisor sum ' + IntToStr(n));
+    for var i := 0 to High(d) do check((UBigInt(n) mod d[i]).isZero, 'divides ' + IntToStr(n));
+  end;
+  check(UBigInt(30).moebius = -1, 'mu(30)');
+  check(UBigInt(12).moebius = 0, 'mu(12)');
+  check(UBigInt(1).moebius = 1, 'mu(1)');
+  check(UBigInt(12).radical = 6, 'rad(12)');
+  check(UBigInt(360).radical = 30, 'rad(360)');
+  check(UBigInt(15).carmichaelLambda = 4, 'lambda(15)');
+  check(UBigInt(561).carmichaelLambda = 80, 'lambda(561)');
+  // a^lambda(n) = 1 (mod n) for a coprime to n
+  for var n := 2 to 60 do begin
+    var lam := UBigInt(n).carmichaelLambda;
+    for var a := 1 to n - 1 do
+      if UBigInt(a).gcd(UBigInt(n)).isOne then check(UBigInt(a).modPow(lam, UBigInt(n)).isOne, 'carmichael order ' + IntToStr(n));
+  end;
+  check(UBigInt(6).isPerfect and UBigInt(28).isPerfect and UBigInt(496).isPerfect and UBigInt(8128).isPerfect, 'perfect numbers');
+  check(not UBigInt(12).isPerfect, 'not perfect');
+  check(UBigInt(30).isSquarefree and not UBigInt(18).isSquarefree, 'squarefree');
+  check(UBigInt(561).isCarmichael and UBigInt(1105).isCarmichael and UBigInt(1729).isCarmichael, 'carmichael numbers');
+  check(not UBigInt(1728).isCarmichael, 'not carmichael');
+  check(UBigInt(729).isKthPower(6) and UBigInt(1000000).isKthPower(6), 'is 6th power');
+  check(not UBigInt(1000).isKthPower(6), 'not 6th power');
+  var (rt, rm) := UBigInt(1030).nthRootRem(3);
+  check((rt = 10) and (rm = 30), 'nthRootRem');
+  check(BigInt(-8).isKthPower(3) and not BigInt(-8).isKthPower(2), 'signed kth power');
+  check(BigInt(-360).eulerPhi = 96, 'signed phi on magnitude');
+end;
+
+procedure testExtrasCrypto;
+begin
+  section('extras: cryptographic helpers');
+  // BPSW agrees with the deterministic small-range test, then beyond it
+  for var n := 0 to 2000 do check(UBigInt(n).isPrime = UBigInt(n).isProbablePrime, 'isPrime small ' + IntToStr(n));
+  var p1: UBigInt := '1000000000000000000000000000057';
+  check(p1.isPrime, 'isPrime big prime');
+  check(not (p1 + 3).isPrime, 'isPrime big composite');
+  // large Carmichael and strong pseudoprimes must not fool BPSW
+  check(not UBigInt('651693055693681').isPrime, 'BPSW big carmichael');
+  check(not UBigInt('3215031751').isPrime, 'BPSW strong pseudoprime base 2,3,5,7');
+  // prime counting
+  check(UBigInt.primePi(10) = 4, 'pi(10)');
+  check(UBigInt.primePi(100) = 25, 'pi(100)');
+  check(UBigInt.primePi(1000000) = 78498, 'pi(1e6)');
+  check(UBigInt.primeCount(1000000, 1100000) = 7216, 'primeCount interval');
+  // kronecker extends jacobi and matches it on odd positive moduli
+  for var a := -30 to 30 do
+    for var m := 1 to 29 do
+      if UBigInt(m).isOdd then check(BigInt(a).kronecker(BigInt(m)) = BigInt(a).floorMod(BigInt(m)).jacobi(BigInt(m)), 'kronecker vs jacobi');
+  check(BigInt(5).kronecker(BigInt(2)) = -1, 'kronecker(5,2)');
+  check(BigInt(7).kronecker(BigInt(2)) = 1, 'kronecker(7,2)');
+  check(BigInt(-1).kronecker(BigInt(7)) = -1, 'kronecker(-1,7)');
+  check(BigInt(6).kronecker(BigInt(10)) = 0, 'kronecker shares factor');
+  // constant-time modPow agrees with the fast one on random inputs
+  for var i := 1 to 200 do begin
+    var b := randU(200);
+    var e := randU(200);
+    var m := randU(200) or UBigInt.one;
+    if m.isOne then continue;
+    check(b.modPowSec(e, m) = b.modPow(e, m), 'modPowSec matches modPow');
+  end;
+  // sqrtModN: every returned root squares back, and a residue is found
+  for var i := 1 to 100 do begin
+    var n := randU(40) or UBigInt.one;
+    if n < 2 then continue;
+    var a := UBigInt.randomBelow(n);
+    if not a.gcd(n).isOne then continue;
+    var roots := a.sqrtModN(n);
+    for var r in roots do check(r.sqr mod n = a, 'sqrtModN valid');
+    // if a is a residue, at least one root comes back (small n only)
+    if n.toQWord <= 3000 then begin
+      var isRes := false;
+      for var x := 1 to integer(n.toQWord) - 1 do
+        if UBigInt(x).sqr mod n = a then begin
+          isRes := true;
+          break;
+        end;
+      check((Length(roots) > 0) = isRes, 'sqrtModN completeness');
+    end;
+  end;
+  // discrete log round-trips: recover x from g^x
+  var pm: UBigInt := 1000003;
+  var g: UBigInt := 5;
+  for var i := 1 to 20 do begin
+    var x := UBigInt.randomBelow(UBigInt(500));
+    var y := g.modPow(x, pm);
+    var rec := g.discreteLog(y, pm);
+    check((rec >= 0) and (g.modPow(UBigInt(QWord(rec)), pm) = y), 'discreteLog roundtrip');
+  end;
+  // safe and strong primes have the required structure
+  BigIntRandomSeed(4242);
+  var sp := UBigInt.randomSafePrime(96);
+  check(sp.isPrime and ((sp - 1) shr 1).isPrime, 'safe prime structure');
+  var stp := UBigInt.randomStrongPrime(160);
+  check(stp.isPrime, 'strong prime is prime');
+end;
+
+procedure testExtrasComb2;
+begin
+  section('extras: combinatorics');
+  // partitions against known values and the pentagonal identity is implicit
+  check(UBigInt.partitions(0) = 1, 'p(0)');
+  check(UBigInt.partitions(1) = 1, 'p(1)');
+  check(UBigInt.partitions(10) = 42, 'p(10)');
+  check(UBigInt.partitions(100) = UBigInt('190569292'), 'p(100)');
+  check(UBigInt.partitions(500) = UBigInt('2300165032574323995027'), 'p(500)');
+  // bell numbers, and bell = sum of stirling2 over k
+  check(UBigInt.bell(0) = 1, 'bell(0)');
+  check(UBigInt.bell(10) = 115975, 'bell(10)');
+  for var n := 0 to 15 do begin
+    var s := UBigInt.zero;
+    for var k := 0 to n do s := s + UBigInt.stirling2(n, k);
+    check(s = UBigInt.bell(n), 'bell = sum stirling2 ' + IntToStr(n));
+  end;
+  check(UBigInt.stirling2(5, 2) = 15, 'S2(5,2)');
+  check(UBigInt.stirling2(10, 3) = 9330, 'S2(10,3)');
+  // sum_k |s1(n,k)| = n!, and signs alternate to give the rising factorial
+  for var n := 0 to 12 do begin
+    var s := BigInt.zero;
+    for var k := 0 to n do s := s + BigInt.stirling1(n, k).abs;
+    check(s = BigInt.factorial(n), 'sum|s1| = n! ' + IntToStr(n));
+  end;
+  check(BigInt.stirling1(5, 2) = -50, 's1(5,2)');
+  check(BigInt.stirling1(4, 2) = 11, 's1(4,2)');
+  // subfactorial and the D(n) = n*D(n-1) + (-1)^n identity
+  check(UBigInt.subfactorial(0) = 1, '!0');
+  check(UBigInt.subfactorial(9) = 133496, '!9');
+  for var n := 2 to 40 do begin
+    var lhs := UBigInt.subfactorial(n);
+    var rhs := Int64(n) * UBigInt.subfactorial(n - 1);
+    if n and 1 = 0 then check(lhs = rhs + 1, 'derangement even ' + IntToStr(n))
+    else check(lhs = rhs - 1, 'derangement odd ' + IntToStr(n));
+  end;
+  // multinomial equals the factorial ratio
+  check(UBigInt.multinomial([2, 3, 4]) = UBigInt.factorial(9) div (UBigInt.factorial(2) * UBigInt.factorial(3) * UBigInt.factorial(4)), 'multinomial');
+  check(UBigInt.multinomial([5]) = 1, 'multinomial single');
+  // rising/falling factorials
+  check(UBigInt.risingFactorial(UBigInt(5), 3) = 210, 'rising(5,3)');
+  check(UBigInt.fallingFactorial(UBigInt(5), 3) = 60, 'falling(5,3)');
+  check(UBigInt.fallingFactorial(UBigInt(3), 5).isZero, 'falling past zero');
+  check(BigInt.fallingFactorial(BigInt(-2), 3) = -24, 'falling negative base');
+  check(UBigInt.fallingFactorial(UBigInt(9), 9) = UBigInt.factorial(9), 'falling n n = n!');
+  // Bernoulli numbers as exact fractions
+  var (n1, d1) := BigInt.bernoulli(1);
+  check((n1 = -1) and (d1 = 2), 'B1 = -1/2');
+  var (n2, d2) := BigInt.bernoulli(2);
+  check((n2 = 1) and (d2 = 6), 'B2 = 1/6');
+  var (n4, d4) := BigInt.bernoulli(4);
+  check((n4 = -1) and (d4 = 30), 'B4 = -1/30');
+  var (n6, d6) := BigInt.bernoulli(6);
+  check((n6 = 1) and (d6 = 42), 'B6 = 1/42');
+  var (n12, d12) := BigInt.bernoulli(12);
+  check((n12 = -691) and (d12 = 2730), 'B12 = -691/2730');
+  var (n3, d3) := BigInt.bernoulli(3);
+  check(n3.isZero and (d3 = 1), 'B3 = 0');
+end;
+
+procedure testExtrasFormat;
+begin
+  section('extras: roman, words, continued fractions');
+  checkEq(BigInt(4).toRoman, 'IV', 'roman 4');
+  checkEq(BigInt(49).toRoman, 'XLIX', 'roman 49');
+  checkEq(BigInt(1994).toRoman, 'MCMXCIV', 'roman 1994');
+  checkEq(BigInt(3999).toRoman, 'MMMCMXCIX', 'roman 3999');
+  checkRaises(procedure begin var z := BigInt(4000).toRoman; end, EConvertError, 'roman out of range');
+  checkRaises(procedure begin var z := BigInt(0).toRoman; end, EConvertError, 'roman zero');
+  checkEq(BigInt(0).toWords, 'zero', 'words 0');
+  checkEq(BigInt(19).toWords, 'nineteen', 'words 19');
+  checkEq(BigInt(42).toWords, 'forty-two', 'words 42');
+  checkEq(BigInt(305).toWords, 'three hundred five', 'words 305');
+  checkEq(BigInt(1234567).toWords, 'one million two hundred thirty-four thousand five hundred sixty-seven', 'words big');
+  checkEq(BigInt(-7).toWords, 'negative seven', 'words negative');
+  checkEq(BigInt('1000000000000').toWords, 'one trillion', 'words trillion');
+  // continued fractions: expand and rebuild
+  var cf := BigInt.continuedFraction(BigInt(415), BigInt(93));
+  check((Length(cf) = 4) and (cf[0] = 4) and (cf[3] = 7), 'CF 415/93');
+  var (cn, cd) := BigInt.fromContinuedFraction(cf);
+  check((cn = 415) and (cd = 93), 'CF rebuild');
+  // random rationals round-trip through the CF
+  for var i := 1 to 200 do begin
+    var a := BigInt(Random(1000000) - 500000);
+    var b := BigInt(Random(100000) + 1);
+    var (rn, rd) := BigInt.fromContinuedFraction(BigInt.continuedFraction(a, b));
+    var g := a.gcd(b);
+    check((rn = a div g) and (rd = b div g), 'CF roundtrip');
+  end;
+  // pi convergents: 22/7 and 355/113 are the low-order best approximations
+  var pcf := BigDecimal.pi(40).continuedFraction(6);
+  var (pn, pd) := BigInt.fromContinuedFraction(Copy(pcf, 0, 4));
+  check((pn = 355) and (pd = 113), 'pi convergent 355/113');
+end;
+
 begin
   RandSeed := 20260706;
   testUBasics;
@@ -1889,6 +2184,10 @@ begin
   testExtrasNumberTheory;
   testExtrasCombinatorics;
   testExtrasFactorize;
+  testExtrasMultiplicative;
+  testExtrasCrypto;
+  testExtrasComb2;
+  testExtrasFormat;
 
   testDecBasics;
   testDecArithmetic;
@@ -1900,6 +2199,7 @@ begin
   testDecTranscendental;
   testDecTrig;
   testDecPractical;
+  testDecSpecial;
 
   writeln;
   if failCount = 0 then writeln(#27'[32mALL TESTS PASSED (', passCount, ' checks)'#27'[0m')

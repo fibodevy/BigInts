@@ -174,19 +174,43 @@ type
     function sqr: UBigInt;
     function sqrt: UBigInt;
     function nthRoot(n: LongWord): UBigInt;
+    function nthRootRem(n: LongWord): (root, rem: UBigInt);
+    function isKthPower(k: LongWord): boolean;
     function pow(e: LongWord): UBigInt;
     function modPow(const e, m: UBigInt): UBigInt;
+    // constant-time square-and-multiply: the running time does not depend on
+    // the exponent bits (side-channel resistant), for secret exponents
+    function modPowSec(const e, m: UBigInt): UBigInt;
     function modInverse(const m: UBigInt): UBigInt;
     function gcd(const other: UBigInt): UBigInt;
     function lcm(const other: UBigInt): UBigInt;
     // extras: number theory
     function jacobi(const n: UBigInt): integer;
+    function kronecker(const n: UBigInt): integer;
     function modSqrt(const p: UBigInt): UBigInt;
+    // square roots modulo a composite: every solution, via factor+lift+CRT
+    function sqrtModN(const n: UBigInt): array of UBigInt;
+    // baby-step giant-step discrete log: least x with self^x = target (mod m),
+    // or -1 when none exists below the modulus order
+    function discreteLog(const target, m: UBigInt): Int64;
     function isPerfectSquare: boolean;
     function sqrtRem: (root, rem: UBigInt);
     function factorize: array of (p: UBigInt; e: LongWord);
-    // primes (Miller-Rabin; deterministic witnesses below 3.3e24, then random rounds)
+    // multiplicative functions, all read off the factorization
+    function eulerPhi: UBigInt;
+    function carmichaelLambda: UBigInt;
+    function moebius: integer;
+    function sigma(k: LongWord = 1): UBigInt;
+    function tau: UBigInt;
+    function radical: UBigInt;
+    function divisors: array of UBigInt;
+    function isSquarefree: boolean;
+    function isPerfect: boolean;
+    function isCarmichael: boolean;
+    // primes: isProbablePrime is Miller-Rabin (deterministic below 3.3e24, then
+    // random rounds); isPrime is Baillie-PSW (no known counterexample)
     function isProbablePrime(rounds: integer = 24): boolean;
+    function isPrime: boolean;
     function nextPrime: UBigInt;
     function prevPrime: UBigInt;
     // bytes, little/big endian magnitude; zero gives an empty array
@@ -208,12 +232,26 @@ type
     class function randomBelow(const bound: UBigInt): UBigInt; static;
     class function randomRange(const lo, hi: UBigInt): UBigInt; static;
     class function randomPrime(bits: LongWord; rounds: integer = 24): UBigInt; static;
+    // safe prime: p and (p-1)/2 both prime; strong prime: p-1 and p+1 each have
+    // a large prime factor (RSA/DH key generation)
+    class function randomSafePrime(bits: LongWord): UBigInt; static;
+    class function randomStrongPrime(bits: LongWord): UBigInt; static;
+    // exact prime counting by a segmented sieve (practical to ~1e10)
+    class function primePi(n: QWord): QWord; static;
+    class function primeCount(lo, hi: QWord): QWord; static;
     class function factorial(n: LongWord): UBigInt; static;
     class function fibonacci(n: LongWord): UBigInt; static;
     class function lucas(n: LongWord): UBigInt; static;
     class function binomial(n, k: LongWord): UBigInt; static;
+    class function multinomial(const ks: array of LongWord): UBigInt; static;
+    class function risingFactorial(const x: UBigInt; n: LongWord): UBigInt; static;
+    class function fallingFactorial(const x: UBigInt; n: LongWord): UBigInt; static;
     class function catalan(n: LongWord): UBigInt; static;
     class function primorial(n: LongWord): UBigInt; static;
+    class function subfactorial(n: LongWord): UBigInt; static;
+    class function bell(n: LongWord): UBigInt; static;
+    class function stirling2(n, k: LongWord): UBigInt; static;
+    class function partitions(n: LongWord): UBigInt; static;
   end;
 
   { BigInt - signed arbitrary precision integer, sign-magnitude storage;
@@ -363,15 +401,28 @@ type
     function modInverse(const m: BigInt): BigInt;
     function gcd(const other: BigInt): BigInt;
     function lcm(const other: BigInt): BigInt;
-    // extras: number theory (factorize works on the absolute value)
+    // extras: number theory (these all work on the absolute value)
     function gcdExt(const other: BigInt): (g, x, y: BigInt);
     function jacobi(const n: BigInt): integer;
+    function kronecker(const n: BigInt): integer;
     function modSqrt(const p: BigInt): BigInt;
     function isPerfectSquare: boolean;
     function sqrtRem: (root, rem: BigInt);
     function factorize: array of (p: BigInt; e: LongWord);
+    function eulerPhi: BigInt;
+    function carmichaelLambda: BigInt;
+    function moebius: integer;
+    function sigma(k: LongWord = 1): BigInt;
+    function tau: BigInt;
+    function radical: BigInt;
+    function divisors: array of BigInt;
+    function isSquarefree: boolean;
+    function isPerfect: boolean;
+    function isCarmichael: boolean;
+    function isKthPower(k: LongWord): boolean;
     // primes: negative values are never prime, nextPrime returns the first prime > self
     function isProbablePrime(rounds: integer = 24): boolean;
+    function isPrime: boolean;
     function nextPrime: BigInt;
     function prevPrime: BigInt;
     // bytes: minimal two's complement with sign bit, like Java toByteArray
@@ -382,6 +433,9 @@ type
     // misc
     function digitCount: LongWord;
     function toStringGrouped(sep: char = '_'; groupSize: integer = 3): string;
+    // number in Roman numerals (1..3999); in words (English short scale)
+    function toRoman: string;
+    function toWords: string;
     function hashCode: DWord;
     // constants and generators
     class function zero: BigInt; static;
@@ -400,8 +454,23 @@ type
     class function fibonacci(n: LongWord): BigInt; static;
     class function lucas(n: LongWord): BigInt; static;
     class function binomial(n, k: LongWord): BigInt; static;
+    class function multinomial(const ks: array of LongWord): BigInt; static;
+    class function risingFactorial(const x: BigInt; n: LongWord): BigInt; static;
+    class function fallingFactorial(const x: BigInt; n: LongWord): BigInt; static;
     class function catalan(n: LongWord): BigInt; static;
     class function primorial(n: LongWord): BigInt; static;
+    class function subfactorial(n: LongWord): BigInt; static;
+    class function bell(n: LongWord): BigInt; static;
+    // signed Stirling numbers of the first kind, Stirling of the second kind
+    class function stirling1(n, k: LongWord): BigInt; static;
+    class function stirling2(n, k: LongWord): BigInt; static;
+    class function partitions(n: LongWord): BigInt; static;
+    // Bernoulli number as an exact reduced fraction (num/den)
+    class function bernoulli(n: LongWord): (num, den: BigInt); static;
+    // continued fractions: coefficients of num/den, and the rebuild to a
+    // reduced fraction
+    class function continuedFraction(const num, den: BigInt): array of BigInt; static;
+    class function fromContinuedFraction(const cf: array of BigInt): (num, den: BigInt); static;
   end;
 
   // declared after both records so UBigInt can offer a BigInt-returning method
@@ -514,6 +583,9 @@ type
     // exact rational view: self = num / den with a reduced power-of-ten
     // denominator, so 0.375 gives (3, 8)
     function toFraction: (num, den: BigInt);
+    // continued fraction coefficients of the exact value (maxTerms <= 0 for
+    // all of them); great for best rational approximations
+    function continuedFraction(maxTerms: integer = 0): array of BigInt;
     // decimal introspection: precision counts significant digits, getDigit
     // returns the digit at 10^i of the absolute value (0 outside)
     function precision: integer;
@@ -574,6 +646,16 @@ type
     function sinh(precision: integer = 18): BigDecimal;
     function cosh(precision: integer = 18): BigDecimal;
     function tanh(precision: integer = 18): BigDecimal;
+    // special functions: the gamma function and its logarithm (positive
+    // argument for lnGamma, reflection covers negatives for gamma), the real
+    // factorial x! = gamma(x+1), the error function and its complement
+    function lnGamma(precision: integer = 18): BigDecimal;
+    function gamma(precision: integer = 18): BigDecimal;
+    function factorial(precision: integer = 18): BigDecimal;
+    function erf(precision: integer = 18): BigDecimal;
+    function erfc(precision: integer = 18): BigDecimal;
+    // round to a count of significant digits rather than a decimal position
+    function roundToSignificant(digits: integer; mode: TBigDecimalRounding = bdrRound): BigDecimal;
     // float builders: plain takes the shortest round-tripping decimal,
     // exact the full binary expansion
     class function fromDouble(d: Double): BigDecimal; static;
@@ -595,6 +677,11 @@ type
     // famous constants at any precision (pi is cached, Chudnovsky splitting)
     class function pi(precision: integer = 18): BigDecimal; static;
     class function e(precision: integer = 18): BigDecimal; static;
+    // two-argument arctangent (quadrant-aware), Euclidean length, and the
+    // arithmetic-geometric mean
+    class function atan2(const y, x: BigDecimal; precision: integer = 18): BigDecimal; static;
+    class function hypot(const x, y: BigDecimal; precision: integer = 18): BigDecimal; static;
+    class function agm(const a, b: BigDecimal; precision: integer = 18): BigDecimal; static;
   end;
 
 var
@@ -3262,6 +3349,434 @@ begin
   result := res;
 end;
 
+function UBigInt.eulerPhi: UBigInt;
+begin
+  if isZero then exit(default(UBigInt));
+  result := self;
+  for var (p, e) in factorize do result := result div p * (p - 1);
+end;
+
+function UBigInt.carmichaelLambda: UBigInt;
+begin
+  if isZero then raise EBigIntError.Create('carmichaelLambda needs a positive value');
+  result := UBigInt.one;
+  for var (p, e) in factorize do begin
+    // lambda(2^e) drops to 2^(e-2) from e = 3 up; odd prime powers keep phi
+    var lam := if (p = 2) and (e >= 3) then UBigInt.pow2(e - 2) else p.pow(e - 1) * (p - 1);
+    result := result.lcm(lam);
+  end;
+end;
+
+function UBigInt.moebius: integer;
+begin
+  if isZero then exit(0);
+  result := 1;
+  for var (p, e) in factorize do begin
+    if e > 1 then exit(0);
+    result := -result;
+  end;
+end;
+
+function UBigInt.sigma(k: LongWord): UBigInt;
+begin
+  if isZero then exit(default(UBigInt));
+  if k = 0 then exit(tau);
+  result := UBigInt.one;
+  for var (p, e) in factorize do begin
+    // sum of the geometric series 1 + p^k + ... + p^(k*e)
+    var pk := p.pow(k);
+    result := result * ((pk.pow(e + 1) - 1) div (pk - 1));
+  end;
+end;
+
+function UBigInt.tau: UBigInt;
+begin
+  if isZero then exit(default(UBigInt));
+  result := UBigInt.one;
+  for var (p, e) in factorize do result := result * Int64(e + 1);
+end;
+
+function UBigInt.radical: UBigInt;
+begin
+  if isZero then exit(default(UBigInt));
+  result := UBigInt.one;
+  for var (p, e) in factorize do result := result * p;
+end;
+
+function UBigInt.divisors: array of UBigInt;
+var
+  res: array of UBigInt;
+begin
+  if isZero then exit(nil);
+  res := [UBigInt.one];
+  for var (p, e) in factorize do begin
+    var base := Length(res);
+    var pe := UBigInt.one;
+    for var j := 1 to e do begin
+      pe := pe * p;
+      for var i := 0 to base - 1 do begin
+        SetLength(res, Length(res) + 1);
+        res[High(res)] := res[i] * pe;
+      end;
+    end;
+  end;
+  // insertion sort ascending
+  for var i := 1 to High(res) do begin
+    var v := res[i];
+    var j := i - 1;
+    while (j >= 0) and (res[j] > v) do begin
+      res[j + 1] := res[j];
+      dec(j);
+    end;
+    res[j + 1] := v;
+  end;
+  result := res;
+end;
+
+function UBigInt.isSquarefree: boolean;
+begin
+  if isZero then exit(false);
+  for var (p, e) in factorize do
+    if e > 1 then exit(false);
+  result := true;
+end;
+
+function UBigInt.isPerfect: boolean;
+begin
+  if self < 2 then exit(false);
+  // proper divisors sum to self exactly when sigma(1) = 2*self
+  result := sigma(1) = (self shl 1);
+end;
+
+function UBigInt.isCarmichael: boolean;
+begin
+  // Korselt: composite, squarefree, and p-1 | n-1 for every prime p | n
+  if (self < 561) or isEven then exit(false);
+  var f := factorize;
+  if Length(f) < 3 then exit(false);
+  var nm1 := self - 1;
+  for var i := 0 to High(f) do begin
+    if f[i].e > 1 then exit(false);
+    if not (nm1 mod (f[i].p - 1)).isZero then exit(false);
+  end;
+  result := true;
+end;
+
+function UBigInt.nthRootRem(n: LongWord): (root, rem: UBigInt);
+begin
+  var r := nthRoot(n);
+  exit(r, self - r.pow(n));
+end;
+
+function UBigInt.isKthPower(k: LongWord): boolean;
+begin
+  if k = 0 then raise EBigIntError.Create('zeroth power test is undefined');
+  if (k = 1) or isZero or isOne then exit(true);
+  var r := nthRoot(k);
+  result := r.pow(k) = self;
+end;
+
+// ---------------------------------------------------------------------------
+// UBigInt cryptographic helpers
+// ---------------------------------------------------------------------------
+
+// modular helpers for values already reduced into [0, n)
+function AddMod(const a, b, n: UBigInt): UBigInt; inline;
+begin
+  result := a + b;
+  if result >= n then result := result - n;
+end;
+
+function SubMod(const a, b, n: UBigInt): UBigInt; inline;
+begin
+  result := if a >= b then a - b else a + n - b;
+end;
+
+// x / 2 mod an odd n
+function HalfMod(const x, n: UBigInt): UBigInt; inline;
+begin
+  result := if x.isEven then x shr 1 else (x + n) shr 1;
+end;
+
+// Miller-Rabin to base 2, the first half of Baillie-PSW
+function MillerRabin2(const n: UBigInt): boolean;
+begin
+  var nm1 := n - 1;
+  var s := nm1.lowestSetBit;
+  var d := nm1 shr s;
+  var x := UBigInt.two.modPow(d, n);
+  if x.isOne or (x = nm1) then exit(true);
+  for var j := 1 to s - 1 do begin
+    x := x.sqr mod n;
+    if x = nm1 then exit(true);
+  end;
+  result := false;
+end;
+
+// strong Lucas test with Selfridge parameters, the second half of Baillie-PSW;
+// n is odd, > 1 and not a perfect square
+function LucasStrongPRP(const n: UBigInt): boolean;
+begin
+  // first D in 5, -7, 9, -11, ... with the Jacobi symbol (D/n) = -1
+  var dabs: Int64 := 5;
+  var sgn: Int64 := 1;
+  var dm := default(UBigInt);
+  while true do begin
+    var dmod := UBigInt(QWord(dabs)) mod n;
+    if sgn < 0 then dmod := n - dmod;
+    var j := UJacobi(dmod, n);
+    if j = 0 then exit(UBigInt(QWord(dabs)) = n); // a shared factor means composite
+    if j = -1 then begin
+      dm := dmod;
+      break;
+    end;
+    sgn := -sgn;
+    dabs := dabs + 2;
+  end;
+  // Q = (1 - D)/4 mod n, with P = 1 (D is 1 mod 4, so the division is exact)
+  var qsig := (1 - sgn * dabs) div 4;
+  var qm := if qsig >= 0 then UBigInt(QWord(qsig)) mod n else n - (UBigInt(QWord(-qsig)) mod n);
+  // n + 1 = d * 2^s
+  var np1 := n + 1;
+  var s := np1.lowestSetBit;
+  var d := np1 shr s;
+  // Lucas sequence U_d, V_d and Q^d mod n, scanning d from the second bit down
+  var u := UBigInt.one;
+  var v := UBigInt.one;
+  var qk := qm;
+  for var i := integer(d.bitLength) - 2 downto 0 do begin
+    u := (u * v) mod n;
+    v := SubMod(v.sqr mod n, (qk shl 1) mod n, n);
+    qk := qk.sqr mod n;
+    if d.testBit(i) then begin
+      var nu := HalfMod(AddMod(u, v, n), n);
+      var nv := HalfMod(AddMod(v, (dm * u) mod n, n), n);
+      u := nu;
+      v := nv;
+      qk := (qk * qm) mod n;
+    end;
+  end;
+  if u.isZero or v.isZero then exit(true);
+  for var r := 1 to s - 1 do begin
+    v := SubMod(v.sqr mod n, (qk shl 1) mod n, n);
+    if v.isZero then exit(true);
+    qk := qk.sqr mod n;
+  end;
+  result := false;
+end;
+
+function UBigInt.isPrime: boolean;
+begin
+  if self < 2 then exit(false);
+  if isEven then exit(self = 2);
+  // deterministic Miller-Rabin already settles everything below 3.3e24
+  if bitLength <= 81 then exit(isProbablePrime);
+  // Baillie-PSW above: strong base-2 Miller-Rabin plus a strong Lucas test
+  if not MillerRabin2(self) then exit(false);
+  if isPerfectSquare then exit(false);
+  result := LucasStrongPRP(self);
+end;
+
+function UBigInt.modPowSec(const e, m: UBigInt): UBigInt;
+begin
+  if m.isZero then RaiseDivByZero;
+  if m.isOne then exit(default(UBigInt));
+  // Montgomery ladder: every bit runs one multiply and one square, and the two
+  // registers swap roles without branching on the operation performed, so the
+  // sequence of big-integer operations does not depend on the exponent bits
+  var x0 := UBigInt.one;
+  var x1 := self mod m;
+  var bits := e.bitLength;
+  if bits = 0 then bits := 1;
+  for var i := integer(bits) - 1 downto 0 do
+    if e.testBit(i) then begin
+      x0 := (x0 * x1) mod m;
+      x1 := (x1 * x1) mod m;
+    end else begin
+      x1 := (x0 * x1) mod m;
+      x0 := (x0 * x0) mod m;
+    end;
+  result := x0;
+end;
+
+// Kronecker symbol (a/n), the full extension of Jacobi to any integers
+function KroneckerSym(a, n: BigInt): integer;
+begin
+  if n.isZero then exit(if (a = 1) or (a = -1) then 1 else 0);
+  result := 1;
+  if n.isNegative then begin
+    n.negate;
+    if a.isNegative then result := -result;
+  end;
+  // pull the twos out of n, using (a/2) = 0, 1 or -1 by a mod 8
+  if n.isEven then begin
+    if a.isEven then exit(0);
+    var v: Int64 := 0;
+    while n.isEven do begin
+      n := n shr 1;
+      inc(v);
+    end;
+    if (v and 1) = 1 then begin
+      var m8 := a.floorMod(BigInt(8)).toInteger;
+      if (m8 = 3) or (m8 = 5) then result := -result;
+    end;
+  end;
+  // n is odd positive now; Jacobi depends only on a mod n
+  var au := a.floorMod(n).toUBigInt;
+  var nu := n.toUBigInt;
+  var j := UJacobi(au, nu);
+  if j = 0 then exit(0);
+  result := result * j;
+end;
+
+function UBigInt.kronecker(const n: UBigInt): integer;
+begin
+  result := KroneckerSym(self.toBigInt, n.toBigInt);
+end;
+
+// solve y = r1 (mod m1), y = r2 (mod m2) for coprime moduli
+function CrtPair(const r1, m1, r2, m2: UBigInt): UBigInt;
+begin
+  var t := (SubMod(r2 mod m2, r1 mod m2, m2) * m1.modInverse(m2)) mod m2;
+  result := r1 + m1 * t;
+end;
+
+// every square root of a coprime to p, modulo p^e; empty when a is a non-residue
+function RootsModPP(const a, p: UBigInt; e: LongWord): array of UBigInt;
+begin
+  var pe := p.pow(e);
+  var am := a mod pe;
+  if p = 2 then begin
+    if e = 1 then exit([am mod 2]);
+    if e = 2 then exit(if (am mod 4) = 1 then [UBigInt.one, UBigInt(3)] else nil);
+    if (am mod 8) <> 1 then exit(nil);
+    // lift a root through the 2-adic squares: add 2^(k-1) when the square is off
+    var r := UBigInt.one;
+    var pk := UBigInt(8);
+    var k := 3;
+    while k < integer(e) do begin
+      var pk1 := pk shl 1;
+      if (r.sqr mod pk1) <> (am mod pk1) then r := r + (pk shr 1);
+      pk := pk1;
+      inc(k);
+    end;
+    r := r mod pe;
+    var s := (r + UBigInt.pow2(e - 1)) mod pe;
+    exit([r, pe - r, s, pe - s]);
+  end;
+  // odd prime: Tonelli-Shanks mod p, then Hensel lift to p^e
+  if UJacobi(am, p) <> 1 then exit(nil);
+  var r := am.modSqrt(p);
+  var pk := p;
+  for var k := 2 to integer(e) do begin
+    var pk1 := pk * p;
+    // Newton step r := r - (r^2 - a) / (2r), all mod p^k
+    var num := SubMod(r.sqr mod pk1, am mod pk1, pk1);
+    var inv := ((r shl 1) mod pk1).modInverse(pk1);
+    r := SubMod(r, (num * inv) mod pk1, pk1);
+    pk := pk1;
+  end;
+  result := [r, pe - r];
+end;
+
+function UBigInt.sqrtModN(const n: UBigInt): array of UBigInt;
+begin
+  if n.isZero then RaiseDivByZero;
+  if n.isOne then exit([default(UBigInt)]);
+  var a := self mod n;
+  if not a.gcd(n).isOne then raise EBigIntError.Create('sqrtModN needs gcd(self, n) = 1');
+  // roots modulo each prime power, glued together with the CRT
+  var sols: array of UBigInt := [default(UBigInt)];
+  var modAcc := UBigInt.one;
+  for var (p, e) in n.factorize do begin
+    var pe := p.pow(e);
+    var rs := RootsModPP(a, p, e);
+    if Length(rs) = 0 then exit(nil);
+    // fresh accumulator each round (an inline var keeps its value across
+    // loop iterations, so the reset is explicit)
+    var next: array of UBigInt := nil;
+    for var x in sols do
+      for var r in rs do begin
+        SetLength(next, Length(next) + 1);
+        next[High(next)] := CrtPair(x, modAcc, r, pe);
+      end;
+    sols := next;
+    modAcc := modAcc * pe;
+  end;
+  // sort ascending, drop duplicates
+  for var i := 1 to High(sols) do begin
+    var v := sols[i];
+    var j := i - 1;
+    while (j >= 0) and (sols[j] > v) do begin
+      sols[j + 1] := sols[j];
+      dec(j);
+    end;
+    sols[j + 1] := v;
+  end;
+  var res: array of UBigInt;
+  for var i := 0 to High(sols) do
+    if (i = 0) or (sols[i] <> sols[i - 1]) then begin
+      SetLength(res, Length(res) + 1);
+      res[High(res)] := sols[i];
+    end;
+  result := res;
+end;
+
+function UBigInt.discreteLog(const target, m: UBigInt): Int64;
+begin
+  if m.isZero then RaiseDivByZero;
+  if m.isOne then exit(0);
+  var g := self mod m;
+  var h := target mod m;
+  if h.isOne then exit(0);
+  if not g.gcd(m).isOne then raise EBigIntError.Create('discreteLog needs gcd(base, modulus) = 1');
+  // baby-step giant-step over ceil(sqrt(m)) steps
+  var nb := m.sqrt + 1;
+  if nb > UBigInt(QWord(1) shl 20) then raise EBigIntError.Create('discreteLog search space too large');
+  var steps := SizeInt(nb.toQWord);
+  // open-addressed table of the baby steps (g^j, keeping the least j)
+  var cap: SizeInt := 1;
+  while cap < steps * 2 do cap := cap shl 1;
+  var mask := DWord(cap - 1);
+  var htKey: array of UBigInt;
+  var htVal: array of Int64;
+  var htUsed: array of boolean;
+  SetLength(htKey, cap);
+  SetLength(htVal, cap);
+  SetLength(htUsed, cap);
+  var cur := UBigInt.one;
+  for var j := 0 to steps - 1 do begin
+    var slot := cur.hashCode and mask;
+    var dup := false;
+    while htUsed[slot] do begin
+      if htKey[slot] = cur then begin
+        dup := true;
+        break;
+      end;
+      slot := (slot + 1) and mask;
+    end;
+    if not dup then begin
+      htUsed[slot] := true;
+      htKey[slot] := cur;
+      htVal[slot] := j;
+    end;
+    cur := (cur * g) mod m;
+  end;
+  // giant steps: multiply by g^(-nb) and look each result up
+  var factor := g.modPow(nb, m).modInverse(m);
+  var nbq := Int64(nb.toQWord);
+  var gamma := h;
+  for var i := 0 to steps do begin
+    var slot := gamma.hashCode and mask;
+    while htUsed[slot] do begin
+      if htKey[slot] = gamma then exit(Int64(i) * nbq + htVal[slot]);
+      slot := (slot + 1) and mask;
+    end;
+    gamma := (gamma * factor) mod m;
+  end;
+  result := -1;
+end;
+
 function UBigInt.toBytesLE: TBytes;
 var
   res: TBytes;
@@ -3655,6 +4170,193 @@ begin
       inc(idx);
     end;
   result := UProdPrimes(primes, 0, cnt - 1);
+end;
+
+class function UBigInt.multinomial(const ks: array of LongWord): UBigInt;
+begin
+  result := UBigInt.one;
+  var total: LongWord := 0;
+  // product of binomials keeps every intermediate exact and small
+  for var k in ks do begin
+    total := total + k;
+    result := result * binomial(total, k);
+  end;
+end;
+
+class function UBigInt.risingFactorial(const x: UBigInt; n: LongWord): UBigInt;
+begin
+  result := UBigInt.one;
+  for var i := 0 to Int64(n) - 1 do result := result * (x + i);
+end;
+
+class function UBigInt.fallingFactorial(const x: UBigInt; n: LongWord): UBigInt;
+begin
+  result := UBigInt.one;
+  for var i := 0 to Int64(n) - 1 do begin
+    if x < i then exit(default(UBigInt));
+    result := result * (x - i);
+  end;
+end;
+
+class function UBigInt.subfactorial(n: LongWord): UBigInt;
+begin
+  if n = 0 then exit(UBigInt.one);
+  if n = 1 then exit(default(UBigInt));
+  // D(k) = (k-1) * (D(k-1) + D(k-2))
+  var a := UBigInt.one;
+  var b := default(UBigInt);
+  for var i := 2 to n do begin
+    var c := Int64(i - 1) * (a + b);
+    a := b;
+    b := c;
+  end;
+  result := b;
+end;
+
+class function UBigInt.bell(n: LongWord): UBigInt;
+var
+  row: array of UBigInt;
+begin
+  // Bell triangle: each row starts with the previous row's last value
+  row := [UBigInt.one];
+  for var i := 1 to n do begin
+    var next: array of UBigInt;
+    SetLength(next, i + 1);
+    next[0] := row[i - 1];
+    for var j := 1 to i do next[j] := next[j - 1] + row[j - 1];
+    row := next;
+  end;
+  result := row[0];
+end;
+
+class function UBigInt.stirling2(n, k: LongWord): UBigInt;
+var
+  dp: array of UBigInt;
+begin
+  if k > n then exit(default(UBigInt));
+  if k = 0 then exit(if n = 0 then UBigInt.one else default(UBigInt));
+  // S(i, j) = j*S(i-1, j) + S(i-1, j-1), rolled over j descending
+  SetLength(dp, k + 1);
+  dp[0] := UBigInt.one;
+  for var i := 1 to n do begin
+    var top := if i < k then i else k;
+    for var j := top downto 1 do dp[j] := Int64(j) * dp[j] + dp[j - 1];
+    dp[0] := default(UBigInt);
+  end;
+  result := dp[k];
+end;
+
+class function UBigInt.partitions(n: LongWord): UBigInt;
+var
+  p: array of BigInt;
+begin
+  SetLength(p, n + 1);
+  p[0] := BigInt.one;
+  for var m := 1 to Int64(n) do begin
+    var sum := BigInt.zero;
+    var k: Int64 := 1;
+    while true do begin
+      // generalized pentagonal numbers k(3k-1)/2 and k(3k+1)/2
+      var g1 := k * (3 * k - 1) div 2;
+      if g1 > m then break;
+      var term := p[SizeInt(m - g1)];
+      var g2 := k * (3 * k + 1) div 2;
+      if g2 <= m then term := term + p[SizeInt(m - g2)];
+      if (k and 1) = 1 then sum := sum + term else sum := sum - term;
+      inc(k);
+    end;
+    p[SizeInt(m)] := sum;
+  end;
+  result := p[n].toUBigInt;
+end;
+
+class function UBigInt.randomSafePrime(bits: LongWord): UBigInt;
+begin
+  if bits < 3 then raise EBigIntError.Create('safe prime needs at least 3 bits');
+  // p = 2q + 1 with q also prime (q is a Sophie Germain prime)
+  while true do begin
+    var q := UBigInt.randomPrime(bits - 1);
+    var p := (q shl 1) + 1;
+    if (p.bitLength = bits) and p.isProbablePrime then exit(p);
+  end;
+end;
+
+class function UBigInt.randomStrongPrime(bits: LongWord): UBigInt;
+begin
+  if bits < 16 then raise EBigIntError.Create('strong prime needs at least 16 bits');
+  // Gordon's algorithm: p-1 has the large factor s, p+1 the large factor r,
+  // and r-1 the large factor t
+  var half := bits div 2;
+  var s := UBigInt.randomPrime(half);
+  var t := UBigInt.randomPrime(half - 4);
+  var r := (t shl 1) + 1;
+  while not r.isProbablePrime do r := r + (t shl 1);
+  var p0 := ((s.modPow(r - 2, r) * s) shl 1) - 1;
+  var rs2 := (r * s) shl 1;
+  var p := p0;
+  while not p.isProbablePrime do p := p + rs2;
+  result := p;
+end;
+
+class function UBigInt.primeCount(lo, hi: QWord): QWord;
+var
+  comp, seg: array of boolean;
+  base: array of QWord;
+begin
+  if hi < 2 then exit(0);
+  if lo < 2 then lo := 2;
+  if lo > hi then exit(0);
+  // sieve the base primes up to floor(sqrt(hi))
+  var lim: QWord := 0;
+  while (lim + 1) * (lim + 1) <= hi do inc(lim);
+  SetLength(comp, SizeInt(lim) + 1);
+  SetLength(base, SizeInt(lim div 2) + 8);
+  var bcount: SizeInt := 0;
+  var i: QWord := 2;
+  while i <= lim do begin
+    if not comp[i] then begin
+      base[bcount] := i;
+      inc(bcount);
+      var j := i * i;
+      while j <= lim do begin
+        comp[j] := true;
+        j := j + i;
+      end;
+    end;
+    inc(i);
+  end;
+  // sweep [lo, hi] in cache-sized windows
+  var total: QWord := 0;
+  var segLen: SizeInt := 1 shl 15;
+  SetLength(seg, segLen);
+  var low := lo;
+  while low <= hi do begin
+    var high := low + QWord(segLen) - 1;
+    if high > hi then high := hi;
+    var span := SizeInt(high - low) + 1;
+    for var s := 0 to span - 1 do seg[s] := false;
+    for var bi := 0 to bcount - 1 do begin
+      var p := base[bi];
+      if p * p > high then break;
+      var start := ((low + p - 1) div p) * p;
+      if start < p * p then start := p * p;
+      var j := start;
+      while j <= high do begin
+        seg[SizeInt(j - low)] := true;
+        j := j + p;
+      end;
+    end;
+    for var s := 0 to span - 1 do
+      if not seg[s] then inc(total);
+    if high = hi then break;
+    low := high + 1;
+  end;
+  result := total;
+end;
+
+class function UBigInt.primePi(n: QWord): QWord;
+begin
+  result := primeCount(2, n);
 end;
 
 
@@ -4538,6 +5240,11 @@ begin
   result := (not fNeg) and magnitude.isProbablePrime(rounds);
 end;
 
+function BigInt.isPrime: boolean;
+begin
+  result := (not fNeg) and magnitude.isPrime;
+end;
+
 function BigInt.nextPrime: BigInt;
 begin
   if fNeg or (Length(fLimbs) = 0) then exit(BigInt(2));
@@ -4580,6 +5287,11 @@ begin
   result := UJacobi(floorMod(n).toUBigInt, n.magnitude);
 end;
 
+function BigInt.kronecker(const n: BigInt): integer;
+begin
+  result := KroneckerSym(self, n);
+end;
+
 function BigInt.modSqrt(const p: BigInt): BigInt;
 begin
   if p.sign <= 0 then raise EBigIntError.Create('modulus must be positive');
@@ -4606,6 +5318,69 @@ begin
   SetLength(res, Length(uf));
   for var i := 0 to High(uf) do res[i] := (uf[i].p.toBigInt, uf[i].e);
   result := res;
+end;
+
+// number-theoretic functions all read the magnitude
+function BigInt.eulerPhi: BigInt;
+begin
+  result := magnitude.eulerPhi.toBigInt;
+end;
+
+function BigInt.carmichaelLambda: BigInt;
+begin
+  result := magnitude.carmichaelLambda.toBigInt;
+end;
+
+function BigInt.moebius: integer;
+begin
+  result := magnitude.moebius;
+end;
+
+function BigInt.sigma(k: LongWord): BigInt;
+begin
+  result := magnitude.sigma(k).toBigInt;
+end;
+
+function BigInt.tau: BigInt;
+begin
+  result := magnitude.tau.toBigInt;
+end;
+
+function BigInt.radical: BigInt;
+begin
+  result := magnitude.radical.toBigInt;
+end;
+
+function BigInt.divisors: array of BigInt;
+var
+  res: array of BigInt;
+begin
+  var ud := magnitude.divisors;
+  SetLength(res, Length(ud));
+  for var i := 0 to High(ud) do res[i] := ud[i].toBigInt;
+  result := res;
+end;
+
+function BigInt.isSquarefree: boolean;
+begin
+  result := magnitude.isSquarefree;
+end;
+
+function BigInt.isPerfect: boolean;
+begin
+  result := (not fNeg) and magnitude.isPerfect;
+end;
+
+function BigInt.isCarmichael: boolean;
+begin
+  result := (not fNeg) and magnitude.isCarmichael;
+end;
+
+function BigInt.isKthPower(k: LongWord): boolean;
+begin
+  // an even root of a negative value cannot be a perfect power
+  if fNeg and (k and 1 = 0) then exit(false);
+  result := magnitude.isKthPower(k);
 end;
 
 function BigInt.toBytesLE: TBytes;
@@ -4661,6 +5436,73 @@ end;
 function BigInt.toStringGrouped(sep: char; groupSize: integer): string;
 begin
   result := GroupDigits(toString, sep, groupSize);
+end;
+
+function BigInt.toRoman: string;
+const
+  vals: array[0..12] of integer = (1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1);
+  syms: array[0..12] of string = ('M', 'CM', 'D', 'CD', 'C', 'XC', 'L', 'XL', 'X', 'IX', 'V', 'IV', 'I');
+begin
+  if (sign <= 0) or (self > 3999) then raise EConvertError.Create('toRoman needs a value in 1..3999');
+  var n := toInteger;
+  result := '';
+  for var i := 0 to High(vals) do
+    while n >= vals[i] do begin
+      result := result + syms[i];
+      n := n - vals[i];
+    end;
+end;
+
+function BigInt.toWords: string;
+const
+  ones: array[0..19] of string = ('zero', 'one', 'two', 'three', 'four', 'five',
+    'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve', 'thirteen',
+    'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen');
+  tens: array[2..9] of string = ('twenty', 'thirty', 'forty', 'fifty', 'sixty',
+    'seventy', 'eighty', 'ninety');
+  // short-scale group names, up to 10^66 (limit of this table)
+  scales: array[0..22] of string = ('', ' thousand', ' million', ' billion',
+    ' trillion', ' quadrillion', ' quintillion', ' sextillion', ' septillion',
+    ' octillion', ' nonillion', ' decillion', ' undecillion', ' duodecillion',
+    ' tredecillion', ' quattuordecillion', ' quindecillion', ' sexdecillion',
+    ' septendecillion', ' octodecillion', ' novemdecillion', ' vigintillion',
+    ' unvigintillion');
+
+  // words for a value 0..999 (no leading/trailing spaces)
+  function under1000(v: integer): string;
+  begin
+    result := '';
+    if v >= 100 then begin
+      result := ones[v div 100] + ' hundred';
+      v := v mod 100;
+      if v > 0 then result := result + ' ';
+    end;
+    if v >= 20 then begin
+      result := result + tens[v div 10];
+      if v mod 10 > 0 then result := result + '-' + ones[v mod 10];
+    end else if v > 0 then result := result + ones[v];
+  end;
+
+begin
+  if isZero then exit('zero');
+  // split into base-1000 groups, low to high
+  var groups: array of integer;
+  var m := magnitude;
+  var thousand := UBigInt(1000);
+  while not m.isZero do begin
+    var (q, r) := m.divMod(thousand);
+    SetLength(groups, Length(groups) + 1);
+    groups[High(groups)] := r.toInteger;
+    m := q;
+  end;
+  if High(groups) > High(scales) then raise EConvertError.Create('toWords value exceeds the scale table (10^66)');
+  result := '';
+  for var i := High(groups) downto 0 do
+    if groups[i] > 0 then begin
+      if result <> '' then result := result + ' ';
+      result := result + under1000(groups[i]) + scales[i];
+    end;
+  if fNeg then result := 'negative ' + result;
 end;
 
 function BigInt.hashCode: DWord;
@@ -4771,6 +5613,142 @@ end;
 class function BigInt.primorial(n: LongWord): BigInt;
 begin
   result := UBigInt.primorial(n).toBigInt;
+end;
+
+class function BigInt.multinomial(const ks: array of LongWord): BigInt;
+begin
+  result := UBigInt.multinomial(ks).toBigInt;
+end;
+
+class function BigInt.risingFactorial(const x: BigInt; n: LongWord): BigInt;
+begin
+  // signed base, so this cannot go through the unsigned version
+  result := BigInt.one;
+  for var i := 0 to Int64(n) - 1 do result := result * (x + i);
+end;
+
+class function BigInt.fallingFactorial(const x: BigInt; n: LongWord): BigInt;
+begin
+  result := BigInt.one;
+  for var i := 0 to Int64(n) - 1 do result := result * (x - i);
+end;
+
+class function BigInt.subfactorial(n: LongWord): BigInt;
+begin
+  result := UBigInt.subfactorial(n).toBigInt;
+end;
+
+class function BigInt.bell(n: LongWord): BigInt;
+begin
+  result := UBigInt.bell(n).toBigInt;
+end;
+
+class function BigInt.stirling1(n, k: LongWord): BigInt;
+var
+  dp: array of BigInt;
+begin
+  if k > n then exit(BigInt.zero);
+  if k = 0 then exit(if n = 0 then BigInt.one else BigInt.zero);
+  // s(i, j) = s(i-1, j-1) - (i-1)*s(i-1, j), rolled over j descending
+  SetLength(dp, k + 1);
+  dp[0] := BigInt.one;
+  for var i := 1 to n do begin
+    var top := if i < k then i else k;
+    for var j := top downto 1 do dp[j] := dp[j - 1] - Int64(i - 1) * dp[j];
+    dp[0] := BigInt.zero;
+  end;
+  result := dp[k];
+end;
+
+class function BigInt.stirling2(n, k: LongWord): BigInt;
+begin
+  result := UBigInt.stirling2(n, k).toBigInt;
+end;
+
+class function BigInt.partitions(n: LongWord): BigInt;
+begin
+  result := UBigInt.partitions(n).toBigInt;
+end;
+
+class function BigInt.bernoulli(n: LongWord): (num, den: BigInt);
+var
+  bn, bd: array of BigInt;
+begin
+  // recurrence sum_{k=0}^{m} C(m+1,k) B_k = 0, with exact rational B_k
+  SetLength(bn, n + 1);
+  SetLength(bd, n + 1);
+  bn[0] := BigInt.one;
+  bd[0] := BigInt.one;
+  for var m := 1 to Int64(n) do begin
+    var sn := BigInt.zero;
+    var sd := BigInt.one;
+    for var k := 0 to m - 1 do begin
+      if (k > 1) and (k and 1 = 1) then continue; // odd B_k above 1 vanish
+      var tn := BigInt.binomial(LongWord(m + 1), LongWord(k)) * bn[k];
+      // sn/sd + tn/bd[k]
+      sn := sn * bd[k] + tn * sd;
+      sd := sd * bd[k];
+      var g := sn.gcd(sd);
+      if not g.isZero then begin
+        sn := sn div g;
+        sd := sd div g;
+      end;
+    end;
+    // B[m] = -(sn/sd)/(m+1)
+    var rn := -sn;
+    var rd := sd * BigInt(m + 1);
+    if rd.isNegative then begin
+      rn.negate;
+      rd.negate;
+    end;
+    var g := rn.gcd(rd);
+    if not g.isZero then begin
+      rn := rn div g;
+      rd := rd div g;
+    end;
+    bn[m] := rn;
+    bd[m] := rd;
+  end;
+  exit(bn[n], bd[n]);
+end;
+
+class function BigInt.continuedFraction(const num, den: BigInt): array of BigInt;
+var
+  res: array of BigInt;
+begin
+  if den.isZero then RaiseDivByZero;
+  var a := num;
+  var b := den;
+  while not b.isZero do begin
+    SetLength(res, Length(res) + 1);
+    res[High(res)] := a.floorDiv(b);
+    var r := a.floorMod(b);
+    a := b;
+    b := r;
+  end;
+  result := res;
+end;
+
+class function BigInt.fromContinuedFraction(const cf: array of BigInt): (num, den: BigInt);
+begin
+  if Length(cf) = 0 then exit(BigInt.zero, BigInt.one);
+  var num := cf[High(cf)];
+  var den := BigInt.one;
+  for var i := High(cf) - 1 downto 0 do begin
+    var nn := cf[i] * num + den;
+    den := num;
+    num := nn;
+  end;
+  var g := num.gcd(den);
+  if not g.isZero then begin
+    num := num div g;
+    den := den div g;
+  end;
+  if den.isNegative then begin
+    num.negate;
+    den.negate;
+  end;
+  exit(num, den);
 end;
 
 // ---------------------------------------------------------------------------
@@ -6696,6 +7674,14 @@ begin
   exit(nn, dd);
 end;
 
+function BigDecimal.continuedFraction(maxTerms: integer): array of BigInt;
+begin
+  // a decimal is rational, so its expansion is finite and exact
+  var (num, den) := toFraction;
+  result := BigInt.continuedFraction(num, den);
+  if (maxTerms > 0) and (Length(result) > maxTerms) then SetLength(result, maxTerms);
+end;
+
 function BigDecimal.quantize(const step: BigDecimal; mode: TBigDecimalRounding): BigDecimal;
 begin
   var (q, r) := divMod(step);
@@ -6725,11 +7711,209 @@ begin
   result := (self - other).abs.compare(epsilon.abs) <= 0;
 end;
 
+function BigDecimal.roundToSignificant(digits: integer; mode: TBigDecimalRounding): BigDecimal;
+begin
+  if digits < 1 then raise EBigIntError.Create('roundToSignificant needs at least one digit');
+  if isZero then exit(default(BigDecimal));
+  result := rounded(mostSignificantExponent - digits + 1, mode);
+end;
+
+class function BigDecimal.atan2(const y, x: BigDecimal; precision: integer): BigDecimal;
+begin
+  var p := precision;
+  if p < 0 then p := 0;
+  var wp := p + 10;
+  if x.isZero then begin
+    if y.isZero then exit(default(BigDecimal));
+    var h := BigDecimal.pi(wp).divide(2, wp);
+    exit(DecGuardCut(if y.isNegative then -h else h, p));
+  end;
+  var at := y.divide(x, wp).arctan(wp);
+  if x.isPositive then exit(DecGuardCut(at, p));
+  // x < 0: swing by pi into the correct quadrant, keeping the sign of y
+  var pv := BigDecimal.pi(wp);
+  result := DecGuardCut(if y.isNegative then at - pv else at + pv, p);
+end;
+
+class function BigDecimal.hypot(const x, y: BigDecimal; precision: integer): BigDecimal;
+begin
+  var p := precision;
+  if p < 0 then p := 0;
+  result := (x * x + y * y).sqrt(p);
+end;
+
+class function BigDecimal.agm(const a, b: BigDecimal; precision: integer): BigDecimal;
+begin
+  var p := precision;
+  if p < 0 then p := 0;
+  if a.isNegative or b.isNegative then raise EBigIntError.Create('agm needs non-negative arguments');
+  var wp := p + 12;
+  var pa := a;
+  var pb := b;
+  var tol := BigDecimal.one.shifted10(-(p + 4));
+  // quadratic convergence: a handful of steps reach any practical precision
+  for var i := 1 to 200 do begin
+    var na := (pa + pb).divide(2, wp);
+    var nb := (pa * pb).sqrt(wp);
+    pa := na;
+    if (na - nb).abs < tol then break;
+    pb := nb;
+  end;
+  result := DecGuardCut(pa, p);
+end;
+
+// ln Gamma(z) for z > 0: Stirling's series with a Bernoulli tail, the argument
+// shifted up so the series converges fast, then the shift undone
+function LnGammaPos(const z: BigDecimal; p: integer): BigDecimal;
+begin
+  var wp := p + 14;
+  var need := p + 4;
+  var shift := 0;
+  if z < need then shift := need - z.trunc.toInteger;
+  var w := z + shift;
+  var lnw := w.ln(wp);
+  // (w - 1/2) ln w - w + ln(2 pi)/2
+  var res := (w - BigDecimal('0.5')) * lnw - w + (BigDecimal.pi(wp) * 2).ln(wp).divide(2, wp);
+  var w2 := w * w;
+  var wpow := w; // w^(2k-1)
+  var tol := BigDecimal.one.shifted10(-(p + 8));
+  var k := 1;
+  while k <= p + 2 do begin
+    var (bnum, bden) := BigInt.bernoulli(LongWord(2 * k));
+    // B_{2k} / ((2k)(2k-1) * w^{2k-1})
+    var denom := BigDecimal(bden) * Int64((2 * k) * (2 * k - 1)) * wpow;
+    var term := BigDecimal(bnum).divide(denom, wp);
+    res := res + term;
+    if term.abs < tol then break;
+    wpow := wpow * w2;
+    inc(k);
+  end;
+  for var i := 0 to shift - 1 do res := res - (z + i).ln(wp);
+  result := res;
+end;
+
+// erf via its Taylor series; wp already carries the guard for the cancellation
+function ErfSeries(const x: BigDecimal; wp: integer): BigDecimal;
+begin
+  var x2 := x * x;
+  var termNum := x; // x^(2n+1) / n!
+  var sum := x;
+  var tol := BigDecimal.one.shifted10(-(wp - 2));
+  var n := 1;
+  while true do begin
+    termNum := (termNum * x2).divide(n, wp);
+    var t := termNum.divide(2 * n + 1, wp);
+    if (n and 1) = 1 then sum := sum - t else sum := sum + t;
+    if t.abs < tol then break;
+    inc(n);
+    if n > 40 * wp + 200 then break;
+  end;
+  result := sum * BigDecimal(2).divide(BigDecimal.pi(wp).sqrt(wp), wp);
+end;
+
+// erfc for x > 0 by the Lentz continued fraction, no 1 - (nearly 1) loss
+function ErfcCF(const x: BigDecimal; wp: integer): BigDecimal;
+begin
+  var tiny := BigDecimal.one.shifted10(-(wp + 20));
+  var tol := BigDecimal.one.shifted10(-wp);
+  var f := x;
+  if f.isZero then f := tiny;
+  var c := f;
+  var d := BigDecimal.zero;
+  var k := 1;
+  while true do begin
+    var a := BigDecimal(k).divide(2, wp);
+    d := x + a * d;
+    if d.isZero then d := tiny;
+    c := x + a.divide(c, wp);
+    if c.isZero then c := tiny;
+    d := BigDecimal.one.divide(d, wp);
+    var delta := c * d;
+    f := f * delta;
+    if (delta - 1).abs < tol then break;
+    inc(k);
+    if k > 40 * wp + 200 then break;
+  end;
+  // erfc(x) = exp(-x^2) / (sqrt(pi) * D)
+  result := (-(x * x)).exp(wp).divide(BigDecimal.pi(wp).sqrt(wp) * f, wp);
+end;
+
+function BigDecimal.lnGamma(precision: integer): BigDecimal;
+begin
+  var p := precision;
+  if p < 0 then p := 0;
+  if fMan.fNeg or isZero then raise EBigIntError.Create('lnGamma needs a positive argument');
+  result := DecGuardCut(LnGammaPos(self, p + 4), p);
+end;
+
+function BigDecimal.gamma(precision: integer): BigDecimal;
+begin
+  var p := precision;
+  if p < 0 then p := 0;
+  if isZero or (isIntegral and fMan.fNeg) then raise EBigIntError.Create('gamma has a pole at zero and the negative integers');
+  // exact for a small positive integer: Gamma(n) = (n-1)!
+  if isIntegral and isPositive and fitsInCardinal then begin
+    var k := toCardinal;
+    if k <= 1000 then begin
+      var d: BigDecimal := UBigInt.factorial(k - 1);
+      exit(d);
+    end;
+  end;
+  if self < BigDecimal('0.5') then begin
+    // reflection: Gamma(z) = pi / (sin(pi z) * Gamma(1 - z))
+    var wp := p + 14;
+    var pv := BigDecimal.pi(wp);
+    var s := (pv * self).sin(wp);
+    var g1 := (BigDecimal.one - self).gamma(wp);
+    // the final divide already rounds to p digits, a second cut would drop some
+    exit(pv.divide(s * g1, p));
+  end;
+  result := LnGammaPos(self, p + 8).exp(p);
+end;
+
+function BigDecimal.factorial(precision: integer): BigDecimal;
+begin
+  var p := precision;
+  if p < 0 then p := 0;
+  // exact when the argument is a small non-negative integer
+  if isIntegral and not fMan.fNeg and fitsInCardinal then begin
+    var k := toCardinal;
+    if k <= 1000 then begin
+      var d: BigDecimal := UBigInt.factorial(k);
+      exit(d);
+    end;
+  end;
+  result := (self + 1).gamma(p);
+end;
+
+function BigDecimal.erf(precision: integer): BigDecimal;
+begin
+  var p := precision;
+  if p < 0 then p := 0;
+  if isZero then exit(default(BigDecimal));
+  var neg := fMan.fNeg;
+  var t := abs;
+  var td := t.toDouble;
+  // once erfc drops below the rounding threshold, erf is +-1
+  if td * td > (p + 3) * 2.302585 + 5 then exit(if neg then -BigDecimal.one else BigDecimal.one);
+  // the series cancels for large t; widen the working precision to compensate
+  var guard := System.Trunc(0.44 * td * td) + 12;
+  var r := ErfSeries(t, p + guard);
+  if neg then r := -r;
+  result := DecGuardCut(r, p);
+end;
+
+function BigDecimal.erfc(precision: integer): BigDecimal;
+begin
+  var p := precision;
+  if p < 0 then p := 0;
+  // for large positive x, 1 - erf loses all digits: use the continued fraction
+  if self.toDouble > 1.5 then exit(DecGuardCut(ErfcCF(self, p + 12), p));
+  result := DecGuardCut(BigDecimal.one - erf(p + 4), p);
+end;
+
 {$ifdef BIGINT_ASM}
 initialization
-  UseAdx := CpuHasAdx;
-{$endif}
-end.
   UseAdx := CpuHasAdx;
 {$endif}
 end.
