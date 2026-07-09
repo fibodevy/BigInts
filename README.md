@@ -23,7 +23,7 @@ Arbitrary precision integers and decimals for Pascal in a single self-contained 
 - number theory and combinatorics: Lehmer `gcd`, `gcdExt` (Bezout coefficients), `lcm`, `jacobi`, `factorial`, `fibonacci`, `lucas`, `binomial`, `catalan`, `primorial`
 - randomness: pluggable generators (xoshiro256**, PCG64, splitmix64, `System.Random`, OS entropy), deterministic seeding, uniform `randomBelow`/`randomRange`
 - interop: byte serialization in both endiannesses, `hashCode`, digit-grouped output
-- decimals: exact decimal arithmetic (`0.1 + 0.2 = 0.3`), division and square root at any precision, six rounding modes, shortest and exact float conversions in both directions (the BigDecimal chapter below)
+- decimals: exact decimal arithmetic (`0.1 + 0.2 = 0.3`), division and roots at any precision, six rounding modes, shortest and exact float conversions in both directions, and the whole analytic toolbox - `pi`, `exp`, `ln`, `log`, fractional powers, trigonometry and hyperbolics at any precision (the BigDecimal chapter below)
 - speed: measured 1.4-4x of GMP on x64 for the core operations (benchmarks below); assembler inner loops with a pure Pascal fallback behind a `USEASM` define
 
 ## Quick start
@@ -197,26 +197,56 @@ begin
 end.
 ```
 
+The analytic layer runs on the same scaled-integer core: every function takes a `precision` argument (fractional digits, default 18) and rounds its last shown digit through the hidden guard, like divide does. `pi` comes from Chudnovsky binary splitting and is cached, huge trigonometric arguments are reduced with pi carried at a matching precision.
+
+```pascal
+program analytic;
+
+{$mode unleashed}
+
+uses BigInts;
+
+begin
+  writeln($'{BigDecimal.pi(50)}');    // 3.14159265358979323846264338327950288419716939937511
+  writeln($'{BigDecimal(2).ln(40)}'); // 0.6931471805599453094172321214581765680755
+  writeln($'{BigDecimal(2) ** BigDecimal('0.5')}');  // 1.414213562373095049
+  writeln($'{BigDecimal(1).sin(40)}');               // 0.8414709848078965066525023216302989996226
+  writeln($'{BigDecimal('1E6').logBase(BigDecimal(10))}');           // 6
+  writeln($'{BigDecimal('19.99').quantize(BigDecimal('0.05'))}');    // 20
+  var (num, den) := BigDecimal('0.375').toFraction;
+  writeln($'{num}/{den}');                           // 3/8
+  writeln(BigDecimal('0.000123').toEngineering);     // 123E-6
+  {$ifdef WINDOWS}readln;{$endif}
+end.
+```
+
 | method | notes |
 |---|---|
 | `parse(s)`, `tryParse(s, out v)`, `:=` from string | `[sign]digits[.digits][E[sign]digits]`, `_` separators allowed |
-| `toString`, `toScientific` | plain `-123.45` / normalized `-1.2345E2` |
+| `toString`, `toScientific`, `toEngineering` | plain `-123.45` / normalized `-1.2345E2` / exponent a multiple of three, `123E-6` |
 | `toInt64`, `toQWord`, `toInteger`, `toCardinal`, `toBigInt`, `fitsIn*` | exact conversions: raise `ERangeError` unless integral and in range |
 | `trunc`, `floor`, `ceil`, `round` | to `BigInt`: toward zero, toward -inf, toward +inf, halves to even (like Pascal `round`) |
 | `frac` | what `trunc` drops, so `self = trunc + frac` |
+| `toFraction` | exact rational view as a `(num, den)` tuple: `0.375` gives `(3, 8)` |
 | `rounded(toDigit = 0, mode = bdrRound)` | rounding at any decimal position: `0` = integer, `-2` = cents, `3` = thousands; modes `bdrTrunc bdrCeil bdrFloor bdrRound bdrHalfUp bdrHalfEven` |
+| `quantize(step, mode = bdrRound)` | round to the nearest multiple of any step, e.g. `0.05` |
 | `divide(b, precision = 18)`, `divMod(d)` | division at a chosen precision / integer quotient with the exact remainder |
 | `fromDouble`, `fromSingle`, explicit float casts | the shortest decimal that reads back to the same float: `0.1` gives `0.1` |
 | `fromDoubleExact`, `fromSingleExact` | the exact binary value: `0.1` gives all 55 digits of it |
 | `toDouble`, `toSingle` | correctly rounded to the nearest float, ties to even; overflow gives infinity, underflow zero |
 | `toExtended`, `fromExtended`, `fromExtendedExact` | on targets with the 80-bit type |
-| `sqrt(precision = 18)` | `precision` fractional digits with the same hidden guard digit as divide |
-| `pow(e)`, `**` | exact for `e >= 0`; a negative exponent divides at the default precision |
+| `sqrt(precision = 18)`, `nthRoot(n, precision = 18)` | `precision` fractional digits with the same hidden guard digit as divide |
+| `pow(e)` | exact for an integer `e >= 0`; a negative exponent divides at the default precision |
+| `pow(y, precision = 18)`, `**` | fractional exponents through `exp(y * ln x)` |
+| `exp`, `ln`, `log2`, `log10`, `logBase(b)` | all take `(precision = 18)`; `log10` is exact for powers of ten, `log2` for powers of two |
+| `sin`, `cos`, `tan`, `arcsin`, `arccos`, `arctan` | radians; big arguments reduce modulo pi/2 at a matching precision |
+| `sinh`, `cosh`, `tanh` | hyperbolics over the same exponential core |
+| `pi(precision)`, `e(precision)` | class functions; pi is cached between calls |
 | `gcd`, `lcm` | on the decimal lattice: `gcd(0.25, 0.15) = 0.05` |
 | `precision`, `mostSignificantExponent`, `getDigit(i)` | significant digit count, exponent of the leading digit, digit at `10^i` |
 | `shift10(n)`, `shifted10(n)` | multiply by a power of ten without touching the mantissa |
 | `isZero`, `isOne`, `isIntegral`, `isEven`, `isOdd`, `isNegative`, `isPositive`, `sign`, `abs`, `negate` | predicates and sign helpers; a fractional value is neither even nor odd |
-| `compare`, `equals`, `min`, `max`, `hashCode`, `swap` | plus the full operator and comparison set |
+| `compare`, `equals`, `approxEquals(other, eps)`, `min`, `max`, `hashCode`, `swap` | plus the full operator and comparison set |
 | `zero`, `one`, `two`, `ten` | class constants |
 
 ## Semantics worth knowing
