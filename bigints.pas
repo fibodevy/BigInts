@@ -553,6 +553,19 @@ type
     function log2(precision: integer = 18): BigDecimal;
     function log10(precision: integer = 18): BigDecimal;
     function logBase(const b: BigDecimal; precision: integer = 18): BigDecimal;
+    // trigonometry in radians; large arguments are reduced modulo pi/2 with
+    // pi carried at a matching precision, arcsin/arccos raise EBigIntError
+    // outside -1..1
+    function sin(precision: integer = 18): BigDecimal;
+    function cos(precision: integer = 18): BigDecimal;
+    function tan(precision: integer = 18): BigDecimal;
+    function arcsin(precision: integer = 18): BigDecimal;
+    function arccos(precision: integer = 18): BigDecimal;
+    function arctan(precision: integer = 18): BigDecimal;
+    // hyperbolics
+    function sinh(precision: integer = 18): BigDecimal;
+    function cosh(precision: integer = 18): BigDecimal;
+    function tanh(precision: integer = 18): BigDecimal;
     // float builders: plain takes the shortest round-tripping decimal,
     // exact the full binary expansion
     class function fromDouble(d: Double): BigDecimal; static;
@@ -6284,8 +6297,358 @@ begin
   result := a.pow(b);
 end;
 
+// reduce |a| modulo pi/2 at a precision matching the argument size: r is the
+// signed remainder scaled by 10^w with |r| a touch above pi/4, quad the
+// quadrant of |a|
+procedure TrigReduce(const a: BigDecimal; w: Int64; out r: BigInt; out quad: integer);
+begin
+  var lo, hi: Int64;
+  DecMagBounds(a.fMan.fLimbs, a.fExp, lo, hi);
+  var wred := w + 8;
+  if hi > 0 then wred := wred + hi;
+  var xu: UBigInt;
+  xu.fLimbs := DecToScaled(a, wred).fLimbs;
+  var ph := PiScaled(wred) div 2;
+  var q := (xu * 2 + ph) div (ph * 2);
+  var rb := xu.toBigInt - (q * ph).toBigInt;
+  quad := integer(LModW(q.fLimbs, 4));
+  r.fLimbs := UScaleDown(rb.magnitude, wred - w).fLimbs;
+  r.fNeg := rb.fNeg and (Length(r.fLimbs) > 0);
+end;
+
+// sine and cosine of r = R/10^w for |r| below 0.8, both scaled by 10^w
+procedure SinCosScaled(const r: BigInt; w: Int64; out sinS: BigInt; out cosS: UBigInt);
+begin
+  var p10 := UPow10(LongWord(w));
+  var ru: UBigInt;
+  ru.fLimbs := r.fLimbs;
+  var r2 := ru.sqr div p10;
+  var s := ru;
+  var t := ru;
+  var j: Int64 := 1;
+  var sub := true;
+  repeat
+    t := t * r2 div p10 div ((j + 1) * (j + 2));
+    if t.isZero then break;
+    j := j + 2;
+    if sub then s := s - t else s := s + t;
+    sub := not sub;
+  until false;
+  sinS.fLimbs := s.fLimbs;
+  sinS.fNeg := r.fNeg and (Length(s.fLimbs) > 0);
+  var c := p10;
+  t := p10;
+  j := 0;
+  sub := true;
+  repeat
+    t := t * r2 div p10 div ((j + 1) * (j + 2));
+    if t.isZero then break;
+    j := j + 2;
+    if sub then c := c - t else c := c + t;
+    sub := not sub;
+  until false;
+  cosS := c;
+end;
+
+// arctan of x = XU/10^w, XU >= 0, scaled by 10^w: arguments above one fold
+// through pi/2 - arctan(1/x), the rest is halved under 1e-3 and summed
+function ATanScaledU(XU: UBigInt; w: Int64): UBigInt;
+begin
+  var p10 := UPow10(LongWord(w));
+  if XU = p10 then exit(PiScaled(w) div 4);
+  var fold := XU > p10;
+  if fold then XU := p10 * p10 div XU;
+  var cnt := 0;
+  var thresh := p10 div 1000;
+  while XU > thresh do begin
+    // x := x / (1 + sqrt(1 + x^2)) halves the angle
+    var h := (p10 * p10 + XU * XU).sqrt;
+    XU := XU * p10 div (p10 + h);
+    inc(cnt);
+  end;
+  var s := XU;
+  var t := XU;
+  var x2 := XU.sqr div p10;
+  var j: Int64 := 1;
+  var sub := true;
+  repeat
+    t := t * x2 div p10;
+    if t.isZero then break;
+    j := j + 2;
+    var d := t div j;
+    if d.isZero then break;
+    if sub then s := s - d else s := s + d;
+    sub := not sub;
+  until false;
+  s := s shl cnt;
+  if fold then s := PiScaled(w) div 2 - s;
+  result := s;
+end;
+
+function BigDecimal.sin(precision: integer): BigDecimal;
+begin
+  var p := precision;
+  if p < 0 then p := 0;
+  if fMan.isZero then exit(default(BigDecimal));
+  var w := Int64(p) + 20;
+  var msd := mostSignificantExponent;
+  if msd < 0 then w := w - msd;
+  var r: BigInt;
+  var quad: integer;
+  TrigReduce(abs, w, r, quad);
+  var ss, v: BigInt;
+  var cc: UBigInt;
+  SinCosScaled(r, w, ss, cc);
+  case quad of
+    0: v := ss;
+    1: begin
+      v.fLimbs := cc.fLimbs;
+      v.fNeg := false;
+    end;
+    2: v := -ss;
+  else begin
+    v.fLimbs := cc.fLimbs;
+    v.fNeg := Length(cc.fLimbs) > 0;
+  end;
+  end;
+  if fMan.fNeg then v := -v;
+  result := DecFromScaled(v, w, p);
+end;
+
+function BigDecimal.cos(precision: integer): BigDecimal;
+begin
+  var p := precision;
+  if p < 0 then p := 0;
+  if fMan.isZero then exit(BigDecimal.one);
+  var w := Int64(p) + 20;
+  var r: BigInt;
+  var quad: integer;
+  TrigReduce(abs, w, r, quad);
+  var ss, v: BigInt;
+  var cc: UBigInt;
+  SinCosScaled(r, w, ss, cc);
+  case quad of
+    0: begin
+      v.fLimbs := cc.fLimbs;
+      v.fNeg := false;
+    end;
+    1: v := -ss;
+    2: begin
+      v.fLimbs := cc.fLimbs;
+      v.fNeg := Length(cc.fLimbs) > 0;
+    end;
+  else v := ss;
+  end;
+  result := DecFromScaled(v, w, p);
+end;
+
+function BigDecimal.tan(precision: integer): BigDecimal;
+begin
+  var p := precision;
+  if p < 0 then p := 0;
+  if fMan.isZero then exit(default(BigDecimal));
+  var w := Int64(p) + 24;
+  var msd := mostSignificantExponent;
+  if msd < 0 then w := w - msd;
+  var r: BigInt;
+  var quad: integer;
+  TrigReduce(abs, w, r, quad);
+  var ss: BigInt;
+  var cc: UBigInt;
+  SinCosScaled(r, w, ss, cc);
+  var p10 := UPow10(LongWord(w));
+  var v: BigInt;
+  if quad and 1 = 0 then begin
+    // tan r: the cosine of a reduced argument never vanishes
+    v.fLimbs := (ss.magnitude * p10 div cc).fLimbs;
+    v.fNeg := ss.fNeg and (Length(v.fLimbs) > 0);
+  end else begin
+    // tan(pi/2 + r) = -cos r / sin r
+    if ss.isZero then raise EBigIntError.Create('tangent pole');
+    v.fLimbs := (cc * p10 div ss.magnitude).fLimbs;
+    v.fNeg := not ss.fNeg and (Length(v.fLimbs) > 0);
+  end;
+  if fMan.fNeg then v := -v;
+  result := DecFromScaled(v, w, p);
+end;
+
+function BigDecimal.arctan(precision: integer): BigDecimal;
+begin
+  var p := precision;
+  if p < 0 then p := 0;
+  if fMan.isZero then exit(default(BigDecimal));
+  var w := Int64(p) + 20;
+  var msd := mostSignificantExponent;
+  if msd < 0 then w := w - msd;
+  var xu: UBigInt;
+  xu.fLimbs := DecToScaled(self, w).fLimbs;
+  var v: BigInt;
+  v.fLimbs := ATanScaledU(xu, w).fLimbs;
+  v.fNeg := fMan.fNeg;
+  result := DecFromScaled(v, w, p);
+end;
+
+function BigDecimal.arcsin(precision: integer): BigDecimal;
+begin
+  var p := precision;
+  if p < 0 then p := 0;
+  if fMan.isZero then exit(default(BigDecimal));
+  var c := abs.compare(BigDecimal.one);
+  if c > 0 then raise EBigIntError.Create('arcsine argument outside -1..1');
+  var w := Int64(p) + 20;
+  var msd := mostSignificantExponent;
+  if msd < 0 then w := w - msd;
+  var v: BigInt;
+  if c = 0 then v.fLimbs := (PiScaled(w) div 2).fLimbs
+  else begin
+    // arcsin(x) = arctan(x / sqrt(1 - x^2))
+    var xu: UBigInt;
+    xu.fLimbs := DecToScaled(self, w).fLimbs;
+    var p10 := UPow10(LongWord(w));
+    var den := (p10 * p10 - xu * xu).sqrt;
+    v.fLimbs := ATanScaledU(xu * p10 div den, w).fLimbs;
+  end;
+  v.fNeg := fMan.fNeg;
+  result := DecFromScaled(v, w, p);
+end;
+
+function BigDecimal.arccos(precision: integer): BigDecimal;
+begin
+  var p := precision;
+  if p < 0 then p := 0;
+  if abs.compare(BigDecimal.one) > 0 then raise EBigIntError.Create('arccosine argument outside -1..1');
+  var w := Int64(p) + 20;
+  var v: BigInt;
+  v.fNeg := false;
+  if fMan.isZero then v.fLimbs := (PiScaled(w) div 2).fLimbs
+  else begin
+    // arccos(x) = arctan(sqrt(1 - x^2) / x), plus pi below zero - the
+    // cancellation-free form
+    var xu: UBigInt;
+    xu.fLimbs := DecToScaled(self, w).fLimbs;
+    var p10 := UPow10(LongWord(w));
+    var den := (p10 * p10 - xu * xu).sqrt;
+    var at := ATanScaledU(den * p10 div xu, w);
+    if fMan.fNeg then v.fLimbs := (PiScaled(w) - at).fLimbs
+    else v.fLimbs := at.fLimbs;
+  end;
+  result := DecFromScaled(v, w, p);
+end;
+
+function BigDecimal.sinh(precision: integer): BigDecimal;
+begin
+  var p := precision;
+  if p < 0 then p := 0;
+  if fMan.isZero then exit(default(BigDecimal));
+  if abs.compare(BigDecimal.one) <= 0 then begin
+    // the plus-only sine series keeps tiny arguments significant
+    var w := Int64(p) + 20;
+    var msd := mostSignificantExponent;
+    if msd < 0 then w := w - msd;
+    var p10 := UPow10(LongWord(w));
+    var xu: UBigInt;
+    xu.fLimbs := DecToScaled(self, w).fLimbs;
+    var r2 := xu.sqr div p10;
+    var s := xu;
+    var t := xu;
+    var j: Int64 := 1;
+    repeat
+      t := t * r2 div p10 div ((j + 1) * (j + 2));
+      if t.isZero then break;
+      j := j + 2;
+      s := s + t;
+    until false;
+    var v: BigInt;
+    v.fLimbs := s.fLimbs;
+    v.fNeg := fMan.fNeg and (Length(s.fLimbs) > 0);
+    exit(DecFromScaled(v, w, p));
+  end;
+  // (e^x - e^-x) / 2
+  var lo, hi: Int64;
+  DecMagBounds(fMan.fLimbs, fExp, lo, hi);
+  if hi >= 10 then RaiseDecExpRange;
+  var ax := toDouble;
+  if ax < 0 then ax := -ax;
+  var d := System.Trunc(ax * 0.4342944819032518) + 2;
+  var w := Int64(p) + d + 24;
+  var eu := ExpScaled(DecToScaled(abs, w), w);
+  var p10 := UPow10(LongWord(w));
+  var v: BigInt;
+  v.fLimbs := ((eu - p10 * p10 div eu) div 2).fLimbs;
+  v.fNeg := fMan.fNeg;
+  result := DecFromScaled(v, w, p);
+end;
+
+function BigDecimal.cosh(precision: integer): BigDecimal;
+begin
+  var p := precision;
+  if p < 0 then p := 0;
+  if fMan.isZero then exit(BigDecimal.one);
+  var lo, hi: Int64;
+  DecMagBounds(fMan.fLimbs, fExp, lo, hi);
+  if hi >= 10 then RaiseDecExpRange;
+  var ax := toDouble;
+  if ax < 0 then ax := -ax;
+  var d := System.Trunc(ax * 0.4342944819032518) + 2;
+  var w := Int64(p) + d + 24;
+  var eu := ExpScaled(DecToScaled(abs, w), w);
+  var p10 := UPow10(LongWord(w));
+  var v: BigInt;
+  v.fLimbs := ((eu + p10 * p10 div eu) div 2).fLimbs;
+  v.fNeg := false;
+  result := DecFromScaled(v, w, p);
+end;
+
+function BigDecimal.tanh(precision: integer): BigDecimal;
+begin
+  var p := precision;
+  if p < 0 then p := 0;
+  if fMan.isZero then exit(default(BigDecimal));
+  var v: BigInt;
+  if abs.compare(BigDecimal.one) <= 0 then begin
+    // sinh / cosh with cosh = sqrt(1 + sinh^2), all in one scale
+    var w := Int64(p) + 20;
+    var msd := mostSignificantExponent;
+    if msd < 0 then w := w - msd;
+    var p10 := UPow10(LongWord(w));
+    var xu: UBigInt;
+    xu.fLimbs := DecToScaled(self, w).fLimbs;
+    var r2 := xu.sqr div p10;
+    var s := xu;
+    var t := xu;
+    var j: Int64 := 1;
+    repeat
+      t := t * r2 div p10 div ((j + 1) * (j + 2));
+      if t.isZero then break;
+      j := j + 2;
+      s := s + t;
+    until false;
+    v.fLimbs := (s * p10 div (p10 * p10 + s.sqr).sqrt).fLimbs;
+    v.fNeg := fMan.fNeg and (Length(v.fLimbs) > 0);
+    exit(DecFromScaled(v, w, p));
+  end;
+  // (1 - u) / (1 + u) with u = e^(-2|x|); past the working scale u is zero
+  var w := Int64(p) + 24;
+  var p10 := UPow10(LongWord(w));
+  var ax := toDouble;
+  if ax < 0 then ax := -ax;
+  var u := UBigInt.zero;
+  if 0.8685889638065036 * ax <= w + 2 then begin
+    var x2 := DecToScaled(abs, w);
+    x2 := x2 + x2;
+    x2.fNeg := true;
+    u := ExpScaled(x2, w);
+  end;
+  v.fLimbs := ((p10 - u) * p10 div (p10 + u)).fLimbs;
+  v.fNeg := fMan.fNeg;
+  result := DecFromScaled(v, w, p);
+end;
+
 {$ifdef BIGINT_ASM}
 initialization
+  UseAdx := CpuHasAdx;
+{$endif}
+end.
   UseAdx := CpuHasAdx;
 {$endif}
 end.
