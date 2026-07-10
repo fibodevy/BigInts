@@ -29,6 +29,11 @@ unit BigInts;
 
 interface
 
+// native UInt128 (x86_64 compilers that provide it): double-limb products and
+// the PCG64 state advance become single inline multiplies instead of calls
+// (declared() only resolves system types from the interface part on)
+{$if defined(BIGINT_ASM) and declared(UInt128)}{$define BIGINT_INT128}{$endif}
+
 uses SysUtils;
 
 type
@@ -823,6 +828,15 @@ begin
 end;
 
 // 2-limb product of a * b
+{$ifdef BIGINT_INT128}
+// inlines to one mul at the call site, no call and no memory round-trip
+procedure UMulLimb(a, b: TLimb; out hi, lo: TLimb); inline;
+begin
+  var p := UInt128(a) * b;
+  lo := TLimb(p);
+  hi := TLimb(p shr 64);
+end;
+{$else}
 procedure UMulLimb(a, b: TLimb; out hi, lo: TLimb); assembler; nostackframe;
 asm
   mov rax, rcx
@@ -830,6 +844,7 @@ asm
   mov [r8], rdx
   mov [r9], rax
 end;
+{$endif}
 
 // (hi:lo) div d and its remainder, caller guarantees hi < d
 function UDivLimb(hi, lo, d: TLimb; out rem: TLimb): TLimb; assembler; nostackframe;
@@ -3986,6 +4001,7 @@ begin
   xoshiroState[3] := RotL64(xoshiroState[3], 45);
 end;
 
+{$ifndef BIGINT_INT128}
 // portable 64x64 -> 128 product (independent of the limb width)
 procedure Mul64x64(a, b: QWord; out hi, lo: QWord);
 begin
@@ -3999,6 +4015,7 @@ begin
   hi := a1 * b1 + (p10 shr 32) + (p01 shr 32);
   lo := (p01 shl 32) or (p00 and $FFFFFFFF);
 end;
+{$endif}
 
 // PCG XSL-RR 128/64 with the reference multiplier and stream
 function PcgNext: QWord;
@@ -4011,6 +4028,11 @@ begin
   var oldHi := pcgHi;
   var oldLo := pcgLo;
   // 128-bit state * mult + inc
+  {$ifdef BIGINT_INT128}
+  var state := ((UInt128(oldHi) shl 64) or oldLo) * ((UInt128(mHi) shl 64) or mLo) + ((UInt128(aHi) shl 64) or aLo);
+  pcgHi := QWord(state shr 64);
+  pcgLo := QWord(state);
+  {$else}
   var hi, lo: QWord;
   Mul64x64(oldLo, mLo, hi, lo);
   hi := hi + oldHi * mLo + oldLo * mHi;
@@ -4018,6 +4040,7 @@ begin
   if newLo < lo then inc(hi);
   pcgHi := hi + aHi;
   pcgLo := newLo;
+  {$endif}
   // output from the pre-advance state
   var rot := integer(oldHi shr 58);
   var x := oldHi xor oldLo;
