@@ -32,7 +32,10 @@ interface
 // native UInt128 (x86_64 compilers that provide it): double-limb products and
 // the PCG64 state advance become single inline multiplies instead of calls
 // (declared() only resolves system types from the interface part on)
-{$if defined(BIGINT_ASM) and declared(UInt128)}{$define BIGINT_INT128}{$endif}
+// BIGINT_HAS_INT128 gates the public Int128/UInt128 conversions (they need
+// only the type); BIGINT_INT128 additionally requires the asm build and drives
+// the inline double-limb product and PCG64 advance
+{$if declared(UInt128)}{$define BIGINT_HAS_INT128}{$if defined(BIGINT_ASM)}{$define BIGINT_INT128}{$endif}{$endif}
 
 uses SysUtils;
 
@@ -141,6 +144,10 @@ type
     function toUInt32: UInt32;
     function toInt64: Int64;
     function toUInt64: UInt64;
+    {$ifdef BIGINT_HAS_INT128}
+    function toInt128: Int128;
+    function toUInt128: UInt128;
+    {$endif}
     function toDouble: Double;
     // does the value fit in each native integer width
     function fitsInInt8: boolean;
@@ -151,6 +158,10 @@ type
     function fitsInUInt32: boolean;
     function fitsInInt64: boolean;
     function fitsInUInt64: boolean;
+    {$ifdef BIGINT_HAS_INT128}
+    function fitsInInt128: boolean;
+    function fitsInUInt128: boolean;
+    {$endif}
     // predicates
     function isZero: boolean;
     function isOne: boolean;
@@ -362,6 +373,10 @@ type
     function toUInt32: UInt32;
     function toInt64: Int64;
     function toUInt64: UInt64;
+    {$ifdef BIGINT_HAS_INT128}
+    function toInt128: Int128;
+    function toUInt128: UInt128;
+    {$endif}
     function toDouble: Double;
     function toUBigInt: UBigInt;
     // does the value fit in each native integer width
@@ -373,6 +388,10 @@ type
     function fitsInUInt32: boolean;
     function fitsInInt64: boolean;
     function fitsInUInt64: boolean;
+    {$ifdef BIGINT_HAS_INT128}
+    function fitsInInt128: boolean;
+    function fitsInUInt128: boolean;
+    {$endif}
     // predicates
     function isZero: boolean;
     function isOne: boolean;
@@ -570,6 +589,10 @@ type
     function toUInt32: UInt32;
     function toInt64: Int64;
     function toUInt64: UInt64;
+    {$ifdef BIGINT_HAS_INT128}
+    function toInt128: Int128;
+    function toUInt128: UInt128;
+    {$endif}
     function toBigInt: BigInt;
     function toUBigInt: UBigInt;
     // integral and inside each native integer width
@@ -581,6 +604,10 @@ type
     function fitsInUInt32: boolean;
     function fitsInInt64: boolean;
     function fitsInUInt64: boolean;
+    {$ifdef BIGINT_HAS_INT128}
+    function fitsInInt128: boolean;
+    function fitsInUInt128: boolean;
+    {$endif}
     // correctly rounded to the nearest float (ties to even); overflow gives
     // infinity, underflow gives zero
     function toDouble: Double;
@@ -2696,6 +2723,20 @@ begin
   result := LToQWord(fLimbs);
 end;
 
+{$ifdef BIGINT_HAS_INT128}
+function UBigInt.toInt128: Int128;
+begin
+  if not fitsInInt128 then raise ERangeError.Create('UBigInt value does not fit in Int128');
+  result := Int128((UInt128(LExtract64(fLimbs, 64)) shl 64) or UInt128(LExtract64(fLimbs, 0)));
+end;
+
+function UBigInt.toUInt128: UInt128;
+begin
+  if not fitsInUInt128 then raise ERangeError.Create('UBigInt value does not fit in UInt128');
+  result := (UInt128(LExtract64(fLimbs, 64)) shl 64) or UInt128(LExtract64(fLimbs, 0));
+end;
+{$endif}
+
 function UBigInt.toDouble: Double;
 begin
   var bits := bitLength;
@@ -2756,6 +2797,18 @@ function UBigInt.fitsInUInt64: boolean;
 begin
   result := bitLength <= 64;
 end;
+
+{$ifdef BIGINT_HAS_INT128}
+function UBigInt.fitsInInt128: boolean;
+begin
+  result := bitLength <= 127;
+end;
+
+function UBigInt.fitsInUInt128: boolean;
+begin
+  result := bitLength <= 128;
+end;
+{$endif}
 
 function UBigInt.isZero: boolean;
 begin
@@ -5087,6 +5140,21 @@ begin
   result := LToQWord(fLimbs);
 end;
 
+{$ifdef BIGINT_HAS_INT128}
+function BigInt.toInt128: Int128;
+begin
+  if not fitsInInt128 then raise ERangeError.Create('BigInt value does not fit in Int128');
+  var m := (UInt128(LExtract64(fLimbs, 64)) shl 64) or UInt128(LExtract64(fLimbs, 0));
+  result := if fNeg then -Int128(m) else Int128(m);
+end;
+
+function BigInt.toUInt128: UInt128;
+begin
+  if not fitsInUInt128 then raise ERangeError.Create('BigInt value does not fit in UInt128');
+  result := (UInt128(LExtract64(fLimbs, 64)) shl 64) or UInt128(LExtract64(fLimbs, 0));
+end;
+{$endif}
+
 function BigInt.toDouble: Double;
 begin
   result := magnitude.toDouble;
@@ -5140,6 +5208,18 @@ function BigInt.fitsInUInt64: boolean;
 begin
   result := (not fNeg) and (bitLength <= 64);
 end;
+
+{$ifdef BIGINT_HAS_INT128}
+function BigInt.fitsInInt128: boolean;
+begin
+  result := bitLength < 128;
+end;
+
+function BigInt.fitsInUInt128: boolean;
+begin
+  result := (not fNeg) and (bitLength <= 128);
+end;
+{$endif}
 
 function BigInt.isZero: boolean;
 begin
@@ -6322,6 +6402,18 @@ begin
   result := toBigInt.toUInt64;
 end;
 
+{$ifdef BIGINT_HAS_INT128}
+function BigDecimal.toInt128: Int128;
+begin
+  result := toBigInt.toInt128;
+end;
+
+function BigDecimal.toUInt128: UInt128;
+begin
+  result := toBigInt.toUInt128;
+end;
+{$endif}
+
 function BigDecimal.toBigInt: BigInt;
 begin
   if not isIntegral then raise ERangeError.Create('BigDecimal value is not integral');
@@ -6372,6 +6464,18 @@ function BigDecimal.fitsInUInt64: boolean;
 begin
   result := isIntegral and trunc.fitsInUInt64;
 end;
+
+{$ifdef BIGINT_HAS_INT128}
+function BigDecimal.fitsInInt128: boolean;
+begin
+  result := isIntegral and trunc.fitsInInt128;
+end;
+
+function BigDecimal.fitsInUInt128: boolean;
+begin
+  result := isIntegral and trunc.fitsInUInt128;
+end;
+{$endif}
 
 function BigDecimal.isZero: boolean;
 begin

@@ -65,7 +65,8 @@ Everything is camelCase and discoverable through code completion. Methods live o
 | `toHex`, `toBin`, `toOct` | shorthands for bases 16, 2, 8 |
 | `toStringGrouped(sep = '_', groupSize = 3)` | `1_234_567` style output |
 | `toInt8`, `toUInt8`, `toInt16`, `toUInt16`, `toInt32`, `toUInt32`, `toInt64`, `toUInt64`, `toDouble` | raise `ERangeError` when the value does not fit |
-| `fitsInInt8`, `fitsInUInt8`, ... `fitsInInt64`, `fitsInUInt64` | the matching checks for every native width |
+| `toInt128`, `toUInt128` | on targets whose compiler provides the native 128-bit type |
+| `fitsInInt8`, `fitsInUInt8`, ... `fitsInInt64`, `fitsInUInt64` (and `fitsInInt128`/`fitsInUInt128` where available) | the matching checks for every native width |
 | `toUBigInt` / `toBigInt` | cross the signedness bridge; a negative value raises `ERangeError` |
 | `toDecimal` | widen to `BigDecimal` (exact, never rounds) |
 | `toBytesLE`, `toBytesBE`, `fromBytesLE`, `fromBytesBE` | `UBigInt`: raw magnitude; `BigInt`: minimal two's complement with the sign bit, like Java `toByteArray` |

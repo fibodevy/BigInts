@@ -2190,6 +2190,32 @@ begin
   check((pn = 355) and (pd = 113), 'pi convergent 355/113');
 end;
 
+{$if declared(UInt128)}
+procedure testInt128;
+begin
+  section('Int128 / UInt128 conversions');
+  // UBigInt -> native 128, checked against the compiler's own arithmetic
+  var u := UBigInt.pow2(100) + 12345;
+  check(u.toUInt128 = ((UInt128(1) shl 100) + 12345), 'u toUInt128 roundtrip');
+  check(u.fitsInUInt128 and u.fitsInInt128, 'u 100-bit fits both');
+  check((UBigInt.pow2(127) - 1).fitsInInt128 and not UBigInt.pow2(127).fitsInInt128, 'u Int128 edge');
+  check(UBigInt.pow2(127).fitsInUInt128 and not UBigInt.pow2(128).fitsInUInt128, 'u UInt128 edge');
+  check((UBigInt.pow2(127) - 1).toInt128 = High(Int128), 'u toInt128 = High(Int128)');
+  check((UBigInt.pow2(128) - 1).toUInt128 = High(UInt128), 'u toUInt128 = High(UInt128)');
+  checkRaises(procedure begin UBigInt.pow2(200).toUInt128; end, ERangeError, 'u toUInt128 overflow raises');
+  // BigInt signed
+  check((-(BigInt(1) shl 100)).toInt128 = -(Int128(1) shl 100), 'b toInt128 negative');
+  check((-(BigInt(1) shl 127)).toInt128 = Low(Int128), 'b toInt128 = Low(Int128)');
+  check((-(BigInt(1) shl 127)).fitsInInt128 and not (-(BigInt(1) shl 127) - 1).fitsInInt128, 'b Low(Int128) edge');
+  check((BigInt(1) shl 127).fitsInUInt128 and not (BigInt(1) shl 127).fitsInInt128, 'b 2^127 unsigned only');
+  check(BigInt(255).toUInt128 = 255, 'b small toUInt128');
+  checkRaises(procedure begin BigInt(-1).toUInt128; end, ERangeError, 'b negative toUInt128 raises');
+  // BigDecimal delegates through trunc
+  check(BigDecimal('170141183460469231731687303715884105727').toInt128 = High(Int128), 'dec toInt128 max');
+  check(BigDecimal('42').fitsInInt128 and not BigDecimal('42.5').fitsInInt128, 'dec fitsInInt128 integral');
+end;
+{$endif}
+
 begin
   RandSeed := 20260706;
   // the native RNG now auto-seeds from OS entropy per thread; seed it explicitly
@@ -2250,6 +2276,9 @@ begin
   testDecTrig;
   testDecPractical;
   testDecSpecial;
+  {$if declared(UInt128)}
+  testInt128;
+  {$endif}
 
   writeln;
   if failCount = 0 then writeln(#27'[32mALL TESTS PASSED (', passCount, ' checks)'#27'[0m')
