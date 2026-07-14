@@ -67,6 +67,7 @@ Everything is camelCase and discoverable through code completion. Methods live o
 | `toInt64`, `toQWord`, `toInteger`, `toCardinal`, `toDouble` | raise `ERangeError` when the value does not fit |
 | `fitsInInt64`, `fitsInQWord`, `fitsInInteger`, `fitsInCardinal` | the matching checks |
 | `toUBigInt` / `toBigInt` | cross the signedness bridge; a negative value raises `ERangeError` |
+| `toDecimal` | widen to `BigDecimal` (exact, never rounds) |
 | `toBytesLE`, `toBytesBE`, `fromBytesLE`, `fromBytesBE` | `UBigInt`: raw magnitude; `BigInt`: minimal two's complement with the sign bit, like Java `toByteArray` |
 
 ### Predicates and sign
@@ -273,7 +274,7 @@ end.
 |---|---|
 | `parse(s)`, `tryParse(s, out v)`, `:=` from string | `[sign]digits[.digits][E[sign]digits]`, `_` separators allowed |
 | `toString`, `toScientific`, `toEngineering` | plain `-123.45` / normalized `-1.2345E2` / exponent a multiple of three, `123E-6` |
-| `toInt64`, `toQWord`, `toInteger`, `toCardinal`, `toBigInt`, `fitsIn*` | exact conversions: raise `ERangeError` unless integral and in range |
+| `toInt64`, `toQWord`, `toInteger`, `toCardinal`, `toBigInt`, `toUBigInt`, `fitsIn*` | exact conversions: raise `ERangeError` unless integral and in range (`toUBigInt` also on a negative value) |
 | `trunc`, `floor`, `ceil`, `round` | to `BigInt`: toward zero, toward -inf, toward +inf, halves to even (like Pascal `round`) |
 | `frac` | what `trunc` drops, so `self = trunc + frac` |
 | `toFraction` | exact rational view as a `(num, den)` tuple: `0.375` gives `(3, 8)` |

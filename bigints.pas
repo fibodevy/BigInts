@@ -473,10 +473,6 @@ type
     class function fromContinuedFraction(const cf: array of BigInt): (num, den: BigInt); static;
   end;
 
-  // declared after both records so UBigInt can offer a BigInt-returning method
-  TUBigIntBridge = record helper for UBigInt
-    function toBigInt: BigInt;
-  end;
 
   // rounding modes for BigDecimal.rounded: bdrRound rounds halves away from
   // zero, bdrHalfUp rounds halves toward +infinity, bdrHalfEven to the even
@@ -548,6 +544,7 @@ type
     function toInteger: LongInt;
     function toCardinal: LongWord;
     function toBigInt: BigInt;
+    function toUBigInt: UBigInt;
     function fitsInInt64: boolean;
     function fitsInQWord: boolean;
     function fitsInInteger: boolean;
@@ -682,6 +679,17 @@ type
     class function atan2(const y, x: BigDecimal; precision: integer = 18): BigDecimal; static;
     class function hypot(const x, y: BigDecimal; precision: integer = 18): BigDecimal; static;
     class function agm(const a, b: BigDecimal; precision: integer = 18): BigDecimal; static;
+  end;
+
+  // bridges declared after BigDecimal so the integer types can return the
+  // wider types (BigInt for UBigInt, BigDecimal for both)
+  TUBigIntBridge = record helper for UBigInt
+    function toBigInt: BigInt;
+    function toDecimal: BigDecimal;
+  end;
+
+  TBigIntBridge = record helper for BigInt
+    function toDecimal: BigDecimal;
   end;
 
 var
@@ -5207,6 +5215,16 @@ begin
   result.fNeg := false;
 end;
 
+function TUBigIntBridge.toDecimal: BigDecimal;
+begin
+  result := self;
+end;
+
+function TBigIntBridge.toDecimal: BigDecimal;
+begin
+  result := self;
+end;
+
 function BigInt.sqr: BigInt;
 begin
   result.fLimbs := LSqr(fLimbs);
@@ -6152,6 +6170,11 @@ function BigDecimal.toBigInt: BigInt;
 begin
   if not isIntegral then raise ERangeError.Create('BigDecimal value is not integral');
   result := trunc;
+end;
+
+function BigDecimal.toUBigInt: UBigInt;
+begin
+  result := toBigInt.toUBigInt;
 end;
 
 function BigDecimal.fitsInInt64: boolean;

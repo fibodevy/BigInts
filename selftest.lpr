@@ -1600,6 +1600,15 @@ begin
   check(BigDecimal('42').toCardinal = 42, 'dec toCardinal');
   check(BigDecimal('4.2E1').toInt64 = 42, 'dec toInt64 from exponent form');
   checkEq(BigDecimal('12345678901234567890123').toBigInt.toString, '12345678901234567890123', 'dec toBigInt');
+  checkEq(BigDecimal('340282366920938463463374607431768211456').toUBigInt.toString, '340282366920938463463374607431768211456', 'dec toUBigInt');
+  check(BigDecimal('42').toUBigInt = UBigInt(42), 'dec toUBigInt small');
+  checkRaises(procedure begin var z := BigDecimal('1.5').toUBigInt; end, ERangeError, 'dec toUBigInt fraction raises');
+  checkRaises(procedure begin var z := BigDecimal('-4').toUBigInt; end, ERangeError, 'dec toUBigInt negative raises');
+  // integer types widen to BigDecimal via toDecimal
+  check(UBigInt('123456789012345678901234567890').toDecimal = BigDecimal('123456789012345678901234567890'), 'dec UBigInt.toDecimal');
+  check(BigInt('-999999999999999999999').toDecimal = BigDecimal('-999999999999999999999'), 'dec BigInt.toDecimal');
+  check(UBigInt(720).toDecimal.divide(BigDecimal(2), 4).toString = '360', 'dec toDecimal in expression');
+  check(BigInt(-7).toDecimal.toBigInt = BigInt(-7), 'dec toDecimal roundtrip');
   checkEq(BigInt(BigDecimal('-99')).toString, '-99', 'dec BigInt cast');
   check(BigDecimal('42').fitsInInt64 and BigDecimal('42').fitsInInteger, 'dec fits integral');
   check(not BigDecimal('42.5').fitsInInt64, 'dec fits rejects fraction');
