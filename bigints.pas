@@ -128,15 +128,24 @@ type
     function toBin: string;
     function toOct: string;
     // numeric conversions (raise ERangeError when the value does not fit)
+    function toInt8: Int8;
+    function toUInt8: UInt8;
+    function toInt16: Int16;
+    function toUInt16: UInt16;
+    function toInt32: Int32;
+    function toUInt32: UInt32;
     function toInt64: Int64;
-    function toQWord: QWord;
-    function toInteger: LongInt;
-    function toCardinal: LongWord;
+    function toUInt64: UInt64;
     function toDouble: Double;
+    // does the value fit in each native integer width
+    function fitsInInt8: boolean;
+    function fitsInUInt8: boolean;
+    function fitsInInt16: boolean;
+    function fitsInUInt16: boolean;
+    function fitsInInt32: boolean;
+    function fitsInUInt32: boolean;
     function fitsInInt64: boolean;
-    function fitsInQWord: boolean;
-    function fitsInInteger: boolean;
-    function fitsInCardinal: boolean;
+    function fitsInUInt64: boolean;
     // predicates
     function isZero: boolean;
     function isOne: boolean;
@@ -340,16 +349,25 @@ type
     function toBin: string;
     function toOct: string;
     // numeric conversions (raise ERangeError when the value does not fit)
+    function toInt8: Int8;
+    function toUInt8: UInt8;
+    function toInt16: Int16;
+    function toUInt16: UInt16;
+    function toInt32: Int32;
+    function toUInt32: UInt32;
     function toInt64: Int64;
-    function toQWord: QWord;
-    function toInteger: LongInt;
-    function toCardinal: LongWord;
+    function toUInt64: UInt64;
     function toDouble: Double;
     function toUBigInt: UBigInt;
+    // does the value fit in each native integer width
+    function fitsInInt8: boolean;
+    function fitsInUInt8: boolean;
+    function fitsInInt16: boolean;
+    function fitsInUInt16: boolean;
+    function fitsInInt32: boolean;
+    function fitsInUInt32: boolean;
     function fitsInInt64: boolean;
-    function fitsInQWord: boolean;
-    function fitsInInteger: boolean;
-    function fitsInCardinal: boolean;
+    function fitsInUInt64: boolean;
     // predicates
     function isZero: boolean;
     function isOne: boolean;
@@ -539,16 +557,25 @@ type
     function toEngineering: string;
     // exact conversions (raise ERangeError unless integral and in range;
     // use trunc/floor/ceil/round for the lossy ones)
+    function toInt8: Int8;
+    function toUInt8: UInt8;
+    function toInt16: Int16;
+    function toUInt16: UInt16;
+    function toInt32: Int32;
+    function toUInt32: UInt32;
     function toInt64: Int64;
-    function toQWord: QWord;
-    function toInteger: LongInt;
-    function toCardinal: LongWord;
+    function toUInt64: UInt64;
     function toBigInt: BigInt;
     function toUBigInt: UBigInt;
+    // integral and inside each native integer width
+    function fitsInInt8: boolean;
+    function fitsInUInt8: boolean;
+    function fitsInInt16: boolean;
+    function fitsInUInt16: boolean;
+    function fitsInInt32: boolean;
+    function fitsInUInt32: boolean;
     function fitsInInt64: boolean;
-    function fitsInQWord: boolean;
-    function fitsInInteger: boolean;
-    function fitsInCardinal: boolean;
+    function fitsInUInt64: boolean;
     // correctly rounded to the nearest float (ties to even); overflow gives
     // infinity, underflow gives zero
     function toDouble: Double;
@@ -2267,17 +2294,17 @@ end;
 
 class operator UBigInt.explicit(const a: UBigInt): QWord;
 begin
-  result := a.toQWord;
+  result := a.toUInt64;
 end;
 
 class operator UBigInt.explicit(const a: UBigInt): LongInt;
 begin
-  result := a.toInteger;
+  result := a.toInt32;
 end;
 
 class operator UBigInt.explicit(const a: UBigInt): LongWord;
 begin
-  result := a.toCardinal;
+  result := a.toUInt32;
 end;
 
 class operator UBigInt.explicit(const a: UBigInt): Double;
@@ -2436,7 +2463,7 @@ begin
   end;
   if Length(a.fLimbs) = 0 then exit(default(UBigInt));
   if a.isOne then exit(a);
-  result.fLimbs := UPowQ(a.fLimbs, b.toQWord);
+  result.fLimbs := UPowQ(a.fLimbs, b.toUInt64);
 end;
 
 class operator UBigInt.**(const a: UBigInt; e: Int64): UBigInt;
@@ -2606,28 +2633,52 @@ begin
   result := LToBase(fLimbs, 8);
 end;
 
+function UBigInt.toInt8: Int8;
+begin
+  if not fitsInInt8 then raise ERangeError.Create('UBigInt value does not fit in Int8');
+  result := Int8(LToQWord(fLimbs));
+end;
+
+function UBigInt.toUInt8: UInt8;
+begin
+  if not fitsInUInt8 then raise ERangeError.Create('UBigInt value does not fit in UInt8');
+  result := UInt8(LToQWord(fLimbs));
+end;
+
+function UBigInt.toInt16: Int16;
+begin
+  if not fitsInInt16 then raise ERangeError.Create('UBigInt value does not fit in Int16');
+  result := Int16(LToQWord(fLimbs));
+end;
+
+function UBigInt.toUInt16: UInt16;
+begin
+  if not fitsInUInt16 then raise ERangeError.Create('UBigInt value does not fit in UInt16');
+  result := UInt16(LToQWord(fLimbs));
+end;
+
+function UBigInt.toInt32: Int32;
+begin
+  if not fitsInInt32 then raise ERangeError.Create('UBigInt value does not fit in Int32');
+  result := Int32(LToQWord(fLimbs));
+end;
+
+function UBigInt.toUInt32: UInt32;
+begin
+  if not fitsInUInt32 then raise ERangeError.Create('UBigInt value does not fit in UInt32');
+  result := UInt32(LToQWord(fLimbs));
+end;
+
 function UBigInt.toInt64: Int64;
 begin
   if not fitsInInt64 then raise ERangeError.Create('UBigInt value does not fit in Int64');
   result := Int64(LToQWord(fLimbs));
 end;
 
-function UBigInt.toQWord: QWord;
+function UBigInt.toUInt64: UInt64;
 begin
-  if not fitsInQWord then raise ERangeError.Create('UBigInt value does not fit in QWord');
+  if not fitsInUInt64 then raise ERangeError.Create('UBigInt value does not fit in UInt64');
   result := LToQWord(fLimbs);
-end;
-
-function UBigInt.toInteger: LongInt;
-begin
-  if not fitsInInteger then raise ERangeError.Create('UBigInt value does not fit in Integer');
-  result := LongInt(LToQWord(fLimbs));
-end;
-
-function UBigInt.toCardinal: LongWord;
-begin
-  if not fitsInCardinal then raise ERangeError.Create('UBigInt value does not fit in Cardinal');
-  result := LongWord(LToQWord(fLimbs));
 end;
 
 function UBigInt.toDouble: Double;
@@ -2651,24 +2702,44 @@ begin
   result := ldexp(Double(q), e);
 end;
 
+function UBigInt.fitsInInt8: boolean;
+begin
+  result := bitLength <= 7;
+end;
+
+function UBigInt.fitsInUInt8: boolean;
+begin
+  result := bitLength <= 8;
+end;
+
+function UBigInt.fitsInInt16: boolean;
+begin
+  result := bitLength <= 15;
+end;
+
+function UBigInt.fitsInUInt16: boolean;
+begin
+  result := bitLength <= 16;
+end;
+
+function UBigInt.fitsInInt32: boolean;
+begin
+  result := bitLength <= 31;
+end;
+
+function UBigInt.fitsInUInt32: boolean;
+begin
+  result := bitLength <= 32;
+end;
+
 function UBigInt.fitsInInt64: boolean;
 begin
-  result := (Length(fLimbs) <= LIMBS_PER_QWORD) and (LToQWord(fLimbs) <= QWord(High(Int64)));
+  result := bitLength <= 63;
 end;
 
-function UBigInt.fitsInQWord: boolean;
+function UBigInt.fitsInUInt64: boolean;
 begin
-  result := Length(fLimbs) <= LIMBS_PER_QWORD;
-end;
-
-function UBigInt.fitsInInteger: boolean;
-begin
-  result := (Length(fLimbs) <= 1) and (LToQWord(fLimbs) <= QWord(High(LongInt)));
-end;
-
-function UBigInt.fitsInCardinal: boolean;
-begin
-  result := (Length(fLimbs) <= 1) and (LToQWord(fLimbs) <= QWord(High(LongWord)));
+  result := bitLength <= 64;
 end;
 
 function UBigInt.isZero: boolean;
@@ -3625,7 +3696,7 @@ begin
       inc(v);
     end;
     if (v and 1) = 1 then begin
-      var m8 := a.floorMod(BigInt(8)).toInteger;
+      var m8 := a.floorMod(BigInt(8)).toInt32;
       if (m8 = 3) or (m8 = 5) then result := -result;
     end;
   end;
@@ -3741,7 +3812,7 @@ begin
   // baby-step giant-step over ceil(sqrt(m)) steps
   var nb := m.sqrt + 1;
   if nb > UBigInt(QWord(1) shl 20) then raise EBigIntError.Create('discreteLog search space too large');
-  var steps := SizeInt(nb.toQWord);
+  var steps := SizeInt(nb.toUInt64);
   // open-addressed table of the baby steps (g^j, keeping the least j)
   var cap: SizeInt := 1;
   while cap < steps * 2 do cap := cap shl 1;
@@ -3772,7 +3843,7 @@ begin
   end;
   // giant steps: multiply by g^(-nb) and look each result up
   var factor := g.modPow(nb, m).modInverse(m);
-  var nbq := Int64(nb.toQWord);
+  var nbq := Int64(nb.toUInt64);
   var gamma := h;
   for var i := 0 to steps do begin
     var slot := gamma.hashCode and mask;
@@ -4600,17 +4671,17 @@ end;
 
 class operator BigInt.explicit(const a: BigInt): QWord;
 begin
-  result := a.toQWord;
+  result := a.toUInt64;
 end;
 
 class operator BigInt.explicit(const a: BigInt): LongInt;
 begin
-  result := a.toInteger;
+  result := a.toInt32;
 end;
 
 class operator BigInt.explicit(const a: BigInt): LongWord;
 begin
-  result := a.toCardinal;
+  result := a.toUInt32;
 end;
 
 class operator BigInt.explicit(const a: BigInt): Double;
@@ -4717,7 +4788,7 @@ begin
     exit;
   end;
   if Length(a.fLimbs) = 0 then exit(default(BigInt));
-  m := UPowQ(a.fLimbs, b.toQWord);
+  m := UPowQ(a.fLimbs, b.toUInt64);
   result.fLimbs := m;
   result.fNeg := a.fNeg and (b.fLimbs[0] and 1 = 1);
 end;
@@ -4944,6 +5015,42 @@ begin
   result := toString(8);
 end;
 
+function BigInt.toInt8: Int8;
+begin
+  if not fitsInInt8 then raise ERangeError.Create('BigInt value does not fit in Int8');
+  result := Int8(toInt64);
+end;
+
+function BigInt.toUInt8: UInt8;
+begin
+  if not fitsInUInt8 then raise ERangeError.Create('BigInt value does not fit in UInt8');
+  result := UInt8(LToQWord(fLimbs));
+end;
+
+function BigInt.toInt16: Int16;
+begin
+  if not fitsInInt16 then raise ERangeError.Create('BigInt value does not fit in Int16');
+  result := Int16(toInt64);
+end;
+
+function BigInt.toUInt16: UInt16;
+begin
+  if not fitsInUInt16 then raise ERangeError.Create('BigInt value does not fit in UInt16');
+  result := UInt16(LToQWord(fLimbs));
+end;
+
+function BigInt.toInt32: Int32;
+begin
+  if not fitsInInt32 then raise ERangeError.Create('BigInt value does not fit in Int32');
+  result := Int32(toInt64);
+end;
+
+function BigInt.toUInt32: UInt32;
+begin
+  if not fitsInUInt32 then raise ERangeError.Create('BigInt value does not fit in UInt32');
+  result := UInt32(LToQWord(fLimbs));
+end;
+
 function BigInt.toInt64: Int64;
 begin
   if not fitsInInt64 then raise ERangeError.Create('BigInt value does not fit in Int64');
@@ -4951,22 +5058,10 @@ begin
   result := if fNeg then Int64((not q) + 1) else Int64(q);
 end;
 
-function BigInt.toQWord: QWord;
+function BigInt.toUInt64: UInt64;
 begin
-  if not fitsInQWord then raise ERangeError.Create('BigInt value does not fit in QWord');
+  if not fitsInUInt64 then raise ERangeError.Create('BigInt value does not fit in UInt64');
   result := LToQWord(fLimbs);
-end;
-
-function BigInt.toInteger: LongInt;
-begin
-  if not fitsInInteger then raise ERangeError.Create('BigInt value does not fit in Integer');
-  result := LongInt(toInt64);
-end;
-
-function BigInt.toCardinal: LongWord;
-begin
-  if not fitsInCardinal then raise ERangeError.Create('BigInt value does not fit in Cardinal');
-  result := LongWord(LToQWord(fLimbs));
 end;
 
 function BigInt.toDouble: Double;
@@ -4981,28 +5076,46 @@ begin
   result.fLimbs := fLimbs;
 end;
 
+// bitLength is the minimal two's complement width minus the sign bit, so a
+// signed N-bit target holds every value shorter than N bits
+function BigInt.fitsInInt8: boolean;
+begin
+  result := bitLength < 8;
+end;
+
+function BigInt.fitsInUInt8: boolean;
+begin
+  result := (not fNeg) and (bitLength <= 8);
+end;
+
+function BigInt.fitsInInt16: boolean;
+begin
+  result := bitLength < 16;
+end;
+
+function BigInt.fitsInUInt16: boolean;
+begin
+  result := (not fNeg) and (bitLength <= 16);
+end;
+
+function BigInt.fitsInInt32: boolean;
+begin
+  result := bitLength < 32;
+end;
+
+function BigInt.fitsInUInt32: boolean;
+begin
+  result := (not fNeg) and (bitLength <= 32);
+end;
+
 function BigInt.fitsInInt64: boolean;
 begin
-  if Length(fLimbs) > LIMBS_PER_QWORD then exit(false);
-  var q := LToQWord(fLimbs);
-  result := if fNeg then q <= QWord($8000000000000000) else q <= QWord(High(Int64));
+  result := bitLength < 64;
 end;
 
-function BigInt.fitsInQWord: boolean;
+function BigInt.fitsInUInt64: boolean;
 begin
-  result := (not fNeg) and (Length(fLimbs) <= LIMBS_PER_QWORD);
-end;
-
-function BigInt.fitsInInteger: boolean;
-begin
-  if Length(fLimbs) > 1 then exit(false);
-  var q := LToQWord(fLimbs);
-  result := if fNeg then q <= QWord($80000000) else q <= QWord(High(LongInt));
-end;
-
-function BigInt.fitsInCardinal: boolean;
-begin
-  result := (not fNeg) and (Length(fLimbs) <= 1) and (LToQWord(fLimbs) <= QWord(High(LongWord)));
+  result := (not fNeg) and (bitLength <= 64);
 end;
 
 function BigInt.isZero: boolean;
@@ -5484,7 +5597,7 @@ const
   syms: array[0..12] of string = ('M', 'CM', 'D', 'CD', 'C', 'XC', 'L', 'XL', 'X', 'IX', 'V', 'IV', 'I');
 begin
   if (sign <= 0) or (self > 3999) then raise EConvertError.Create('toRoman needs a value in 1..3999');
-  var n := toInteger;
+  var n := toInt32;
   result := '';
   for var i := 0 to High(vals) do
     while n >= vals[i] do begin
@@ -5532,7 +5645,7 @@ begin
   while not m.isZero do begin
     var (q, r) := m.divMod(thousand);
     SetLength(groups, Length(groups) + 1);
-    groups[High(groups)] := r.toInteger;
+    groups[High(groups)] := r.toInt32;
     m := q;
   end;
   if High(groups) > High(scales) then raise EConvertError.Create('toWords value exceeds the scale table (10^66)');
@@ -6146,24 +6259,44 @@ begin
   if fMan.fNeg then result := '-' + result;
 end;
 
+function BigDecimal.toInt8: Int8;
+begin
+  result := toBigInt.toInt8;
+end;
+
+function BigDecimal.toUInt8: UInt8;
+begin
+  result := toBigInt.toUInt8;
+end;
+
+function BigDecimal.toInt16: Int16;
+begin
+  result := toBigInt.toInt16;
+end;
+
+function BigDecimal.toUInt16: UInt16;
+begin
+  result := toBigInt.toUInt16;
+end;
+
+function BigDecimal.toInt32: Int32;
+begin
+  result := toBigInt.toInt32;
+end;
+
+function BigDecimal.toUInt32: UInt32;
+begin
+  result := toBigInt.toUInt32;
+end;
+
 function BigDecimal.toInt64: Int64;
 begin
   result := toBigInt.toInt64;
 end;
 
-function BigDecimal.toQWord: QWord;
+function BigDecimal.toUInt64: UInt64;
 begin
-  result := toBigInt.toQWord;
-end;
-
-function BigDecimal.toInteger: LongInt;
-begin
-  result := toBigInt.toInteger;
-end;
-
-function BigDecimal.toCardinal: LongWord;
-begin
-  result := toBigInt.toCardinal;
+  result := toBigInt.toUInt64;
 end;
 
 function BigDecimal.toBigInt: BigInt;
@@ -6177,24 +6310,44 @@ begin
   result := toBigInt.toUBigInt;
 end;
 
+function BigDecimal.fitsInInt8: boolean;
+begin
+  result := isIntegral and trunc.fitsInInt8;
+end;
+
+function BigDecimal.fitsInUInt8: boolean;
+begin
+  result := isIntegral and trunc.fitsInUInt8;
+end;
+
+function BigDecimal.fitsInInt16: boolean;
+begin
+  result := isIntegral and trunc.fitsInInt16;
+end;
+
+function BigDecimal.fitsInUInt16: boolean;
+begin
+  result := isIntegral and trunc.fitsInUInt16;
+end;
+
+function BigDecimal.fitsInInt32: boolean;
+begin
+  result := isIntegral and trunc.fitsInInt32;
+end;
+
+function BigDecimal.fitsInUInt32: boolean;
+begin
+  result := isIntegral and trunc.fitsInUInt32;
+end;
+
 function BigDecimal.fitsInInt64: boolean;
 begin
   result := isIntegral and trunc.fitsInInt64;
 end;
 
-function BigDecimal.fitsInQWord: boolean;
+function BigDecimal.fitsInUInt64: boolean;
 begin
-  result := isIntegral and trunc.fitsInQWord;
-end;
-
-function BigDecimal.fitsInInteger: boolean;
-begin
-  result := isIntegral and trunc.fitsInInteger;
-end;
-
-function BigDecimal.fitsInCardinal: boolean;
-begin
-  result := isIntegral and trunc.fitsInCardinal;
+  result := isIntegral and trunc.fitsInUInt64;
 end;
 
 function BigDecimal.isZero: boolean;
@@ -6729,7 +6882,7 @@ begin
     mm := mm * 10;
     var (d, rr) := r.divMod(s);
     r := rr;
-    var dv := byte(d.toQWord);
+    var dv := byte(d.toUInt64);
     var low := if even then r.compare(mm) <= 0 else r.compare(mm) < 0;
     var high := if even then (r + mp).compare(s) >= 0 else (r + mp).compare(s) > 0;
     if count = Length(digs) then SetLength(digs, count * 2);
@@ -7814,7 +7967,7 @@ begin
   var wp := p + 14;
   var need := p + 4;
   var shift := 0;
-  if z < need then shift := need - z.trunc.toInteger;
+  if z < need then shift := need - z.trunc.toInt32;
   var w := z + shift;
   var lnw := w.ln(wp);
   // (w - 1/2) ln w - w + ln(2 pi)/2
@@ -7897,8 +8050,8 @@ begin
   if p < 0 then p := 0;
   if isZero or (isIntegral and fMan.fNeg) then raise EBigIntError.Create('gamma has a pole at zero and the negative integers');
   // exact for a small positive integer: Gamma(n) = (n-1)!
-  if isIntegral and isPositive and fitsInCardinal then begin
-    var k := toCardinal;
+  if isIntegral and isPositive and fitsInUInt32 then begin
+    var k := toUInt32;
     if k <= 1000 then begin
       var d: BigDecimal := UBigInt.factorial(k - 1);
       exit(d);
@@ -7921,8 +8074,8 @@ begin
   var p := precision;
   if p < 0 then p := 0;
   // exact when the argument is a small non-negative integer
-  if isIntegral and not fMan.fNeg and fitsInCardinal then begin
-    var k := toCardinal;
+  if isIntegral and not fMan.fNeg and fitsInUInt32 then begin
+    var k := toUInt32;
     if k <= 1000 then begin
       var d: BigDecimal := UBigInt.factorial(k);
       exit(d);

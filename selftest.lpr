@@ -99,22 +99,22 @@ begin
     var y := randQ shr (Random(64));
     var ux: UBigInt := x;
     var uy: UBigInt := y;
-    if High(QWord) - x >= y then check((ux + uy).toQWord = x + y, $'add {x}+{y}');
-    if x >= y then check((ux - uy).toQWord = x - y, $'sub {x}-{y}')
-    else check((uy - ux).toQWord = y - x, $'sub {y}-{x}');
-    if (y = 0) or (x <= High(QWord) div y) then check((ux * uy).toQWord = x * y, $'mul {x}*{y}');
+    if High(QWord) - x >= y then check((ux + uy).toUInt64 = x + y, $'add {x}+{y}');
+    if x >= y then check((ux - uy).toUInt64 = x - y, $'sub {x}-{y}')
+    else check((uy - ux).toUInt64 = y - x, $'sub {y}-{x}');
+    if (y = 0) or (x <= High(QWord) div y) then check((ux * uy).toUInt64 = x * y, $'mul {x}*{y}');
     if y <> 0 then begin
-      check((ux div uy).toQWord = x div y, $'div {x} div {y}');
-      check((ux mod uy).toQWord = x mod y, $'mod {x} mod {y}');
+      check((ux div uy).toUInt64 = x div y, $'div {x} div {y}');
+      check((ux mod uy).toUInt64 = x mod y, $'mod {x} mod {y}');
     end;
     check((ux = uy) = (x = y), 'eq oracle');
     check((ux < uy) = (x < y), 'lt oracle');
     check((ux >= uy) = (x >= y), 'ge oracle');
     var sh := Random(64);
-    check((ux shr sh).toQWord = x shr sh, $'shr {sh}');
-    check((ux and uy).toQWord = x and y, 'and oracle');
-    check((ux or uy).toQWord = x or y, 'or oracle');
-    check((ux xor uy).toQWord = x xor y, 'xor oracle');
+    check((ux shr sh).toUInt64 = x shr sh, $'shr {sh}');
+    check((ux and uy).toUInt64 = x and y, 'and oracle');
+    check((ux or uy).toUInt64 = x or y, 'or oracle');
+    check((ux xor uy).toUInt64 = x xor y, 'xor oracle');
   end;
 end;
 
@@ -233,19 +233,33 @@ begin
   section('UBigInt conversions');
   var u: UBigInt := 12345;
   check(u.toInt64 = 12345, 'toInt64');
-  check(u.toQWord = 12345, 'toQWord');
-  check(u.toInteger = 12345, 'toInteger');
-  check(u.toCardinal = 12345, 'toCardinal');
+  check(u.toUInt64 = 12345, 'toQWord');
+  check(u.toInt32 = 12345, 'toInteger');
+  check(u.toUInt32 = 12345, 'toCardinal');
   check(Int64(u) = 12345, 'explicit Int64');
   check(QWord(u) = 12345, 'explicit QWord');
   u := QWord(High(QWord));
-  check(u.fitsInQWord and not u.fitsInInt64, 'fitsIn edges');
+  check(u.fitsInUInt64 and not u.fitsInInt64, 'fitsIn edges');
   u := QWord(High(Int64));
   check(u.fitsInInt64 and (u.toInt64 = High(Int64)), 'High(Int64) fits');
   u := QWord(High(Int64)) + 1;
-  check(not u.fitsInInt64 and u.fitsInQWord, '2^63 does not fit Int64');
+  check(not u.fitsInInt64 and u.fitsInUInt64, '2^63 does not fit Int64');
   u := QWord(High(LongWord));
-  check(u.fitsInCardinal and not u.fitsInInteger, 'cardinal edge');
+  check(u.fitsInUInt32 and not u.fitsInInt32, 'dword edge');
+  // the small-type predicates, upper edge and one over
+  check(UBigInt(255).fitsInUInt8 and not UBigInt(256).fitsInUInt8, 'byte edge');
+  check(UBigInt(127).fitsInInt8 and not UBigInt(128).fitsInInt8, 'shortint edge');
+  check(UBigInt(65535).fitsInUInt16 and not UBigInt(65536).fitsInUInt16, 'word edge');
+  check(UBigInt(32767).fitsInInt16 and not UBigInt(32768).fitsInInt16, 'smallint edge');
+  check(UBigInt(High(LongWord)).fitsInUInt32 and not (UBigInt(High(LongWord)) + 1).fitsInUInt32, 'dword upper edge');
+  // sized conversions roundtrip
+  check(UBigInt(200).toUInt8 = 200, 'u toUInt8');
+  check(UBigInt(100).toInt8 = 100, 'u toInt8');
+  check(UBigInt(60000).toUInt16 = 60000, 'u toUInt16');
+  check(UBigInt(3000000000).toUInt32 = 3000000000, 'u toUInt32');
+  check(UBigInt(QWord(High(QWord))).toUInt64 = High(QWord), 'u toUInt64 max');
+  checkRaises(procedure begin UBigInt(300).toUInt8; end, ERangeError, 'u toUInt8 overflow');
+  checkRaises(procedure begin UBigInt(200).toInt8; end, ERangeError, 'u toInt8 overflow');
 
   // typecasts from full-width integers must stay exact (not round via Double)
   checkEq(UBigInt(QWord(High(QWord))).toString, '18446744073709551615', 'exact cast from QWord');
@@ -390,7 +404,7 @@ begin
   checkRaises(procedure begin var u: UBigInt := 0; dec(u); end, ERangeError, 'dec below zero');
   checkRaises(procedure begin UBigInt.parse('nope'); end, EConvertError, 'parse error raises');
   checkRaises(procedure begin var u: UBigInt := QWord(High(QWord)); u.toInt64; end, ERangeError, 'toInt64 overflow');
-  checkRaises(procedure begin var u: UBigInt := '18446744073709551616'; u.toQWord; end, ERangeError, 'toQWord overflow');
+  checkRaises(procedure begin var u: UBigInt := '18446744073709551616'; u.toUInt64; end, ERangeError, 'toQWord overflow');
   checkRaises(procedure begin var u: UBigInt := 5; u := u shl (-1); end, ERangeError, 'negative shift');
   checkRaises(procedure begin var u: UBigInt := 5; u := u ** (-2); end, EBigIntError, 'negative exponent');
   checkRaises(procedure begin UBigInt(5).toString(37); end, EBigIntError, 'invalid base');
@@ -600,11 +614,25 @@ begin
   check(BigInt('-9223372036854775808').fitsInInt64, '-2^63 fits');
   check(not BigInt('-9223372036854775809').fitsInInt64, '-2^63-1 does not fit');
   check(not BigInt('9223372036854775808').fitsInInt64, '2^63 does not fit');
-  check(BigInt(-1).toInteger = -1, 'toInteger -1');
-  check(BigInt(-$80000000).fitsInInteger, 'Low(LongInt) fits');
-  check(not BigInt(-$80000001).fitsInInteger, 'below Low(LongInt)');
-  check(not BigInt(-1).fitsInQWord, 'negative does not fit QWord');
-  check(not BigInt(-1).fitsInCardinal, 'negative does not fit Cardinal');
+  check(BigInt(-1).toInt32 = -1, 'toInteger -1');
+  check(BigInt(-$80000000).fitsInInt32, 'Low(LongInt) fits');
+  check(not BigInt(-$80000001).fitsInInt32, 'below Low(LongInt)');
+  check(not BigInt(-1).fitsInUInt64, 'negative does not fit QWord');
+  check(not BigInt(-1).fitsInUInt32, 'negative does not fit DWord');
+  // signed small types: both bounds, and unsigned targets reject negatives
+  check(BigInt(127).fitsInInt8 and BigInt(-128).fitsInInt8, 'shortint both bounds');
+  check(not BigInt(128).fitsInInt8 and not BigInt(-129).fitsInInt8, 'shortint over both');
+  check(BigInt(-32768).fitsInInt16 and not BigInt(-32769).fitsInInt16, 'smallint low edge');
+  check(BigInt(255).fitsInUInt8 and not BigInt(-1).fitsInUInt8, 'byte rejects negative');
+  check(BigInt(65535).fitsInUInt16 and not BigInt(-1).fitsInUInt16, 'word rejects negative');
+  check(BigInt('4294967295').fitsInUInt32 and not BigInt('4294967296').fitsInUInt32, 'dword upper edge');
+  // sized conversions keep the sign
+  check(BigInt(-100).toInt8 = -100, 'b toInt8 neg');
+  check(BigInt(-30000).toInt16 = -30000, 'b toInt16 neg');
+  check(BigInt(200).toUInt8 = 200, 'b toUInt8');
+  check(BigInt(Low(Int64)).toInt64 = Low(Int64), 'b toInt64 min');
+  checkRaises(procedure begin BigInt(-1).toUInt8; end, ERangeError, 'b toUInt8 negative raises');
+  checkRaises(procedure begin BigInt(128).toInt8; end, ERangeError, 'b toInt8 overflow');
   check(BigInt(-12345).toDouble = -12345.0, 'toDouble negative');
   check(BigInt(-3.99) = -3, 'explicit negative double truncates');
   check(BigInt(3.99) = 3, 'explicit positive double truncates');
@@ -697,8 +725,8 @@ begin
   checkRaises(procedure begin var b: BigInt := 5; b := b div 0; end, EDivByZero, 'div by zero');
   checkRaises(procedure begin var b: BigInt := 5; b := b mod BigInt(0); end, EDivByZero, 'mod by zero');
   checkRaises(procedure begin BigInt(5).divMod(BigInt(0)); end, EDivByZero, 'divMod by zero');
-  checkRaises(procedure begin var b: BigInt := -1; b.toQWord; end, ERangeError, 'toQWord negative');
-  checkRaises(procedure begin var b: BigInt := -1; b.toCardinal; end, ERangeError, 'toCardinal negative');
+  checkRaises(procedure begin var b: BigInt := -1; b.toUInt64; end, ERangeError, 'toQWord negative');
+  checkRaises(procedure begin var b: BigInt := -1; b.toUInt32; end, ERangeError, 'toCardinal negative');
   checkRaises(procedure begin var b: BigInt := 2; b := b ** (-1); end, EBigIntError, 'negative exponent');
   checkRaises(procedure begin var b: BigInt := 2; b := b shl (-1); end, ERangeError, 'negative shift');
   checkRaises(procedure begin BigInt.parse('12x34'); end, EConvertError, 'parse garbage');
@@ -802,7 +830,7 @@ begin
   section('factorial / fibonacci');
   check(UBigInt.factorial(0) = 1, '0! = 1');
   check(UBigInt.factorial(1) = 1, '1! = 1');
-  check(UBigInt.factorial(20).toQWord = QWord(2432902008176640000), '20!');
+  check(UBigInt.factorial(20).toUInt64 = QWord(2432902008176640000), '20!');
   checkEq(UBigInt.factorial(50).toString, '30414093201713378043612608166064768844377641568960512000000000000', '50!');
   for var i := 1 to 20 do begin
     var n := 2 + LongWord(Random(300));
@@ -813,7 +841,7 @@ begin
   check(UBigInt.fibonacci(0).isZero, 'F(0)');
   check(UBigInt.fibonacci(1) = 1, 'F(1)');
   check(UBigInt.fibonacci(10) = 55, 'F(10)');
-  check(UBigInt.fibonacci(90).toQWord = QWord(2880067194370816120), 'F(90)');
+  check(UBigInt.fibonacci(90).toUInt64 = QWord(2880067194370816120), 'F(90)');
   checkEq(UBigInt.fibonacci(100).toString, '354224848179261915075', 'F(100)');
   for var i := 1 to 30 do begin
     var n := 2 + LongWord(Random(500));
@@ -1082,7 +1110,7 @@ begin
   for var i := 1 to 100 do begin
     var a := BigInt.random(120);
     var e := a.modPow((p - 1) div 2, p);
-    var euler := if e = p - 1 then -1 else e.toInteger;
+    var euler := if e = p - 1 then -1 else e.toInt32;
     check(a.jacobi(p) = euler, 'jacobi = Euler criterion');
   end;
   check(BigInt(1001).jacobi(BigInt(9907)) = -1, 'jacobi 1001/9907');
@@ -1595,9 +1623,9 @@ begin
   end;
   // exact conversions
   check(BigDecimal('42').toInt64 = 42, 'dec toInt64');
-  check(BigDecimal('-42').toInteger = -42, 'dec toInteger');
-  check(BigDecimal('42').toQWord = 42, 'dec toQWord');
-  check(BigDecimal('42').toCardinal = 42, 'dec toCardinal');
+  check(BigDecimal('-42').toInt32 = -42, 'dec toInteger');
+  check(BigDecimal('42').toUInt64 = 42, 'dec toQWord');
+  check(BigDecimal('42').toUInt32 = 42, 'dec toCardinal');
   check(BigDecimal('4.2E1').toInt64 = 42, 'dec toInt64 from exponent form');
   checkEq(BigDecimal('12345678901234567890123').toBigInt.toString, '12345678901234567890123', 'dec toBigInt');
   checkEq(BigDecimal('340282366920938463463374607431768211456').toUBigInt.toString, '340282366920938463463374607431768211456', 'dec toUBigInt');
@@ -1610,10 +1638,18 @@ begin
   check(UBigInt(720).toDecimal.divide(BigDecimal(2), 4).toString = '360', 'dec toDecimal in expression');
   check(BigInt(-7).toDecimal.toBigInt = BigInt(-7), 'dec toDecimal roundtrip');
   checkEq(BigInt(BigDecimal('-99')).toString, '-99', 'dec BigInt cast');
-  check(BigDecimal('42').fitsInInt64 and BigDecimal('42').fitsInInteger, 'dec fits integral');
+  check(BigDecimal('42').fitsInInt64 and BigDecimal('42').fitsInInt32, 'dec fits integral');
   check(not BigDecimal('42.5').fitsInInt64, 'dec fits rejects fraction');
-  check(not BigDecimal('-1').fitsInQWord, 'dec fits rejects negative qword');
+  check(not BigDecimal('-1').fitsInUInt64, 'dec fits rejects negative qword');
   check(not BigDecimal('1E30').fitsInInt64, 'dec fits rejects big');
+  // the small-type predicates delegate through trunc
+  check(BigDecimal('255').fitsInUInt8 and not BigDecimal('256').fitsInUInt8, 'dec byte edge');
+  check(not BigDecimal('255.5').fitsInUInt8, 'dec byte rejects fraction');
+  check(BigDecimal('-128').fitsInInt8 and not BigDecimal('-129').fitsInInt8, 'dec shortint low edge');
+  check(BigDecimal('65535').fitsInUInt16 and BigDecimal('32767').fitsInInt16, 'dec word smallint');
+  check(BigDecimal('4294967295').fitsInUInt32 and not BigDecimal('-1').fitsInUInt32, 'dec dword edge');
+  check(BigDecimal('-100').toInt8 = -100, 'dec toInt8');
+  check(BigDecimal('60000').toUInt16 = 60000, 'dec toUInt16');
   checkRaises(procedure begin var z := BigDecimal('1.5').toInt64; end, ERangeError, 'dec toInt64 fraction raises');
   checkRaises(procedure begin var z := BigDecimal('1.5').toBigInt; end, ERangeError, 'dec toBigInt fraction raises');
   checkRaises(procedure begin var z := BigDecimal('1E2147483647') * BigDecimal('1E2147483647'); end, ERangeError, 'dec exponent overflow raises');
@@ -2032,9 +2068,9 @@ begin
     var roots := a.sqrtModN(n);
     for var r in roots do check(r.sqr mod n = a, 'sqrtModN valid');
     // if a is a residue, at least one root comes back (small n only)
-    if n.toQWord <= 3000 then begin
+    if n.toUInt64 <= 3000 then begin
       var isRes := false;
-      for var x := 1 to integer(n.toQWord) - 1 do
+      for var x := 1 to integer(n.toUInt64) - 1 do
         if UBigInt(x).sqr mod n = a then begin
           isRes := true;
           break;

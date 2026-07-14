@@ -9,10 +9,10 @@ uses SysUtils, BigInts;
 begin
   var small: UBigInt := 42;
   writeln(small.toInt64 + 1); // 43
-  writeln(small.toInteger, ' ', small.toCardinal, ' ', small.toQWord);
+  writeln(small.toInt32, ' ', small.toUInt32, ' ', small.toUInt64);
 
   var big := UBigInt.pow2(100);
-  writeln(big.fitsInInt64, ' ', big.fitsInQWord); // FALSE FALSE
+  writeln(big.fitsInInt64, ' ', big.fitsInUInt64); // FALSE FALSE
   try
     var x := big.toInt64;
   except

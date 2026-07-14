@@ -23,8 +23,8 @@ Arbitrary precision integers and decimals for Pascal in a single self-contained 
 - number theory and combinatorics: Lehmer `gcd`, `gcdExt`, `jacobi`, `kronecker`, `continuedFraction`, and `factorial`, `fibonacci`, `lucas`, `binomial`, `multinomial`, `catalan`, `bell`, `stirling1`/`stirling2`, `bernoulli`, `partitions`, `subfactorial`, `primorial`
 - randomness: pluggable generators (xoshiro256**, PCG64, splitmix64, `System.Random`, OS entropy), deterministic seeding, uniform `randomBelow`/`randomRange`
 - interop: byte serialization in both endiannesses, `hashCode`, digit-grouped output
-- decimals: exact decimal arithmetic (`0.1 + 0.2 = 0.3`), division and roots at any precision, six rounding modes, shortest and exact float conversions in both directions, and the whole analytic toolbox - `pi`, `exp`, `ln`, `log`, fractional powers, trigonometry, hyperbolics, `gamma`, `erf`, `atan2`, `hypot`, `agm` at any precision (the BigDecimal chapter below)
-- speed: measured 1.4-4x of GMP on x64 for the core operations (benchmarks below); assembler inner loops with a pure Pascal fallback behind a `USEASM` define
+- decimals: exact decimal arithmetic (`0.1 + 0.2 = 0.3`), division and roots at any precision, six rounding modes, shortest and exact float conversions in both directions, and the whole analytic toolbox - `pi`, `exp`, `ln`, `log2`/`log10`/`logBase`, fractional powers, trigonometry, hyperbolics, `gamma`, `erf`, `atan2`, `hypot`, `agm` at any precision (the BigDecimal chapter below)
+- speed: measured 1.3-4.5x of GMP on x64 for the core operations (benchmarks below); assembler inner loops with a pure Pascal fallback behind a `USEASM` define
 
 ## Quick start
 
@@ -64,8 +64,8 @@ Everything is camelCase and discoverable through code completion. Methods live o
 | `toString`, `toString(base)` | base 2..36; negatives format as sign plus magnitude in every base |
 | `toHex`, `toBin`, `toOct` | shorthands for bases 16, 2, 8 |
 | `toStringGrouped(sep = '_', groupSize = 3)` | `1_234_567` style output |
-| `toInt64`, `toQWord`, `toInteger`, `toCardinal`, `toDouble` | raise `ERangeError` when the value does not fit |
-| `fitsInInt64`, `fitsInQWord`, `fitsInInteger`, `fitsInCardinal` | the matching checks |
+| `toInt8`, `toUInt8`, `toInt16`, `toUInt16`, `toInt32`, `toUInt32`, `toInt64`, `toUInt64`, `toDouble` | raise `ERangeError` when the value does not fit |
+| `fitsInInt8`, `fitsInUInt8`, ... `fitsInInt64`, `fitsInUInt64` | the matching checks for every native width |
 | `toUBigInt` / `toBigInt` | cross the signedness bridge; a negative value raises `ERangeError` |
 | `toDecimal` | widen to `BigDecimal` (exact, never rounds) |
 | `toBytesLE`, `toBytesBE`, `fromBytesLE`, `fromBytesBE` | `UBigInt`: raw magnitude; `BigInt`: minimal two's complement with the sign bit, like Java `toByteArray` |
@@ -274,7 +274,7 @@ end.
 |---|---|
 | `parse(s)`, `tryParse(s, out v)`, `:=` from string | `[sign]digits[.digits][E[sign]digits]`, `_` separators allowed |
 | `toString`, `toScientific`, `toEngineering` | plain `-123.45` / normalized `-1.2345E2` / exponent a multiple of three, `123E-6` |
-| `toInt64`, `toQWord`, `toInteger`, `toCardinal`, `toBigInt`, `toUBigInt`, `fitsIn*` | exact conversions: raise `ERangeError` unless integral and in range (`toUBigInt` also on a negative value) |
+| `toInt8`..`toInt64`, `toUInt8`..`toUInt64`, `toBigInt`, `toUBigInt`, `fitsInInt8`..`fitsInUInt64` | exact conversions: raise `ERangeError` unless integral and in range (`toUInt*`/`toUBigInt` also on a negative value) |
 | `trunc`, `floor`, `ceil`, `round` | to `BigInt`: toward zero, toward -inf, toward +inf, halves to even (like Pascal `round`) |
 | `frac` | what `trunc` drops, so `self = trunc + frac` |
 | `toFraction` | exact rational view as a `(num, den)` tuple: `0.375` gives `(3, 8)` |
@@ -317,40 +317,40 @@ end.
 
 ## Performance
 
-64-bit limbs with assembler inner loops on x86_64 (mul/adc row primitives, plus a mulx/adcx/adox `addmul_1` picked at runtime when the CPU has ADX); portable 32-bit Pascal limbs everywhere else. The assembler sits behind a `USEASM` define at the top of the unit - comment it out for a fully portable pure Pascal build (roughly 4-8x slower on x64 in the core operations). Knuth algorithm D division, Karatsuba then Toom-3 multiplication and squaring above tunable thresholds (`BigIntKaratsubaThreshold`, `BigIntToom3Threshold`), Montgomery modPow with a windowed exponent, divide-and-conquer base conversion, Lehmer gcd, exact-size result buffers built directly on the heap in the hot paths. On a desktop x64: `factorial(50000)` in ~16 ms, `fibonacci(1000000)` in ~16 ms.
+64-bit limbs with assembler inner loops on x86_64 (mul/adc row primitives, plus a mulx/adcx/adox `addmul_1` picked at runtime when the CPU has ADX); portable 32-bit Pascal limbs everywhere else. The assembler sits behind a `USEASM` define at the top of the unit - comment it out for a fully portable pure Pascal build (roughly 4-8x slower on x64 in the core operations). Knuth algorithm D division, Karatsuba then Toom-3 multiplication and squaring above tunable thresholds (`BigIntKaratsubaThreshold`, `BigIntToom3Threshold`), Montgomery modPow with a windowed exponent, divide-and-conquer base conversion, Lehmer gcd, exact-size result buffers built directly on the heap in the hot paths. On a desktop x64: `factorial(50000)` in ~12 ms, `fibonacci(1000000)` in ~10 ms.
 
 ### Benchmarks vs GMP
 
-Measured against GMP 6.2.1 (the 64-bit-limb `libgmp-10.dll` that ships with Git for Windows) on one x64 desktop, both sides `-O3`, time per operation. The GMP side reuses its mpz targets, which is how GMP code is normally written; the BigInts side allocates a fresh value per operation, which is what value semantics cost.
+Measured against GMP 6.3.0 (the 64-bit-limb `libgmp-10.dll` that ships with Git for Windows) on one x64 desktop, both sides `-O3`, time per operation. The GMP side reuses its mpz targets, which is how GMP code is normally written; the BigInts side allocates a fresh value per operation, which is what value semantics cost.
 
 | operation | BigInts | GMP | ratio |
 |---|---|---|---|
-| add 128b | 32 ns | 5 ns | 6.2x |
-| add 1024b | 46 ns | 9 ns | 5.3x |
-| add 16384b | 176 ns | 65 ns | 2.7x |
-| add 262144b | 1.91 us | 1.28 us | 1.5x |
-| mul 128b | 39 ns | 6 ns | 6.4x |
-| mul 1024b | 189 ns | 129 ns | 1.5x |
-| mul 8192b | 6.3 us | 4.2 us | 1.5x |
-| mul 65536b | 196 us | 82 us | 2.4x |
-| mul 262144b | 1.57 ms | 547 us | 2.9x |
-| mul 65536x1024b | 7.1 us | 8.5 us | 0.8x |
-| sqr 8192b | 5.4 us | 2.6 us | 2.1x |
-| sqr 65536b | 159 us | 56 us | 2.9x |
-| divmod 2048/1024b | 521 ns | 265 ns | 2.0x |
-| divmod 8192/4096b | 4.4 us | 2.5 us | 1.7x |
-| divmod 131072/65536b | 929 us | 202 us | 4.6x |
-| toString 4096b | 11.0 us | 3.9 us | 2.8x |
-| toString 65536b | 683 us | 211 us | 3.2x |
-| parse 4096b | 9.2 us | 3.7 us | 2.5x |
-| parse 65536b | 344 us | 129 us | 2.7x |
-| modPow 512b | 82 us | 40 us | 2.0x |
-| modPow 1024b | 472 us | 264 us | 1.8x |
-| modPow 2048b | 2.7 ms | 2.0 ms | 1.4x |
-| gcd 1024b | 11.3 us | 2.7 us | 4.1x |
-| gcd 16384b | 435 us | 119 us | 3.7x |
+| add 128b | 40 ns | 6 ns | 6.7x |
+| add 1024b | 47 ns | 8 ns | 5.9x |
+| add 16384b | 181 ns | 66 ns | 2.7x |
+| add 262144b | 1.95 us | 1.30 us | 1.5x |
+| mul 128b | 46 ns | 7 ns | 6.7x |
+| mul 1024b | 188 ns | 139 ns | 1.3x |
+| mul 8192b | 6.58 us | 4.31 us | 1.5x |
+| mul 65536b | 189 us | 86 us | 2.2x |
+| mul 262144b | 1.78 ms | 576 us | 3.1x |
+| mul 65536x1024b | 7.25 us | 9.07 us | 0.8x |
+| sqr 8192b | 7.11 us | 2.86 us | 2.5x |
+| sqr 65536b | 200 us | 62 us | 3.2x |
+| divmod 2048/1024b | 536 ns | 334 ns | 1.6x |
+| divmod 8192/4096b | 4.45 us | 2.78 us | 1.6x |
+| divmod 131072/65536b | 982 us | 227 us | 4.3x |
+| toString 4096b | 12.9 us | 4.36 us | 3.0x |
+| toString 65536b | 721 us | 239 us | 3.0x |
+| parse 4096b | 11.6 us | 3.82 us | 3.0x |
+| parse 65536b | 390 us | 138 us | 2.8x |
+| modPow 512b | 98.5 us | 39.0 us | 2.5x |
+| modPow 1024b | 481 us | 262 us | 1.8x |
+| modPow 2048b | 2.86 ms | 1.98 ms | 1.4x |
+| gcd 1024b | 10.7 us | 2.50 us | 4.3x |
+| gcd 16384b | 434 us | 115 us | 3.8x |
 
-Bulk arithmetic lands at 1.4-4x of GMP. The remaining gap is GMP's hand-scheduled assembly, its higher Toom orders and FFT on huge operands, and sub-quadratic gcd and division that this unit does not implement. Tiny one/two-limb values compare at ~6x because a 30-40 ns operation is mostly allocation on the BigInts side; in absolute terms it is still tens of nanoseconds.
+Bulk arithmetic lands at 1.3-4.5x of GMP. The remaining gap is GMP's hand-scheduled assembly, its higher Toom orders and FFT on huge operands, and sub-quadratic gcd and division that this unit does not implement. Tiny one/two-limb values compare at ~6-7x because a 40-50 ns operation is mostly allocation on the BigInts side; in absolute terms it is still tens of nanoseconds.
 
 ## Examples
 

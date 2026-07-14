@@ -8,7 +8,7 @@ uses SysUtils, BigInts;
 
 begin
   writeln(BigDecimal('42').toInt64 + 1);       // 43
-  writeln(BigDecimal('4.2E1').toInteger);      // 42
+  writeln(BigDecimal('4.2E1').toInt32);        // 42
   writeln($'{BigDecimal('12345678901234567890123').toBigInt}');
 
   writeln(BigDecimal('42').fitsInInt64);       // TRUE
