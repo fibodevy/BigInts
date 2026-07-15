@@ -7726,10 +7726,10 @@ begin
       v.fNeg := false;
     end;
     2: v := -ss;
-  else begin
-    v.fLimbs := cc.fLimbs;
-    v.fNeg := Length(cc.fLimbs) > 0;
-  end;
+    else begin
+      v.fLimbs := cc.fLimbs;
+      v.fNeg := Length(cc.fLimbs) > 0;
+    end;
   end;
   if fMan.fNeg then v := -v;
   result := DecFromScaled(v, w, p);
@@ -7757,7 +7757,7 @@ begin
       v.fLimbs := cc.fLimbs;
       v.fNeg := Length(cc.fLimbs) > 0;
     end;
-  else v := ss;
+    else v := ss;
   end;
   result := DecFromScaled(v, w, p);
 end;
