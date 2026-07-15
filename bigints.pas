@@ -8243,7 +8243,8 @@ begin
   if p < 0 then p := 0;
   // for large positive x, 1 - erf loses all digits: use the continued fraction
   if self.toDouble > 1.5 then exit(DecGuardCut(ErfcCF(self, p + 12), p));
-  result := DecGuardCut(BigDecimal.one - erf(p + 4), p);
+  // erf has to clear the guard band the cut drops, or it trims real digits
+  result := DecGuardCut(BigDecimal.one - erf(p + 12), p);
 end;
 
 // ---------------------------------------------------------------------------

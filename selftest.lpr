@@ -1906,6 +1906,7 @@ const
   SQRTPI = '1.7724538509055160272981674833411451827975494561224';
   SQRTPI_HALF = '0.88622692545275801364908374167057259139877472806119';
   ERF_1 = '0.84270079294971486934122063508260925929606699796630';
+  ERFC_1 = '0.15729920705028513065877936491739074070393300203370';
   ERFC_3 = '0.0000220904969985854413727761295823203798477559552253';
   AGM_1_2 = '1.4567910310469068691864323832650819749738639432213';
 begin
@@ -1933,11 +1934,14 @@ begin
   checkEq(BigDecimal(0).erf.toString, '0', 'erf(0) = 0');
   near(BigDecimal(1).erf(45), BigDecimal(ERF_1), 43, 'erf(1)');
   near(BigDecimal('-1').erf(45), -BigDecimal(ERF_1), 43, 'erf odd');
+  near(BigDecimal(1).erfc(45), BigDecimal(ERFC_1), 43, 'erfc(1)');
   near(BigDecimal(3).erfc(45), BigDecimal(ERFC_3), 43, 'erfc(3)');
+  // the 1 - erf path has to hand back every digit asked for, not a trimmed tail
+  checkEq(BigDecimal(1).erfc(40).toString, BigDecimal(ERFC_1).rounded(-40).toString, 'erfc(1) full width');
   check(BigDecimal(30).erf(30) = BigDecimal.one, 'erf saturates');
   for var i := 1 to 15 do begin
     var x := BigDecimal(Random(500) - 250).divide(BigDecimal(100), 10);   // -2.5..2.5
-    near(x.erf(40) + x.erfc(40), BigDecimal.one, 36, 'erf + erfc = 1');
+    near(x.erf(40) + x.erfc(40), BigDecimal.one, 38, 'erf + erfc = 1');
   end;
   // agm
   near(BigDecimal.agm(BigDecimal(1), BigDecimal(2), 45), BigDecimal(AGM_1_2), 43, 'agm(1,2)');
@@ -2276,8 +2280,7 @@ begin
   checkEq(BigDecimal.calc('gamma(0.5)', 40).toString, BigDecimal('0.5').gamma(40).toString, 'calc gamma');
   checkEq(BigDecimal.calc('lngamma(3.5)', 40).toString, BigDecimal('3.5').lnGamma(40).toString, 'calc lngamma');
   checkEq(BigDecimal.calc('erf(1)', 40).toString, BigDecimal(1).erf(40).toString, 'calc erf');
-  // erfc(p) trims a few digits short, calc computes it fuller, so compare loosely
-  check(BigDecimal.calc('erfc(1)', 40).approxEquals(BigDecimal(1).erfc(40), BigDecimal('1E-34')), 'calc erfc');
+  checkEq(BigDecimal.calc('erfc(1)', 40).toString, BigDecimal(1).erfc(40).toString, 'calc erfc');
   checkEq(BigDecimal.calc('factorial(5.5)', 30).toString, BigDecimal('5.5').factorial(30).toString, 'calc real factorial');
   checkEq(BigDecimal.calc('atan2(1, -1)', 40).toString, BigDecimal.atan2(1, -1, 40).toString, 'calc atan2');
   checkEq(BigDecimal.calc('hypot(3, 4)').toString, '5', 'calc hypot');
