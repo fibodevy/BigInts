@@ -274,6 +274,7 @@ end.
 | method | notes |
 |---|---|
 | `parse(s)`, `tryParse(s, out v)`, `:=` from string | `[sign]digits[.digits][E[sign]digits]`, `_` separators allowed |
+| `calc(s, precision = 18)`, `tryCalc(s, out v, precision = 18)` | evaluate a whole expression string, see the calculator section below |
 | `toString`, `toScientific`, `toEngineering` | plain `-123.45` / normalized `-1.2345E2` / exponent a multiple of three, `123E-6` |
 | `toInt8`..`toInt64`, `toUInt8`..`toUInt64`, `toBigInt`, `toUBigInt`, `fitsInInt8`..`fitsInUInt64` | exact conversions: raise `ERangeError` unless integral and in range (`toUInt*`/`toUBigInt` also on a negative value) |
 | `trunc`, `floor`, `ceil`, `round` | to `BigInt`: toward zero, toward -inf, toward +inf, halves to even (like Pascal `round`) |
@@ -305,6 +306,40 @@ end.
 | `isZero`, `isOne`, `isIntegral`, `isEven`, `isOdd`, `isNegative`, `isPositive`, `sign`, `abs`, `negate` | predicates and sign helpers; a fractional value is neither even nor odd |
 | `compare`, `equals`, `approxEquals(other, eps)`, `min`, `max`, `hashCode`, `swap` | plus the full operator and comparison set |
 | `zero`, `one`, `two`, `ten` | class constants |
+
+### The calculator
+
+`calc` evaluates a whole expression from a string, at whatever precision you pass, and returns a `BigDecimal`. It is a pure, stateless evaluator: no variables, no assignment, the same string always gives the same result. `tryCalc` returns `false` on a bad expression instead of raising; `calc` raises `EConvertError` with the character position on a syntax error, and lets math errors (`EDivByZero`, `ERangeError`, `EBigIntError`) through unchanged.
+
+```pascal
+writeln(BigDecimal.calc('2^100 / 3').toScientific);   // 4.2...E29
+writeln(BigDecimal.calc('sin(pi/6)', 30));            // 0.5
+writeln(BigDecimal.calc('(1 + sqrt(5)) / 2', 50));    // the golden ratio, 50 digits
+```
+
+Operators, from lowest precedence to highest:
+
+| operator | meaning | notes |
+|---|---|---|
+| `+` `-` | add, subtract | left associative |
+| `*` `/` `div` `mod` `%` | multiply, real division, integer division, remainder | `/` gives `2.5` for `10/4`; `div` gives `2`; `%` is `mod` |
+| `-` `+` (unary) | sign | binds below power, so `-2^2 = -4` |
+| `^` `**` | power | right associative, `2^3^2 = 512`; `2^-3 = 0.125` |
+| `!` (postfix) | factorial | on a non-negative integer |
+
+Functions (names are case-insensitive):
+
+| group | functions |
+|---|---|
+| roots and powers | `sqrt(x)` `cbrt(x)` `root(x, n)` `pow(x, y)` `sqr(x)` |
+| exp and logs | `exp(x)` `ln(x)` `log(x)`=log10, `log(x, b)`=base b, `log2(x)` `log10(x)` `logb(x, b)` |
+| trigonometry | `sin cos tan (x)`, `asin acos atan (x)` (also `arcsin`/`arccos`/`arctan`), `sinh cosh tanh (x)` |
+| rounding | `floor(x)` `ceil(x)` `round(x)` `trunc(x)` |
+| special | `gamma(x)` `lngamma(x)` `erf(x)` `erfc(x)` `factorial(x)` |
+| two-argument | `min max gcd lcm atan2 hypot agm (a, b)` |
+| constants | `pi` `e` `tau` `phi` |
+
+Every function maps to the method of the same name at the working precision, so `calc('sin(1)', 40)` equals `BigDecimal(1).sin(40)`. Only functions that take numbers and return one number are exposed; the integer number-theory and the tuple-returning methods stay on the API.
 
 ## Semantics worth knowing
 
