@@ -1950,6 +1950,49 @@ begin
   LNorm(r);
 end;
 
+// barrett reciprocal mu = floor(B^(2n) / d), n = limb count of d; precomputed
+// once per fixed divisor so repeated divisions become multiplications
+function LReciprocal(const d: TLimbs): TLimbs;
+var
+  q, r: TLimbs;
+begin
+  var n := Length(d);
+  var bpow := LNewZ(2 * n + 1);
+  bpow[2 * n] := 1;
+  LDivMod(bpow, d, q, r);
+  result := q;
+end;
+
+// floor/mod of x by the fixed d whose barrett reciprocal mu is precomputed;
+// requires x < d^2 (the toString split keeps nd <= 2*D, so a < 10^(2D) = d^2).
+// HAC 14.42: the estimate underestimates the quotient by at most 2, fixed below
+procedure LBarrettDivMod(const x, d, mu: TLimbs; out q, r: TLimbs);
+var
+  qh, rr: TLimbs;
+begin
+  var n := Length(d);
+  if LCmp(x, d) < 0 then begin
+    q := nil;
+    r := Copy(x);
+    exit;
+  end;
+  var lx := Length(x);
+  // q1 = x div B^(n-1), then q3 = (q1 * mu) div B^(n+1) estimates the quotient
+  var q1 := Copy(x, n - 1, lx - (n - 1));
+  var q2 := LMul(q1, mu);
+  var lq2 := Length(q2);
+  if lq2 > n + 1 then qh := Copy(q2, n + 1, lq2 - (n + 1)) else qh := nil;
+  rr := LSub(x, LMul(qh, d));
+  while LCmp(rr, d) >= 0 do begin
+    rr := LSub(rr, d);
+    qh := LAdd(qh, LFromQWord(1));
+  end;
+  LNorm(qh);
+  LNorm(rr);
+  q := qh;
+  r := rr;
+end;
+
 function LShl(const a: TLimbs; n: LongWord): TLimbs;
 var
   res: TLimbs;
@@ -2070,12 +2113,18 @@ end;
 const
   // digit counts below which base conversion stays on the linear algorithms
   TOSTR_DC_DIGITS = 400;
-  PARSE_DC_DIGITS = 400;
+  PARSE_DC_DIGITS = 900; // wide linear parse stays ahead of D&C further out
+  // below this divisor limb count Knuth division still beats the two barrett
+  // multiplies, so only large split powers take the reciprocal path
+  BARRETT_MIN_LIMBS = 160;
 
 var
   // shared base-10 split powers, DecDCPows[i] = chunkBase^(2^i), grown on
   // demand and reused across every base-10 parse/toString (single-threaded)
   DecDCPows: array of TLimbs;
+  // barrett reciprocals aligned with DecDCPows, so toString divides by each
+  // fixed split power via multiply instead of Knuth long division
+  DecDCRecip: array of TLimbs;
 
 // grow the shared base-10 split-power cache to cover levels 0..maxLevel
 procedure EnsureDecDCPows(maxLevel: integer; chunkBase: TLimb);
@@ -2083,16 +2132,43 @@ begin
   var old := Length(DecDCPows);
   if maxLevel < old then exit;
   SetLength(DecDCPows, maxLevel + 1);
+  SetLength(DecDCRecip, maxLevel + 1);
   if old = 0 then begin
     DecDCPows[0] := LFromQWord(chunkBase);
+    DecDCRecip[0] := LReciprocal(DecDCPows[0]);
     old := 1;
   end;
-  for var i := old to maxLevel do DecDCPows[i] := LSqr(DecDCPows[i - 1]);
+  for var i := old to maxLevel do begin
+    DecDCPows[i] := LSqr(DecDCPows[i - 1]);
+    DecDCRecip[i] := LReciprocal(DecDCPows[i]);
+  end;
 end;
 
 // linear conversion core: right-align the digits of a into buf[0..nd-1] and
-// left-pad with zeros; a is a scratch copy this routine destroys
+// left-pad with zeros; a is a scratch copy this routine destroys. on 64-bit
+// limbs two chunkBase divisions run per loop so the loop and pad bookkeeping
+// amortize over 2*chunkLen digits
 procedure LToBaseLinear(a: TLimbs; base: integer; chunkBase: TLimb; chunkLen: integer; buf: PAnsiChar; nd: SizeInt);
+{$if LIMB_BITS = 64}
+begin
+  var p := nd - 1;
+  var alen := Length(a);
+  var b := TLimb(base);
+  while alen > 0 do begin
+    var r0 := LDivWInPlaceLen(a, alen, chunkBase);
+    if alen > 0 then begin
+      var r1 := LDivWInPlaceLen(a, alen, chunkBase);
+      for var i := 1 to chunkLen do begin buf[p] := DIGIT_CHARS[r0 mod b + 1]; r0 := r0 div b; dec(p); end;
+      if alen > 0 then
+        for var i := 1 to chunkLen do begin buf[p] := DIGIT_CHARS[r1 mod b + 1]; r1 := r1 div b; dec(p); end
+      else
+        repeat buf[p] := DIGIT_CHARS[r1 mod b + 1]; r1 := r1 div b; dec(p); until r1 = 0;
+    end else
+      repeat buf[p] := DIGIT_CHARS[r0 mod b + 1]; r0 := r0 div b; dec(p); until r0 = 0;
+  end;
+  while p >= 0 do begin buf[p] := '0'; dec(p); end;
+end;
+{$else}
 begin
   var p := nd - 1;
   var alen := Length(a);
@@ -2116,10 +2192,13 @@ begin
     dec(p);
   end;
 end;
+{$endif}
 
 // divide-and-conquer digits writer: split off the low base^k digits with one
-// division against a precomputed power, recurse into both halves
-procedure LToBaseRec(const a: TLimbs; base: integer; chunkBase: TLimb; chunkLen: integer; buf: PAnsiChar; nd: SizeInt; const pows: array of TLimbs; level: integer);
+// division against a precomputed power, recurse into both halves. for base 10
+// the divisor is a fixed cached power, so barrett reciprocal division (two
+// multiplies) replaces the Knuth long division once the divisor is large
+procedure LToBaseRec(const a: TLimbs; base: integer; chunkBase: TLimb; chunkLen: integer; buf: PAnsiChar; nd: SizeInt; const pows, recips: array of TLimbs; level: integer);
 var
   q, r: TLimbs;
 begin
@@ -2129,12 +2208,14 @@ begin
   end;
   var k := chunkLen shl level;
   if k >= nd then begin
-    LToBaseRec(a, base, chunkBase, chunkLen, buf, nd, pows, level - 1);
+    LToBaseRec(a, base, chunkBase, chunkLen, buf, nd, pows, recips, level - 1);
     exit;
   end;
-  LDivMod(a, pows[level], q, r);
-  LToBaseRec(q, base, chunkBase, chunkLen, buf, nd - k, pows, level - 1);
-  LToBaseRec(r, base, chunkBase, chunkLen, buf + (nd - k), k, pows, level - 1);
+  // the split invariant nd <= 2*k keeps a < pows[level]^2, so barrett is valid
+  if (Length(recips) > 0) and (Length(pows[level]) >= BARRETT_MIN_LIMBS) then LBarrettDivMod(a, pows[level], recips[level], q, r)
+  else LDivMod(a, pows[level], q, r);
+  LToBaseRec(q, base, chunkBase, chunkLen, buf, nd - k, pows, recips, level - 1);
+  LToBaseRec(r, base, chunkBase, chunkLen, buf + (nd - k), k, pows, recips, level - 1);
 end;
 
 // generic base conversion; large numbers go through divide-and-conquer
@@ -2167,12 +2248,12 @@ begin
     end;
     if base = 10 then begin
       EnsureDecDCPows(maxLevel, chunkBase);
-      LToBaseRec(a, base, chunkBase, chunkLen, PAnsiChar(buf), cap, DecDCPows, maxLevel);
+      LToBaseRec(a, base, chunkBase, chunkLen, PAnsiChar(buf), cap, DecDCPows, DecDCRecip, maxLevel);
     end else begin
       SetLength(pows, maxLevel + 1);
       pows[0] := LFromQWord(chunkBase);
       for var i := 1 to maxLevel do pows[i] := LSqr(pows[i - 1]);
-      LToBaseRec(a, base, chunkBase, chunkLen, PAnsiChar(buf), cap, pows, maxLevel);
+      LToBaseRec(a, base, chunkBase, chunkLen, PAnsiChar(buf), cap, pows, [], maxLevel);
     end;
   end;
   // strip the leading zero padding
@@ -2202,8 +2283,92 @@ begin
   result := count > 0;
 end;
 
-// linear parse core: chunked multiply-add over count digit values
+// a := a * (mHi:mLo) + (addHi:addLo); a must not be shared, scratch supplies a
+// live copy of the multiplicand and must hold at least Length(a) limbs
+{$if LIMB_BITS = 64}
+procedure LMulAdd2WInPlace(var a, scratch: TLimbs; mHi, mLo, addHi, addLo: TLimb);
+begin
+  var la := Length(a);
+  if la = 0 then begin
+    if addHi <> 0 then begin
+      SetLength(a, 2);
+      a[0] := addLo;
+      a[1] := addHi;
+    end else if addLo <> 0 then begin
+      SetLength(a, 1);
+      a[0] := addLo;
+    end;
+    exit;
+  end;
+  Move(a[0], scratch[0], la * SizeOf(TLimb));
+  SetLength(a, la + 2);
+  a[la] := MpnMul1(@a[0], @scratch[0], la, mLo);
+  a[la + 1] := MpnAddMul1(@a[1], @scratch[0], la, mHi);
+  // fold the 2-limb addend into the low limbs, propagate the carry upward
+  var lo := a[0] + addLo;
+  var carry: TLimb := ord(lo < addLo);
+  a[0] := lo;
+  var s := a[1] + addHi;
+  var c2: TLimb := ord(s < addHi);
+  s := s + carry;
+  inc(c2, ord(s < carry));
+  a[1] := s;
+  var i := 2;
+  while (c2 <> 0) and (i < Length(a)) do begin
+    var t := a[i] + c2;
+    c2 := ord(t < c2);
+    a[i] := t;
+    inc(i);
+  end;
+  LNorm(a);
+end;
+{$endif}
+
+// linear parse core: chunked multiply-add over count digit values; on 64-bit
+// limbs two limb-chunks (2*chunkLen digits) fold in per multiply-add, halving
+// the number of big-integer passes
 function LFromDigitsLinear(digits: PByte; count: SizeInt; base: integer; chunkBase: TLimb; chunkLen: integer): TLimbs;
+{$if LIMB_BITS = 64}
+begin
+  result := nil;
+  var b := TLimb(base);
+  var cbHi, cbLo: TLimb;
+  UMulLimb(chunkBase, chunkBase, cbHi, cbLo); // wide chunk base = chunkBase^2
+  var wideLen := chunkLen * 2;
+  var scratch: TLimbs := nil;
+  if count > wideLen then SetLength(scratch, count div chunkLen + 4);
+  var pos: SizeInt := 0;
+  var firstLen := count mod wideLen;
+  if firstLen > 0 then begin
+    var hiPart: TLimb := 0;
+    var loPart: TLimb := 0;
+    if firstLen > chunkLen then begin
+      for var i := 1 to firstLen - chunkLen do begin hiPart := hiPart * b + digits[pos]; inc(pos); end;
+      for var i := 1 to chunkLen do begin loPart := loPart * b + digits[pos]; inc(pos); end;
+      var wHi, wLo: TLimb;
+      UMulLimb(hiPart, chunkBase, wHi, wLo);
+      wLo := wLo + loPart;
+      inc(wHi, ord(wLo < loPart));
+      if wHi <> 0 then begin SetLength(result, 2); result[0] := wLo; result[1] := wHi; end
+      else if wLo <> 0 then begin SetLength(result, 1); result[0] := wLo; end;
+    end else begin
+      for var i := 1 to firstLen do begin loPart := loPart * b + digits[pos]; inc(pos); end;
+      if loPart <> 0 then begin SetLength(result, 1); result[0] := loPart; end;
+    end;
+  end;
+  while pos < count do begin
+    var hiPart: TLimb := 0;
+    var loPart: TLimb := 0;
+    for var i := 1 to chunkLen do begin hiPart := hiPart * b + digits[pos]; inc(pos); end;
+    for var i := 1 to chunkLen do begin loPart := loPart * b + digits[pos]; inc(pos); end;
+    var wHi, wLo: TLimb;
+    UMulLimb(hiPart, chunkBase, wHi, wLo);
+    wLo := wLo + loPart;
+    inc(wHi, ord(wLo < loPart));
+    LMulAdd2WInPlace(result, scratch, cbHi, cbLo, wHi, wLo);
+  end;
+end;
+{$else}
 begin
   result := nil;
   var pos: SizeInt := 0;
@@ -2227,6 +2392,7 @@ begin
     LMulAddWInPlace(result, chunkBase, v);
   end;
 end;
+{$endif}
 
 // divide-and-conquer parse: value = high * chunkBase^(2^level slice) + low
 function LFromDigitsRec(digits: PByte; count: SizeInt; base: integer; chunkBase: TLimb; chunkLen: integer; const pows: array of TLimbs; level: integer): TLimbs;
