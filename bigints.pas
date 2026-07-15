@@ -669,6 +669,15 @@ type
     // parsing: [sign]digits[.digits][E[sign]digits], "_" separators allowed
     class function parse(const s: string): BigDecimal; static;
     class function tryParse(const s: string; out v: BigDecimal): boolean; static;
+    // calculator: evaluate a textual expression at the given precision, e.g.
+    // calc('2^100 / sqrt(2)'). Operators + - * / div mod(%) ^(**) !, the
+    // usual precedence with a right-associative power; functions sqrt cbrt
+    // root pow sqr abs exp ln log log2 log10 logb sin cos tan asin acos atan
+    // sinh cosh tanh floor ceil round trunc gamma lngamma erf erfc factorial
+    // min max gcd lcm atan2 hypot agm; constants pi e tau phi. Stateless:
+    // no variables, syntax errors raise EConvertError with the position
+    class function calc(const s: string; precision: integer = 18): BigDecimal; static;
+    class function tryCalc(const s: string; out v: BigDecimal; precision: integer = 18): boolean; static;
     // math: sqrt keeps `precision` fractional digits plus the same hidden
     // guard digit as divide; pow with a negative exponent divides at the
     // default precision; gcd/lcm work on the decimal lattice, so
@@ -8235,6 +8244,441 @@ begin
   // for large positive x, 1 - erf loses all digits: use the continued fraction
   if self.toDouble > 1.5 then exit(DecGuardCut(ErfcCF(self, p + 12), p));
   result := DecGuardCut(BigDecimal.one - erf(p + 4), p);
+end;
+
+// ---------------------------------------------------------------------------
+// BigDecimal calculator
+// ---------------------------------------------------------------------------
+
+// a stateless expression evaluator: one lexer pass, recursive descent with
+// evaluation on the fly, everything computed on BigDecimal at a working
+// precision a few digits above the requested one
+
+type
+  TCalcToken = (ckNumber, ckName, ckPlus, ckMinus, ckMul, ckDiv, ckIntDiv, ckMod, ckPow, ckFact, ckLParen, ckRParen, ckComma, ckEnd);
+
+  TCalcState = record
+    s: string;
+    len: SizeInt;
+    pos: SizeInt;       // next character to scan (1-based)
+    kind: TCalcToken;
+    tokPos: SizeInt;    // where the current token started
+    num: BigDecimal;    // ckNumber payload
+    name: string;       // ckName payload, lowercased
+    wp: integer;        // working precision
+    depth: integer;     // recursion guard (parens, calls, power chains)
+  end;
+
+procedure CalcError(const st: TCalcState; const msg: string);
+begin
+  raise EConvertError.Create($'calc: {msg} at position {st.tokPos}');
+end;
+
+// advance to the next token
+procedure CalcNext(var st: TCalcState);
+begin
+  while (st.pos <= st.len) and (st.s[st.pos] in [' ', #9, #10, #13]) do inc(st.pos);
+  st.tokPos := st.pos;
+  if st.pos > st.len then begin
+    st.kind := ckEnd;
+    exit;
+  end;
+  var c: char := st.s[st.pos];
+  // numbers: digits or a leading dot, separators, optional E exponent
+  if (c in ['0'..'9']) or ((c = '.') and (st.pos < st.len) and (st.s[st.pos + 1] in ['0'..'9'])) then begin
+    var start := st.pos;
+    var dotSeen := false;
+    while st.pos <= st.len do begin
+      c := st.s[st.pos];
+      if (c in ['0'..'9']) or (c = '_') then inc(st.pos)
+      else if (c = '.') and not dotSeen then begin
+        dotSeen := true;
+        inc(st.pos);
+      end else break;
+    end;
+    // exponent only when digits (or a signed digit) follow the E
+    if (st.pos <= st.len) and (st.s[st.pos] in ['e', 'E']) then begin
+      var q := st.pos + 1;
+      if (q <= st.len) and (st.s[q] in ['+', '-']) then inc(q);
+      if (q <= st.len) and (st.s[q] in ['0'..'9']) then begin
+        st.pos := q;
+        while (st.pos <= st.len) and (st.s[st.pos] in ['0'..'9', '_']) do inc(st.pos);
+      end;
+    end;
+    if not BigDecimal.tryParse(Copy(st.s, start, st.pos - start), st.num) then CalcError(st, 'invalid number');
+    st.kind := ckNumber;
+    exit;
+  end;
+  if c in ['a'..'z', 'A'..'Z'] then begin
+    var start := st.pos;
+    while (st.pos <= st.len) and (st.s[st.pos] in ['a'..'z', 'A'..'Z', '0'..'9']) do inc(st.pos);
+    st.name := LowerCase(Copy(st.s, start, st.pos - start));
+    if st.name = 'div' then st.kind := ckIntDiv
+    else if st.name = 'mod' then st.kind := ckMod
+    else st.kind := ckName;
+    exit;
+  end;
+  inc(st.pos);
+  case c of
+    '+': st.kind := ckPlus;
+    '-': st.kind := ckMinus;
+    '*': if (st.pos <= st.len) and (st.s[st.pos] = '*') then begin
+      st.kind := ckPow;
+      inc(st.pos);
+    end else st.kind := ckMul;
+    '/': st.kind := ckDiv;
+    '%': st.kind := ckMod;
+    '^': st.kind := ckPow;
+    '!': st.kind := ckFact;
+    '(': st.kind := ckLParen;
+    ')': st.kind := ckRParen;
+    ',': st.kind := ckComma;
+    else CalcError(st, $'unexpected "{c}"');
+  end;
+end;
+
+procedure CalcEnter(var st: TCalcState);
+begin
+  inc(st.depth);
+  if st.depth > 256 then raise EConvertError.Create('calc: expression too deeply nested');
+end;
+
+function CalcExpr(var st: TCalcState): BigDecimal; forward;
+
+// constants and function dispatch by lowercased name and argument count
+function CalcName(var st: TCalcState; const fn: string; fnPos: SizeInt; const a: array of BigDecimal): BigDecimal;
+
+  procedure needArgs(n: integer);
+  begin
+    if Length(a) <> n then begin
+      st.tokPos := fnPos;
+      CalcError(st, $'wrong number of arguments for "{fn}"');
+    end;
+  end;
+
+begin
+  match fn of
+    'pi': begin
+      needArgs(0);
+      result := BigDecimal.pi(st.wp);
+    end;
+    'e': begin
+      needArgs(0);
+      result := BigDecimal.e(st.wp);
+    end;
+    'tau': begin
+      needArgs(0);
+      result := BigDecimal.pi(st.wp) * 2;
+    end;
+    'phi': begin
+      needArgs(0);
+      result := (BigDecimal(5).sqrt(st.wp) + 1) * BigDecimal('0.5');
+    end;
+    'sqrt': begin
+      needArgs(1);
+      result := a[0].sqrt(st.wp);
+    end;
+    'cbrt': begin
+      needArgs(1);
+      result := a[0].nthRoot(3, st.wp);
+    end;
+    'sqr': begin
+      needArgs(1);
+      result := a[0] * a[0];
+    end;
+    'abs': begin
+      needArgs(1);
+      result := a[0].abs;
+    end;
+    'exp': begin
+      needArgs(1);
+      result := a[0].exp(st.wp);
+    end;
+    'ln': begin
+      needArgs(1);
+      result := a[0].ln(st.wp);
+    end;
+    'log': begin
+      // Excel convention: log(x) is base 10, log(x, b) any base
+      if Length(a) = 1 then result := a[0].log10(st.wp)
+      else begin
+        needArgs(2);
+        result := a[0].logBase(a[1], st.wp);
+      end;
+    end;
+    'log2': begin
+      needArgs(1);
+      result := a[0].log2(st.wp);
+    end;
+    'log10': begin
+      needArgs(1);
+      result := a[0].log10(st.wp);
+    end;
+    'logb': begin
+      needArgs(2);
+      result := a[0].logBase(a[1], st.wp);
+    end;
+    'sin': begin
+      needArgs(1);
+      result := a[0].sin(st.wp);
+    end;
+    'cos': begin
+      needArgs(1);
+      result := a[0].cos(st.wp);
+    end;
+    'tan': begin
+      needArgs(1);
+      result := a[0].tan(st.wp);
+    end;
+    'asin', 'arcsin': begin
+      needArgs(1);
+      result := a[0].arcsin(st.wp);
+    end;
+    'acos', 'arccos': begin
+      needArgs(1);
+      result := a[0].arccos(st.wp);
+    end;
+    'atan', 'arctan': begin
+      needArgs(1);
+      result := a[0].arctan(st.wp);
+    end;
+    'sinh': begin
+      needArgs(1);
+      result := a[0].sinh(st.wp);
+    end;
+    'cosh': begin
+      needArgs(1);
+      result := a[0].cosh(st.wp);
+    end;
+    'tanh': begin
+      needArgs(1);
+      result := a[0].tanh(st.wp);
+    end;
+    'floor': begin
+      needArgs(1);
+      result := a[0].floor;
+    end;
+    'ceil': begin
+      needArgs(1);
+      result := a[0].ceil;
+    end;
+    'round': begin
+      needArgs(1);
+      result := a[0].round;
+    end;
+    'trunc': begin
+      needArgs(1);
+      result := a[0].trunc;
+    end;
+    'gamma': begin
+      needArgs(1);
+      result := a[0].gamma(st.wp);
+    end;
+    'lngamma': begin
+      needArgs(1);
+      result := a[0].lnGamma(st.wp);
+    end;
+    'erf': begin
+      needArgs(1);
+      result := a[0].erf(st.wp);
+    end;
+    'erfc': begin
+      needArgs(1);
+      result := a[0].erfc(st.wp);
+    end;
+    'factorial': begin
+      needArgs(1);
+      result := a[0].factorial(st.wp);
+    end;
+    'root': begin
+      needArgs(2);
+      if not (a[1].isIntegral and a[1].fitsInUInt32 and a[1].isPositive) then raise EBigIntError.Create('root degree must be a positive integer');
+      result := a[0].nthRoot(a[1].toUInt32, st.wp);
+    end;
+    'pow': begin
+      needArgs(2);
+      result := a[0].pow(a[1], st.wp);
+    end;
+    'min': begin
+      needArgs(2);
+      result := a[0].min(a[1]);
+    end;
+    'max': begin
+      needArgs(2);
+      result := a[0].max(a[1]);
+    end;
+    'gcd': begin
+      needArgs(2);
+      result := a[0].gcd(a[1]);
+    end;
+    'lcm': begin
+      needArgs(2);
+      result := a[0].lcm(a[1]);
+    end;
+    'atan2': begin
+      needArgs(2);
+      result := BigDecimal.atan2(a[0], a[1], st.wp);
+    end;
+    'hypot': begin
+      needArgs(2);
+      result := BigDecimal.hypot(a[0], a[1], st.wp);
+    end;
+    'agm': begin
+      needArgs(2);
+      result := BigDecimal.agm(a[0], a[1], st.wp);
+    end;
+    else begin
+      st.tokPos := fnPos;
+      if Length(a) = 0 then CalcError(st, $'unknown name "{fn}"')
+      else CalcError(st, $'unknown function "{fn}"');
+    end;
+  end;
+end;
+
+// atom: number | constant | function(args) | (expression), plus postfix "!"
+function CalcAtom(var st: TCalcState): BigDecimal;
+var
+  v: BigDecimal;
+begin
+  case st.kind of
+    ckNumber: begin
+      v := st.num;
+      CalcNext(st);
+    end;
+    ckLParen: begin
+      CalcEnter(st);
+      CalcNext(st);
+      v := CalcExpr(st);
+      if st.kind <> ckRParen then CalcError(st, 'expected ")"');
+      dec(st.depth);
+      CalcNext(st);
+    end;
+    ckName: begin
+      var fn := st.name;
+      var fnPos := st.tokPos;
+      CalcNext(st);
+      if st.kind = ckLParen then begin
+        CalcEnter(st);
+        CalcNext(st);
+        var args: array of BigDecimal;
+        if st.kind <> ckRParen then begin
+          SetLength(args, 1);
+          args[0] := CalcExpr(st);
+          while st.kind = ckComma do begin
+            CalcNext(st);
+            SetLength(args, Length(args) + 1);
+            args[High(args)] := CalcExpr(st);
+          end;
+        end;
+        if st.kind <> ckRParen then CalcError(st, 'expected ")"');
+        dec(st.depth);
+        CalcNext(st);
+        v := CalcName(st, fn, fnPos, args);
+      end else v := CalcName(st, fn, fnPos, []);
+    end;
+    ckEnd: begin
+      CalcError(st, 'unexpected end of expression');
+      v := default(BigDecimal);
+    end;
+    else begin
+      CalcError(st, 'unexpected token');
+      v := default(BigDecimal);
+    end;
+  end;
+  while st.kind = ckFact do begin
+    v := v.factorial(st.wp);
+    CalcNext(st);
+  end;
+  result := v;
+end;
+
+// power: right-associative, binds tighter than unary minus, so -2^2 = -4
+// and 2^-3 works; the right side re-enters at the unary level
+function CalcUnary(var st: TCalcState): BigDecimal; forward;
+
+function CalcPower(var st: TCalcState): BigDecimal;
+begin
+  var base := CalcAtom(st);
+  if st.kind = ckPow then begin
+    CalcEnter(st);
+    CalcNext(st);
+    base := base.pow(CalcUnary(st), st.wp);
+    dec(st.depth);
+  end;
+  result := base;
+end;
+
+// unary sign, iterative so "----1" cannot blow the stack
+function CalcUnary(var st: TCalcState): BigDecimal;
+begin
+  var neg := false;
+  while st.kind in [ckPlus, ckMinus] do begin
+    if st.kind = ckMinus then neg := not neg;
+    CalcNext(st);
+  end;
+  result := CalcPower(st);
+  if neg then result := -result;
+end;
+
+function CalcTerm(var st: TCalcState): BigDecimal;
+begin
+  var v := CalcUnary(st);
+  while st.kind in [ckMul, ckDiv, ckIntDiv, ckMod] do begin
+    var op := st.kind;
+    CalcNext(st);
+    var rhs := CalcUnary(st);
+    case op of
+      ckMul: v := v * rhs;
+      ckDiv: v := v.divide(rhs, st.wp);
+      ckIntDiv: v := v div rhs;
+      else v := v mod rhs;
+    end;
+  end;
+  result := v;
+end;
+
+function CalcExpr(var st: TCalcState): BigDecimal;
+begin
+  var v := CalcTerm(st);
+  while st.kind in [ckPlus, ckMinus] do begin
+    var plus := st.kind = ckPlus;
+    CalcNext(st);
+    var rhs := CalcTerm(st);
+    if plus then v := v + rhs else v := v - rhs;
+  end;
+  result := v;
+end;
+
+class function BigDecimal.calc(const s: string; precision: integer): BigDecimal;
+var
+  st: TCalcState;
+begin
+  var p := precision;
+  if p < 0 then p := 0;
+  st.s := s;
+  st.len := Length(s);
+  st.pos := 1;
+  st.wp := p + 8;
+  st.depth := 0;
+  CalcNext(st);
+  result := CalcExpr(st);
+  if st.kind <> ckEnd then CalcError(st, 'unexpected token');
+  // trim the working digits back to `precision` plus the usual hidden guard
+  if Int64(result.fExp) < -(Int64(p) + 1) then begin
+    result := result.rounded(-(p + 1), bdrTrunc);
+    result.fHidden := (result.fExp = -(p + 1)) and (Length(result.fMan.fLimbs) > 0);
+  end;
+end;
+
+class function BigDecimal.tryCalc(const s: string; out v: BigDecimal; precision: integer): boolean;
+begin
+  try
+    v := calc(s, precision);
+    result := true;
+  except
+    v := default(BigDecimal);
+    result := false;
+  end;
 end;
 
 {$ifdef BIGINT_ASM}

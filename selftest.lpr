@@ -2216,6 +2216,131 @@ begin
 end;
 {$endif}
 
+procedure testDecCalc;
+begin
+  section('BigDecimal calculator');
+  // precedence and associativity
+  checkEq(BigDecimal.calc('2+3*4').toString, '14', 'calc precedence');
+  checkEq(BigDecimal.calc('(2+3)*4').toString, '20', 'calc parens');
+  checkEq(BigDecimal.calc('2^3^2').toString, '512', 'calc power right assoc');
+  checkEq(BigDecimal.calc('-2^2').toString, '-4', 'calc unary below power');
+  checkEq(BigDecimal.calc('2^-3').toString, '0.125', 'calc negative exponent');
+  checkEq(BigDecimal.calc('5!').toString, '120', 'calc factorial');
+  checkEq(BigDecimal.calc('-5!').toString, '-120', 'calc minus factorial');
+  checkEq(BigDecimal.calc('5!^2').toString, '14400', 'calc factorial before power');
+  checkEq(BigDecimal.calc('(3!)!').toString, '720', 'calc chained factorial');
+  checkEq(BigDecimal.calc('0!').toString, '1', 'calc zero factorial');
+  checkEq(BigDecimal.calc('----1').toString, '1', 'calc stacked unary');
+  checkEq(BigDecimal.calc('2--3').toString, '5', 'calc minus minus');
+  // division family
+  checkEq(BigDecimal.calc('10/4').toString, '2.5', 'calc true division');
+  checkEq(BigDecimal.calc('1/3').toString, '0.333333333333333333', 'calc 1/3 default precision');
+  checkEq(BigDecimal.calc('1/3*3').toString, '1', 'calc guard digit');
+  checkEq((BigDecimal.calc('1/3') * 3).toString, '1', 'calc guard survives outside');
+  checkEq(BigDecimal.calc('10 div 3').toString, '3', 'calc div');
+  checkEq(BigDecimal.calc('10 mod 3').toString, '1', 'calc mod');
+  checkEq(BigDecimal.calc('10 % 3').toString, '1', 'calc percent alias');
+  checkEq(BigDecimal.calc('7.5 div 2').toString, '3', 'calc div fractional');
+  checkEq(BigDecimal.calc('7.5 mod 2').toString, '1.5', 'calc mod fractional');
+  // power aliases
+  checkEq(BigDecimal.calc('2**10').toString, '1024', 'calc star star');
+  checkEq(BigDecimal.calc('pow(2, 10)').toString, '1024', 'calc pow function');
+  check(BigDecimal.calc('2^0.5', 40).toString = BigDecimal(2).sqrt(40).toString, 'calc fractional power');
+  // numbers
+  checkEq(BigDecimal.calc('1_000.5*2').toString, '2001', 'calc separators');
+  checkEq(BigDecimal.calc('2.5E3').toString, '2500', 'calc exponent literal');
+  checkEq(BigDecimal.calc('.5+.5').toString, '1', 'calc leading dot');
+  checkEq(BigDecimal.calc('2e3').toString, '2000', 'calc lowercase exponent');
+  checkEq(BigDecimal.calc('2 * e', 18).rounded(-6).toString, '5.436564', 'calc e constant after number');
+  // functions match the methods digit for digit at the same precision
+  checkEq(BigDecimal.calc('sqrt(2)', 40).toString, BigDecimal(2).sqrt(40).toString, 'calc sqrt');
+  checkEq(BigDecimal.calc('cbrt(2)', 40).toString, BigDecimal(2).nthRoot(3, 40).toString, 'calc cbrt');
+  checkEq(BigDecimal.calc('root(2, 5)', 40).toString, BigDecimal(2).nthRoot(5, 40).toString, 'calc root');
+  checkEq(BigDecimal.calc('exp(1)', 40).toString, BigDecimal(1).exp(40).toString, 'calc exp');
+  checkEq(BigDecimal.calc('ln(2)', 40).toString, BigDecimal(2).ln(40).toString, 'calc ln');
+  checkEq(BigDecimal.calc('log(7)', 40).toString, BigDecimal(7).log10(40).toString, 'calc log excel');
+  checkEq(BigDecimal.calc('log(8, 2)').toString, '3', 'calc log base');
+  checkEq(BigDecimal.calc('log2(1024)').toString, '10', 'calc log2 exact');
+  checkEq(BigDecimal.calc('log10(0.001)').toString, '-3', 'calc log10 exact');
+  checkEq(BigDecimal.calc('logb(8, 2)').toString, '3', 'calc logb');
+  checkEq(BigDecimal.calc('sin(1)', 40).toString, BigDecimal(1).sin(40).toString, 'calc sin');
+  checkEq(BigDecimal.calc('cos(1)', 40).toString, BigDecimal(1).cos(40).toString, 'calc cos');
+  checkEq(BigDecimal.calc('tan(1)', 40).toString, BigDecimal(1).tan(40).toString, 'calc tan');
+  checkEq(BigDecimal.calc('asin(0.5)', 40).toString, BigDecimal('0.5').arcsin(40).toString, 'calc asin');
+  checkEq(BigDecimal.calc('arcsin(0.5)', 40).toString, BigDecimal.calc('asin(0.5)', 40).toString, 'calc arcsin alias');
+  checkEq(BigDecimal.calc('acos(0.5)', 40).toString, BigDecimal('0.5').arccos(40).toString, 'calc acos');
+  checkEq(BigDecimal.calc('atan(2)', 40).toString, BigDecimal(2).arctan(40).toString, 'calc atan');
+  checkEq(BigDecimal.calc('sinh(1)', 40).toString, BigDecimal(1).sinh(40).toString, 'calc sinh');
+  checkEq(BigDecimal.calc('cosh(1)', 40).toString, BigDecimal(1).cosh(40).toString, 'calc cosh');
+  checkEq(BigDecimal.calc('tanh(1)', 40).toString, BigDecimal(1).tanh(40).toString, 'calc tanh');
+  checkEq(BigDecimal.calc('gamma(0.5)', 40).toString, BigDecimal('0.5').gamma(40).toString, 'calc gamma');
+  checkEq(BigDecimal.calc('lngamma(3.5)', 40).toString, BigDecimal('3.5').lnGamma(40).toString, 'calc lngamma');
+  checkEq(BigDecimal.calc('erf(1)', 40).toString, BigDecimal(1).erf(40).toString, 'calc erf');
+  // erfc(p) trims a few digits short, calc computes it fuller, so compare loosely
+  check(BigDecimal.calc('erfc(1)', 40).approxEquals(BigDecimal(1).erfc(40), BigDecimal('1E-34')), 'calc erfc');
+  checkEq(BigDecimal.calc('factorial(5.5)', 30).toString, BigDecimal('5.5').factorial(30).toString, 'calc real factorial');
+  checkEq(BigDecimal.calc('atan2(1, -1)', 40).toString, BigDecimal.atan2(1, -1, 40).toString, 'calc atan2');
+  checkEq(BigDecimal.calc('hypot(3, 4)').toString, '5', 'calc hypot');
+  checkEq(BigDecimal.calc('agm(1, 2)', 40).toString, BigDecimal.agm(1, 2, 40).toString, 'calc agm');
+  checkEq(BigDecimal.calc('sqr(4)').toString, '16', 'calc sqr');
+  checkEq(BigDecimal.calc('abs(-4.5)').toString, '4.5', 'calc abs');
+  checkEq(BigDecimal.calc('floor(3.7)+ceil(3.2)+trunc(-3.7)+round(2.5)').toString, '6', 'calc roundings');
+  checkEq(BigDecimal.calc('min(3, 2)+max(3, 2)').toString, '5', 'calc min max');
+  checkEq(BigDecimal.calc('gcd(0.25, 0.15)').toString, '0.05', 'calc gcd lattice');
+  checkEq(BigDecimal.calc('lcm(4, 6)').toString, '12', 'calc lcm');
+  // constants
+  checkEq(BigDecimal.calc('pi', 50).toString, BigDecimal.pi(50).toString, 'calc pi');
+  checkEq(BigDecimal.calc('e', 50).toString, BigDecimal.e(50).toString, 'calc e');
+  check((BigDecimal.calc('tau', 40) - BigDecimal.pi(48) * 2).abs < BigDecimal('1E-39'), 'calc tau');
+  check((BigDecimal.calc('phi', 40) - BigDecimal.calc('(1+sqrt(5))/2', 40)).abs < BigDecimal('1E-39'), 'calc phi');
+  check((BigDecimal.calc('phi^2 - phi - 1', 40)).abs < BigDecimal('1E-38'), 'calc phi property');
+  // case-insensitive
+  checkEq(BigDecimal.calc('SIN(0)+Cos(0)').toString, '1', 'calc case insensitive');
+  checkEq(BigDecimal.calc('PI', 20).toString, BigDecimal.calc('pi', 20).toString, 'calc PI');
+  // whitespace freedom
+  checkEq(BigDecimal.calc('  2 +   3*4  ').toString, '14', 'calc whitespace');
+  // precision parameter and trimming
+  check(BigDecimal.calc('1/3', 50).precision = 51, 'calc precision 50 plus guard');
+  checkEq(BigDecimal.calc('2+2', 50).toString, '4', 'calc exact stays exact');
+  checkEq(BigDecimal.calc('0.5', 3).toString, '0.5', 'calc short exact untouched');
+  // the original motivating expression, cross-checked by hand
+  check(BigDecimal.calc('123456999999**123*4444/2/sqr(4)', 10).rounded(-5) = ((BigDecimal('123456999999') ** 123) * 4444).divide(2, 18).divide(16, 18).rounded(-5), 'calc user expression');
+  // errors: syntax raises EConvertError with a position, math errors pass through
+  checkRaises(procedure begin BigDecimal.calc(''); end, EConvertError, 'calc empty');
+  checkRaises(procedure begin BigDecimal.calc('1+'); end, EConvertError, 'calc dangling operator');
+  checkRaises(procedure begin BigDecimal.calc('(1'); end, EConvertError, 'calc open paren');
+  checkRaises(procedure begin BigDecimal.calc('1)'); end, EConvertError, 'calc stray paren');
+  checkRaises(procedure begin BigDecimal.calc('foo(1)'); end, EConvertError, 'calc unknown function');
+  checkRaises(procedure begin BigDecimal.calc('bar'); end, EConvertError, 'calc unknown name');
+  checkRaises(procedure begin BigDecimal.calc('sqrt(1,2)'); end, EConvertError, 'calc too many args');
+  checkRaises(procedure begin BigDecimal.calc('sqrt()'); end, EConvertError, 'calc no args');
+  checkRaises(procedure begin BigDecimal.calc('1 2'); end, EConvertError, 'calc juxtaposition');
+  checkRaises(procedure begin BigDecimal.calc('@'); end, EConvertError, 'calc bad char');
+  checkRaises(procedure begin BigDecimal.calc('2e'); end, EConvertError, 'calc dangling exponent');
+  checkRaises(procedure begin BigDecimal.calc('e(5)'); end, EConvertError, 'calc constant is not a function');
+  checkRaises(procedure begin BigDecimal.calc('1/0'); end, EDivByZero, 'calc division by zero');
+  checkRaises(procedure begin BigDecimal.calc('ln(-1)'); end, EBigIntError, 'calc domain error passes');
+  checkRaises(procedure begin BigDecimal.calc('root(2, 0.5)'); end, EBigIntError, 'calc root degree');
+  var errMsg := '';
+  try
+    BigDecimal.calc('1 + bar(2)');
+  except
+    on ex: EConvertError do errMsg := ex.Message;
+  end;
+  check(Pos('position 5', errMsg) > 0, 'calc error carries position');
+  // tryCalc never raises
+  var v: BigDecimal;
+  check(BigDecimal.tryCalc('2+2', v) and (v = 4), 'calc tryCalc ok');
+  check(not BigDecimal.tryCalc('1/0', v), 'calc tryCalc math error');
+  check(not BigDecimal.tryCalc('1+', v), 'calc tryCalc syntax error');
+  // nesting guard
+  var deep := '1';
+  for var i := 1 to 100 do deep := '(' + deep + ')';
+  checkEq(BigDecimal.calc(deep).toString, '1', 'calc 100 parens fine');
+  for var i := 1 to 200 do deep := '(' + deep + ')';
+  checkRaises(procedure begin BigDecimal.calc(deep); end, EConvertError, 'calc 300 parens rejected');
+end;
+
 begin
   RandSeed := 20260706;
   // the native RNG now auto-seeds from OS entropy per thread; seed it explicitly
@@ -2276,6 +2401,7 @@ begin
   testDecTrig;
   testDecPractical;
   testDecSpecial;
+  testDecCalc;
   {$if declared(UInt128)}
   testInt128;
   {$endif}
