@@ -766,8 +766,10 @@ var
   BigIntKaratsubaThreshold: integer = {$ifdef BIGINT_ASM} 80 {$else} 48 {$endif};
 
   // limb count above which balanced multiplication and squaring switch from
-  // Karatsuba to Toom-3; exposed for tuning and testing
-  BigIntToom3Threshold: integer = 200;
+  // Karatsuba to Toom-3; exposed for tuning and testing. with the 64-bit asm
+  // kernels Karatsuba stays ahead of Toom-3 well past 500 limbs, so the switch
+  // sits high there; below ~520 limbs Toom-3 is a net loss on the asm build
+  BigIntToom3Threshold: integer = {$ifdef BIGINT_ASM} 700 {$else} 200 {$endif};
 
   // generator used by random/randomBelow/randomRange/randomPrime
   BigIntRngAlgo: TBigIntRngAlgo = rngXoshiro256ss;
@@ -2070,6 +2072,24 @@ const
   TOSTR_DC_DIGITS = 400;
   PARSE_DC_DIGITS = 400;
 
+var
+  // shared base-10 split powers, DecDCPows[i] = chunkBase^(2^i), grown on
+  // demand and reused across every base-10 parse/toString (single-threaded)
+  DecDCPows: array of TLimbs;
+
+// grow the shared base-10 split-power cache to cover levels 0..maxLevel
+procedure EnsureDecDCPows(maxLevel: integer; chunkBase: TLimb);
+begin
+  var old := Length(DecDCPows);
+  if maxLevel < old then exit;
+  SetLength(DecDCPows, maxLevel + 1);
+  if old = 0 then begin
+    DecDCPows[0] := LFromQWord(chunkBase);
+    old := 1;
+  end;
+  for var i := old to maxLevel do DecDCPows[i] := LSqr(DecDCPows[i - 1]);
+end;
+
 // linear conversion core: right-align the digits of a into buf[0..nd-1] and
 // left-pad with zeros; a is a scratch copy this routine destroys
 procedure LToBaseLinear(a: TLimbs; base: integer; chunkBase: TLimb; chunkLen: integer; buf: PAnsiChar; nd: SizeInt);
@@ -2145,10 +2165,15 @@ begin
       inc(maxLevel);
       k := k * 2;
     end;
-    SetLength(pows, maxLevel + 1);
-    pows[0] := LFromQWord(chunkBase);
-    for var i := 1 to maxLevel do pows[i] := LSqr(pows[i - 1]);
-    LToBaseRec(a, base, chunkBase, chunkLen, PAnsiChar(buf), cap, pows, maxLevel);
+    if base = 10 then begin
+      EnsureDecDCPows(maxLevel, chunkBase);
+      LToBaseRec(a, base, chunkBase, chunkLen, PAnsiChar(buf), cap, DecDCPows, maxLevel);
+    end else begin
+      SetLength(pows, maxLevel + 1);
+      pows[0] := LFromQWord(chunkBase);
+      for var i := 1 to maxLevel do pows[i] := LSqr(pows[i - 1]);
+      LToBaseRec(a, base, chunkBase, chunkLen, PAnsiChar(buf), cap, pows, maxLevel);
+    end;
   end;
   // strip the leading zero padding
   var p := 1;
@@ -2250,10 +2275,15 @@ begin
     inc(maxLevel);
     k := k * 2;
   end;
-  SetLength(pows, maxLevel + 1);
-  pows[0] := LFromQWord(chunkBase);
-  for var i := 1 to maxLevel do pows[i] := LSqr(pows[i - 1]);
-  result := LFromDigitsRec(@digits[0], count, base, chunkBase, chunkLen, pows, maxLevel);
+  if base = 10 then begin
+    EnsureDecDCPows(maxLevel, chunkBase);
+    result := LFromDigitsRec(@digits[0], count, base, chunkBase, chunkLen, DecDCPows, maxLevel);
+  end else begin
+    SetLength(pows, maxLevel + 1);
+    pows[0] := LFromQWord(chunkBase);
+    for var i := 1 to maxLevel do pows[i] := LSqr(pows[i - 1]);
+    result := LFromDigitsRec(@digits[0], count, base, chunkBase, chunkLen, pows, maxLevel);
+  end;
 end;
 
 // parse core: base = 0 auto-detects prefixes ($ 0x hex, % 0b bin, & 0o oct)
@@ -6045,10 +6075,79 @@ begin
   raise ERangeError.Create('BigDecimal exponent out of range');
 end;
 
+var
+  // 10^(2^k) as limb magnitudes, grown on demand (single-threaded)
+  Pow10Sq: array of TLimbs;
+
+// cached 10^(2^k); grows the table by squaring the previous entry
+function Pow10Bit(k: integer): TLimbs;
+begin
+  var old := Length(Pow10Sq);
+  if k >= old then begin
+    SetLength(Pow10Sq, k + 1);
+    if old = 0 then begin
+      Pow10Sq[0] := LFromQWord(10);
+      old := 1;
+    end;
+    for var i := old to k do Pow10Sq[i] := LSqr(Pow10Sq[i - 1]);
+  end;
+  result := Pow10Sq[k];
+end;
+
 function UPow10(n: LongWord): UBigInt;
 begin
-  if n <= 19 then result.fLimbs := LFromQWord(POW10Q[n])
-  else result.fLimbs := UPowQ(LFromQWord(10), n);
+  if n <= 19 then begin
+    result.fLimbs := LFromQWord(POW10Q[n]);
+    exit;
+  end;
+  // compose 10^n from cached 10^(2^k) for each set bit of n
+  var acc: TLimbs := [1];
+  var k := 0;
+  while n > 0 do begin
+    if n and 1 <> 0 then acc := LMul(acc, Pow10Bit(k));
+    n := n shr 1;
+    inc(k);
+  end;
+  result.fLimbs := acc;
+end;
+
+var
+  // 5^(2^i) squaring blocks, grown on demand; plus a one-slot memo of the last 5^k
+  Pow5Blocks: array of TLimbs;
+  Pow5MemoK: Int64 = -1;
+  Pow5Memo: TLimbs;
+
+// 5^k built from cached 5^(2^i) blocks, memoized for repeated k
+function UPow5(k: LongWord): TLimbs;
+begin
+  if Int64(k) = Pow5MemoK then exit(Pow5Memo);
+  result := [1];
+  var i := 0;
+  var kk := k;
+  while kk > 0 do begin
+    if i > High(Pow5Blocks) then begin
+      SetLength(Pow5Blocks, i + 1);
+      Pow5Blocks[i] := if i = 0 then LFromQWord(5) else LSqr(Pow5Blocks[i - 1]);
+    end;
+    if kk and 1 <> 0 then result := LMul(result, Pow5Blocks[i]);
+    kk := kk shr 1;
+    inc(i);
+  end;
+  Pow5MemoK := k;
+  Pow5Memo := result;
+end;
+
+// m div/mod 10^k using 10^k = 2^k*5^k: shift off the 2^k factor, divide by the
+// smaller 5^k, then rebuild the true remainder mod 10^k. pow5 returns 5^k so the
+// caller can form 10^k with one shift instead of a second power build. k >= 1.
+procedure LDivPow10(const m: TLimbs; k: LongWord; out q, r, pow5: TLimbs);
+begin
+  pow5 := UPow5(k);
+  var m1 := LShr(m, k);
+  var r2: TLimbs;
+  LDivMod(m1, pow5, q, r2);
+  // remainder mod 10^k = (m1 mod 5^k)*2^k + (m mod 2^k)
+  r := LAdd(LShl(r2, k), LSub(m, LShl(m1, k)));
 end;
 
 // multiply a magnitude by 10^k
@@ -6064,16 +6163,32 @@ begin
     end;
     if k > 0 then r := LMulW(r, TLimb(POW10Q[k]));
     result := r;
-  end else result := LMul(a, UPow10(LongWord(k)).fLimbs);
+  end else if k <= 128 then result := LMul(a, UPow10(LongWord(k)).fLimbs)
+  else
+    // large gap: 10^k = 5^k shl k; 5^k has ~30% fewer bits than 10^k, so both
+    // building it and the multiply are cheaper and the binary shift is linear
+    result := LShl(LMul(a, UPow5(LongWord(k))), LongWord(k));
 end;
 
 // strip trailing decimal zeros of a magnitude, bumping the exponent
 procedure LStrip10(var m: TLimbs; var e: Int64);
 begin
-  while (Length(m) > 0) and (m[0] and 1 = 0) do begin
-    var r := LModW(m, DEC_CHUNK);
+  var lm := Length(m);
+  if (lm = 0) or (m[0] and 1 = 1) then exit;
+  // a trailing decimal zero needs a factor of 2 and 5, so their count cannot
+  // exceed the 2-adic valuation; the trailing binary zeros bound the work
+  var t: Int64 := 0;
+  var i := 0;
+  while (i < lm) and (m[i] = 0) do begin
+    inc(t, LIMB_BITS);
+    inc(i);
+  end;
+  if i < lm then inc(t, LimbBsf(m[i]));
+  while t > 0 do begin
+    var w := if t < DEC_CHUNK_POW then integer(t) else DEC_CHUNK_POW;
+    var r := LModW(m, TLimb(POW10Q[w]));
     var z: integer;
-    if r = 0 then z := DEC_CHUNK_POW
+    if r = 0 then z := w
     else begin
       z := 0;
       while r mod 10 = 0 do begin
@@ -6085,7 +6200,8 @@ begin
     var rem: TLimb;
     m := LDivModW(m, TLimb(POW10Q[z]), rem);
     e := e + z;
-    if z < DEC_CHUNK_POW then exit;
+    if z < w then exit;
+    t := t - z;
   end;
 end;
 
@@ -6170,6 +6286,8 @@ begin
     if negateB then result.fMan := -result.fMan;
     exit;
   end;
+  // equal scale: no alignment multiply, add the mantissas as they are
+  if a.fExp = b.fExp then exit(DecMake(SAddPair(a.fMan.fLimbs, a.fMan.fNeg, b.fMan.fLimbs, b.fMan.fNeg xor negateB), Int64(a.fExp), a.fHidden or b.fHidden));
   // align both mantissas to the smaller exponent
   var e := if Int64(a.fExp) < b.fExp then Int64(a.fExp) else Int64(b.fExp);
   var am := LScale10(a.fMan.fLimbs, Int64(a.fExp) - e);
@@ -6339,6 +6457,20 @@ begin
   result := DecCmp(a, b) >= 0;
 end;
 
+// fast decimal render of a single-limb magnitude, no leading zeros
+function QWordToDecimal(q: QWord): string;
+begin
+  if q = 0 then exit('0');
+  var buf: array[0..19] of AnsiChar;
+  var p := 20;
+  while q > 0 do begin
+    dec(p);
+    buf[p] := AnsiChar(Ord('0') + q mod 10);
+    q := q div 10;
+  end;
+  SetString(result, PAnsiChar(@buf[p]), 20 - p);
+end;
+
 function BigDecimal.toString: string;
 var
   m: TLimbs;
@@ -6346,7 +6478,7 @@ var
 begin
   DecDisplay(self, m, e);
   if Length(m) = 0 then exit('0');
-  var digits := LToBase(m, 10);
+  var digits := if Length(m) = 1 then QWordToDecimal(m[0]) else LToBase(m, 10);
   var l := Length(digits);
   if e >= 0 then result := digits + StringOfChar('0', e)
   else begin
@@ -6364,7 +6496,7 @@ var
 begin
   DecDisplay(self, m, e);
   if Length(m) = 0 then exit('0');
-  var digits := LToBase(m, 10);
+  var digits := if Length(m) = 1 then QWordToDecimal(m[0]) else LToBase(m, 10);
   var l := Length(digits);
   var rest := if l > 1 then Copy(digits, 2, l - 1) else '0';
   result := digits[1] + '.' + rest + 'E' + IntToStr(e + l - 1);
@@ -6563,8 +6695,8 @@ begin
     result.fLimbs := LScale10(fMan.fLimbs, fExp);
     result.fNeg := fMan.fNeg;
   end else begin
-    var q, r: TLimbs;
-    LDivMod(fMan.fLimbs, UPow10(LongWord(-Int64(fExp))).fLimbs, q, r);
+    var q, r, p5: TLimbs;
+    LDivPow10(fMan.fLimbs, LongWord(-Int64(fExp)), q, r, p5);
     result.fLimbs := q;
     result.fNeg := fMan.fNeg and (Length(q) > 0);
   end;
@@ -6590,8 +6722,8 @@ end;
 function BigDecimal.frac: BigDecimal;
 begin
   if fExp >= 0 then exit(default(BigDecimal));
-  var q, r: TLimbs;
-  LDivMod(fMan.fLimbs, UPow10(LongWord(-Int64(fExp))).fLimbs, q, r);
+  var q, r, p5: TLimbs;
+  LDivPow10(fMan.fLimbs, LongWord(-Int64(fExp)), q, r, p5);
   var m: BigInt;
   m.fLimbs := r;
   m.fNeg := fMan.fNeg and (Length(r) > 0);
@@ -6655,8 +6787,9 @@ begin
     qm := nil;
     rm := fMan.fLimbs;
   end else begin
-    p10 := UPow10(LongWord(delta)).fLimbs;
-    LDivMod(fMan.fLimbs, p10, qm, rm);
+    var p5: TLimbs;
+    LDivPow10(fMan.fLimbs, LongWord(delta), qm, rm, p5);
+    p10 := LShl(p5, LongWord(delta));
   end;
   var up := false;
   if Length(rm) > 0 then begin
@@ -6778,6 +6911,7 @@ begin
   var digits: TBytes;
   SetLength(digits, len - i + 1);
   var count: SizeInt := 0;
+  var acc: QWord := 0;
   var fracDigits: Int64 := 0;
   var seenDot := false;
   while i <= len do begin
@@ -6793,6 +6927,7 @@ begin
     end;
     if not (c in ['0'..'9']) then break;
     digits[count] := byte(Ord(c) - Ord('0'));
+    if count < 18 then acc := acc * 10 + digits[count];
     inc(count);
     if seenDot then inc(fracDigits);
     inc(i);
@@ -6819,9 +6954,14 @@ begin
     if eneg then expPart := -expPart;
   end;
   if i <= len then exit;
-  SetLength(digits, count);
   var m: BigInt;
-  m.fLimbs := LFromDigits(digits, 10);
+  // money-sized mantissas (<= 18 digits) fit one 64-bit word: build directly,
+  // skipping the TBytes chunked parse
+  if count <= 18 then m.fLimbs := LFromQWord(acc)
+  else begin
+    SetLength(digits, count);
+    m.fLimbs := LFromDigits(digits, 10);
+  end;
   m.fNeg := neg and (Length(m.fLimbs) > 0);
   var e := expPart - fracDigits;
   LStrip10(m.fLimbs, e);
