@@ -57,15 +57,49 @@ type
   TBigIntLimb = DWord;
   {$endif}
   TBigIntLimbs = array of TBigIntLimb;
+  PBigIntLimb = ^TBigIntLimb;
+
+const
+  // values up to this many limbs (256 bits) live inline in the record with no
+  // heap allocation; larger ones spill into a refcounted block. tunable
+  {$ifdef BIGINT_ASM}
+  BIGINT_INLINE_LIMBS = 4;
+  {$else}
+  BIGINT_INLINE_LIMBS = 8;
+  {$endif}
+
+type
+  // heap backing for values that do not fit inline: a reference count and a
+  // limb capacity, followed immediately by the limbs
+  PBigIntBlock = ^TBigIntBlock;
+  TBigIntBlock = record
+    refs: PtrInt;
+    cap: SizeInt;
+  end;
 
   { UBigInt - unsigned arbitrary precision integer }
 
   UBigInt = record
   private
-    fLimbs: TBigIntLimbs;
+    // small-value optimization: up to BIGINT_INLINE_LIMBS limbs sit inline
+    // with no allocation, larger values spill into fBlk; fLen is the
+    // significant limb count (0 = zero, highest limb nonzero). fLimbs is a
+    // property that materializes/stores a TBigIntLimbs, so the whole library
+    // keeps working on limb arrays while small values never touch the heap
+    fInline: array[0..BIGINT_INLINE_LIMBS - 1] of TBigIntLimb;
+    fBlk: PBigIntBlock;
+    fLen: SizeInt;
+    function dataPtr: PBigIntLimb; inline;
+    function getLimbs: TBigIntLimbs;
+    procedure setLimbs(const v: TBigIntLimbs);
     function getBitProp(i: LongWord): boolean; inline;
     procedure putBitProp(i: LongWord; v: boolean); inline;
+    property fLimbs: TBigIntLimbs read getLimbs write setLimbs;
   public
+    class operator Initialize(var x: UBigInt);
+    class operator Finalize(var x: UBigInt);
+    class operator AddRef(var x: UBigInt);
+    class operator Copy(constref src: UBigInt; var dst: UBigInt);
     // conversions in (negative values raise ERangeError)
     class operator :=(x: Int64): UBigInt;
     class operator :=(x: QWord): UBigInt;
@@ -285,11 +319,22 @@ type
 
   BigInt = record
   private
-    fLimbs: TBigIntLimbs;
+    // same inline storage as UBigInt (see there), plus a sign flag
+    fInline: array[0..BIGINT_INLINE_LIMBS - 1] of TBigIntLimb;
+    fBlk: PBigIntBlock;
+    fLen: SizeInt;
     fNeg: boolean;
+    function dataPtr: PBigIntLimb; inline;
+    function getLimbs: TBigIntLimbs;
+    procedure setLimbs(const v: TBigIntLimbs);
     function getBitProp(i: LongWord): boolean; inline;
     procedure putBitProp(i: LongWord; v: boolean); inline;
+    property fLimbs: TBigIntLimbs read getLimbs write setLimbs;
   public
+    class operator Initialize(var x: BigInt);
+    class operator Finalize(var x: BigInt);
+    class operator AddRef(var x: BigInt);
+    class operator Copy(constref src: BigInt; var dst: BigInt);
     // conversions in
     class operator :=(x: Int64): BigInt;
     class operator :=(x: QWord): BigInt;
@@ -1376,6 +1421,158 @@ begin
   if n <> Length(a) then SetLength(a, n);
 end;
 
+// ---------------------------------------------------------------------------
+// small-value optimization storage (inline limbs + refcounted spill block)
+// ---------------------------------------------------------------------------
+
+const
+  BIGINT_BLK_HDR = SizeOf(TBigIntBlock);
+
+// limbs of a spill block start right after its header
+function BlkData(b: PBigIntBlock): PLimb; inline;
+begin
+  result := PLimb(PByte(b) + BIGINT_BLK_HDR);
+end;
+
+function AllocBlk(cap: SizeInt): PBigIntBlock;
+begin
+  result := PBigIntBlock(GetMem(BIGINT_BLK_HDR + cap * SizeOf(TLimb)));
+  result^.refs := 1;
+  result^.cap := cap;
+end;
+
+procedure ReleaseBlk(b: PBigIntBlock); inline;
+begin
+  if b = nil then exit;
+  dec(b^.refs);
+  if b^.refs = 0 then FreeMem(b);
+end;
+
+// read pointer to the limbs (inline array or spill block) without allocating.
+// pinl is the address of the record's inline array. all storage helpers take
+// typed PLimb rather than untyped var params: an untyped var passed to an
+// inline routine and dereferenced via @ miscompiles on this toolchain
+function ViewPtr(pinl: PLimb; blk: PBigIntBlock): PLimb; inline;
+begin
+  result := if blk <> nil then BlkData(blk) else pinl;
+end;
+
+function MakeLimbs(p: PLimb; len: SizeInt): TLimbs; inline;
+begin
+  result := nil;
+  if len = 0 then exit;
+  result := LNew(len);
+  Move(p^, result[0], len * SizeOf(TLimb));
+end;
+
+// store a limb array into inline-or-block storage, normalizing the length;
+// releases any previous block. dst is the record's inline array. v never
+// aliases the block (callers pass a freshly materialized array)
+procedure StoreLimbs(const v: TLimbs; dst: PLimb; var blk: PBigIntBlock; var len: SizeInt);
+begin
+  var n := Length(v);
+  while (n > 0) and (v[n - 1] = 0) do dec(n);
+  ReleaseBlk(blk);
+  blk := nil;
+  len := n;
+  // inline invariant: limbs above len are zero, so fast paths read branchlessly
+  FillChar(dst^, BIGINT_INLINE_LIMBS * SizeOf(TLimb), 0);
+  if n = 0 then exit;
+  if n <= BIGINT_INLINE_LIMBS then Move(v[0], dst^, n * SizeOf(TLimb))
+  else begin
+    blk := AllocBlk(n);
+    Move(v[0], BlkData(blk)^, n * SizeOf(TLimb));
+  end;
+end;
+
+function UBigInt.dataPtr: PBigIntLimb; inline;
+begin
+  result := ViewPtr(@fInline[0], fBlk);
+end;
+
+function UBigInt.getLimbs: TBigIntLimbs;
+begin
+  result := MakeLimbs(ViewPtr(@fInline[0], fBlk), fLen);
+end;
+
+procedure UBigInt.setLimbs(const v: TBigIntLimbs);
+begin
+  StoreLimbs(v, @fInline[0], fBlk, fLen);
+end;
+
+class operator UBigInt.Initialize(var x: UBigInt);
+begin
+  x.fBlk := nil;
+  x.fLen := 0;
+  FillChar(x.fInline, SizeOf(x.fInline), 0);
+end;
+
+class operator UBigInt.Finalize(var x: UBigInt);
+begin
+  ReleaseBlk(x.fBlk);
+  x.fBlk := nil;
+end;
+
+class operator UBigInt.AddRef(var x: UBigInt);
+begin
+  if x.fBlk <> nil then inc(x.fBlk^.refs);
+end;
+
+class operator UBigInt.Copy(constref src: UBigInt; var dst: UBigInt);
+begin
+  if @src = @dst then exit;
+  ReleaseBlk(dst.fBlk);
+  dst.fInline := src.fInline;
+  dst.fBlk := src.fBlk;
+  dst.fLen := src.fLen;
+  if dst.fBlk <> nil then inc(dst.fBlk^.refs);
+end;
+
+function BigInt.dataPtr: PBigIntLimb; inline;
+begin
+  result := ViewPtr(@fInline[0], fBlk);
+end;
+
+function BigInt.getLimbs: TBigIntLimbs;
+begin
+  result := MakeLimbs(ViewPtr(@fInline[0], fBlk), fLen);
+end;
+
+procedure BigInt.setLimbs(const v: TBigIntLimbs);
+begin
+  StoreLimbs(v, @fInline[0], fBlk, fLen);
+end;
+
+class operator BigInt.Initialize(var x: BigInt);
+begin
+  x.fBlk := nil;
+  x.fLen := 0;
+  x.fNeg := false;
+  FillChar(x.fInline, SizeOf(x.fInline), 0);
+end;
+
+class operator BigInt.Finalize(var x: BigInt);
+begin
+  ReleaseBlk(x.fBlk);
+  x.fBlk := nil;
+end;
+
+class operator BigInt.AddRef(var x: BigInt);
+begin
+  if x.fBlk <> nil then inc(x.fBlk^.refs);
+end;
+
+class operator BigInt.Copy(constref src: BigInt; var dst: BigInt);
+begin
+  if @src = @dst then exit;
+  ReleaseBlk(dst.fBlk);
+  dst.fInline := src.fInline;
+  dst.fBlk := src.fBlk;
+  dst.fLen := src.fLen;
+  dst.fNeg := src.fNeg;
+  if dst.fBlk <> nil then inc(dst.fBlk^.refs);
+end;
+
 function LToQWord(const a: TLimbs): QWord; inline;
 begin
   {$if LIMB_BITS = 64}
@@ -1439,14 +1636,283 @@ begin
   result := 0;
 end;
 
-function LCmpQ(const a: TLimbs; q: QWord): integer;
+// pointer-based reads over (ptr, len): used by the small-value fast paths so
+// they never materialize a limb array
+function LToQWordP(p: PLimb; len: SizeInt): QWord; inline;
 begin
-  if Length(a) > LIMBS_PER_QWORD then exit(1);
-  var av := LToQWord(a);
+  {$if LIMB_BITS = 64}
+  result := if len > 0 then p[0] else 0;
+  {$else}
+  result := 0;
+  if len > 0 then result := p[0];
+  if len > 1 then result := result or (QWord(p[1]) shl 32);
+  {$endif}
+end;
+
+function LCmpP(pa: PLimb; la: SizeInt; pb: PLimb; lb: SizeInt): integer; inline;
+begin
+  if la <> lb then exit(if la < lb then -1 else 1);
+  for var i := la - 1 downto 0 do
+    if pa[i] <> pb[i] then exit(if pa[i] < pb[i] then -1 else 1);
+  result := 0;
+end;
+
+function LCmpQP(p: PLimb; len: SizeInt; q: QWord): integer; inline;
+begin
+  if len > LIMBS_PER_QWORD then exit(1);
+  var av := LToQWordP(p, len);
   if av < q then exit(-1);
   if av > q then exit(1);
   result := 0;
 end;
+
+// ---------------------------------------------------------------------------
+// inline small-value fast paths (no allocation, no property materialization);
+// operands and results live in the zero-padded inline array. r is a fresh
+// operator result (fBlk = nil, inline zeroed)
+// ---------------------------------------------------------------------------
+
+// all fast paths take typed PLimb pointers (never untyped var params - those
+// miscompile when inlined and dereferenced via @ on this toolchain). dst is
+// the destination record's inline array; the destination may be a reused
+// operator temp still holding a live block, so every finish releases it
+
+// build a magnitude from a QWord straight into inline storage
+procedure USetQWord(dst: PLimb; var blk: PBigIntBlock; var len: SizeInt; q: QWord); inline;
+begin
+  {$if LIMB_BITS = 64}
+  dst[0] := q;
+  var m: SizeInt := if q <> 0 then 1 else 0;
+  {$else}
+  dst[0] := TLimb(q);
+  dst[1] := TLimb(q shr 32);
+  var m: SizeInt := if q > High(TLimb) then 2 else if q <> 0 then 1 else 0;
+  {$endif}
+  for var i := m to BIGINT_INLINE_LIMBS - 1 do dst[i] := 0;
+  ReleaseBlk(blk);
+  blk := nil;
+  len := m;
+end;
+
+// finish a fast-path result as zero
+procedure PutZero(dst: PLimb; var rblk: PBigIntBlock; var rlen: SizeInt); inline;
+begin
+  for var i := 0 to BIGINT_INLINE_LIMBS - 1 do dst[i] := 0;
+  ReleaseBlk(rblk);
+  rblk := nil;
+  rlen := 0;
+end;
+
+// share a source magnitude into a destination record's storage fields with no
+// materialization: bump the block refcount instead of copying limbs. safe when
+// source and destination alias (the refcount goes up before the release)
+procedure ShareMag(srcInline: PLimb; sblk: PBigIntBlock; slen: SizeInt; dstInline: PLimb; var dblk: PBigIntBlock; var dlen: SizeInt);
+begin
+  if sblk <> nil then inc(sblk^.refs);
+  if dstInline <> srcInline then
+    for var i := 0 to BIGINT_INLINE_LIMBS - 1 do dstInline[i] := srcInline[i];
+  ReleaseBlk(dblk);
+  dblk := sblk;
+  dlen := slen;
+end;
+
+// spread a QWord into a zero-padded stack operand for the inline fast paths;
+// returns its significant length
+function QToInline(q: QWord; p: PLimb): SizeInt; inline;
+begin
+  for var i := 0 to BIGINT_INLINE_LIMBS - 1 do p[i] := 0;
+  {$if LIMB_BITS = 64}
+  p[0] := q;
+  result := if q <> 0 then 1 else 0;
+  {$else}
+  p[0] := TLimb(q);
+  p[1] := TLimb(q shr 32);
+  result := if p[1] <> 0 then 2 else if q <> 0 then 1 else 0;
+  {$endif}
+end;
+
+// copy a computed buffer of significance m into the destination and finish it.
+// the fast paths compute into a local buffer first, so the result may safely
+// alias an operand (the compiler reuses operand temps as the result slot)
+procedure PutInline(buf: PLimb; m: SizeInt; dst: PLimb; var rblk: PBigIntBlock; var rlen: SizeInt);
+begin
+  for var i := 0 to m - 1 do dst[i] := buf[i];
+  for var i := m to BIGINT_INLINE_LIMBS - 1 do dst[i] := 0;
+  ReleaseBlk(rblk);
+  rblk := nil;
+  rlen := m;
+end;
+
+// spill finisher for fast-path results just past the inline capacity; copies
+// into a fresh block before releasing the old one (result may be a reused temp)
+procedure PutSpill(buf: PLimb; m: SizeInt; dst: PLimb; var rblk: PBigIntBlock; var rlen: SizeInt);
+begin
+  var nb := AllocBlk(m);
+  Move(buf^, BlkData(nb)^, m * SizeOf(TLimb));
+  FillChar(dst^, BIGINT_INLINE_LIMBS * SizeOf(TLimb), 0);
+  ReleaseBlk(rblk);
+  rblk := nb;
+  rlen := m;
+end;
+
+// r := a + b for two inline operands; spills to a block only when the carry
+// actually runs past the inline capacity
+procedure AddInline(pa: PLimb; alen: SizeInt; pb: PLimb; blen: SizeInt; dst: PLimb; var rblk: PBigIntBlock; var rlen: SizeInt);
+begin
+  var n := if alen > blen then alen else blen;
+  var buf: array[0..BIGINT_INLINE_LIMBS] of TLimb;
+  var carry: TLimb := 0;
+  for var i := 0 to n - 1 do begin
+    var av := pa[i];
+    var s := av + pb[i];
+    var c1 := TLimb(Ord(s < av));
+    s := s + carry;
+    carry := c1 or TLimb(Ord(s < carry));
+    buf[i] := s;
+  end;
+  buf[n] := carry;
+  var m: SizeInt;
+  if carry <> 0 then m := n + 1
+  else begin
+    m := n;
+    while (m > 0) and (buf[m - 1] = 0) do dec(m);
+  end;
+  if m <= BIGINT_INLINE_LIMBS then PutInline(@buf[0], m, dst, rblk, rlen)
+  else PutSpill(@buf[0], m, dst, rblk, rlen);
+end;
+
+// magnitude subtract a - b for a >= b, both inline
+procedure SubInline(pa: PLimb; alen: SizeInt; pb: PLimb; dst: PLimb; var rblk: PBigIntBlock; var rlen: SizeInt);
+begin
+  var buf: array[0..BIGINT_INLINE_LIMBS] of TLimb;
+  var borrow: TLimb := 0;
+  for var i := 0 to alen - 1 do begin
+    var av := pa[i];
+    var bv := pb[i];
+    var s := av - bv;
+    var b1 := TLimb(Ord(av < bv));
+    var s2 := s - borrow;
+    borrow := b1 or TLimb(Ord(s < borrow));
+    buf[i] := s2;
+  end;
+  var m := alen;
+  while (m > 0) and (buf[m - 1] = 0) do dec(m);
+  PutInline(@buf[0], m, dst, rblk, rlen);
+end;
+
+// r := a * b for two inline operands; the product (at most twice the inline
+// capacity) is computed on the stack and spills to a block only when it has to
+procedure MulInline(pa: PLimb; alen: SizeInt; pb: PLimb; blen: SizeInt; dst: PLimb; var rblk: PBigIntBlock; var rlen: SizeInt);
+begin
+  if (alen = 0) or (blen = 0) then begin
+    PutZero(dst, rblk, rlen);
+    exit;
+  end;
+  var buf: array[0..2 * BIGINT_INLINE_LIMBS - 1] of TLimb;
+  for var i := 0 to alen + blen - 1 do buf[i] := 0;
+  for var i := 0 to alen - 1 do buf[i + blen] := MpnAddMul1(@buf[i], pb, blen, pa[i]);
+  var m := alen + blen;
+  while (m > 0) and (buf[m - 1] = 0) do dec(m);
+  if m <= BIGINT_INLINE_LIMBS then PutInline(@buf[0], m, dst, rblk, rlen)
+  else PutSpill(@buf[0], m, dst, rblk, rlen);
+end;
+
+// signed add of two small magnitudes given as zero-padded (ptr, len, neg)
+// operands; dst/rblk/rlen/rneg are the destination record's storage fields
+procedure SAddInlineP(pa: PLimb; alen: SizeInt; aneg: boolean; pb: PLimb; blen: SizeInt; bneg: boolean; dst: PLimb; var rblk: PBigIntBlock; var rlen: SizeInt; out rneg: boolean);
+begin
+  if aneg = bneg then begin
+    AddInline(pa, alen, pb, blen, dst, rblk, rlen);
+    rneg := aneg and (rlen > 0);
+    exit;
+  end;
+  var c := LCmpP(pa, alen, pb, blen);
+  if c = 0 then begin
+    PutZero(dst, rblk, rlen);
+    rneg := false;
+  end else if c > 0 then begin
+    SubInline(pa, alen, pb, dst, rblk, rlen);
+    rneg := aneg and (rlen > 0);
+  end else begin
+    SubInline(pb, blen, pa, dst, rblk, rlen);
+    rneg := bneg and (rlen > 0);
+  end;
+end;
+
+// (pa, alen) divMod (pb, blen) for values that fit inline, blen >= 1; the
+// quotient (<= alen limbs) and remainder (< blen limbs) always fit inline.
+// computes into caller stack buffers qb/rb, so results may alias the operands
+procedure DivModInline(pa: PLimb; alen: SizeInt; pb: PLimb; blen: SizeInt; qb: PLimb; out qlen: SizeInt; rb: PLimb; out rlen: SizeInt);
+var
+  un: array[0..BIGINT_INLINE_LIMBS] of TLimb;
+  vn: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+begin
+  if LCmpP(pa, alen, pb, blen) < 0 then begin
+    qlen := 0;
+    for var i := 0 to alen - 1 do rb[i] := pa[i];
+    rlen := alen;
+    exit;
+  end;
+  if blen = 1 then begin
+    var d := pb[0];
+    var r: TLimb := 0;
+    for var i := alen - 1 downto 0 do qb[i] := UDivLimb(r, pa[i], d, r);
+    var mq := alen;
+    while (mq > 0) and (qb[mq - 1] = 0) do dec(mq);
+    qlen := mq;
+    rb[0] := r;
+    rlen := if r <> 0 then 1 else 0;
+    exit;
+  end;
+  // Knuth algorithm D on stack buffers, same steps as LDivMod (alen >= blen >= 2)
+  var n := blen;
+  var m := alen;
+  var s := LIMB_MASK - integer(LimbBsr(pb[n - 1]));
+  if s = 0 then begin
+    for var i := 0 to n - 1 do vn[i] := pb[i];
+    for var i := 0 to m - 1 do un[i] := pa[i];
+    un[m] := 0;
+  end else begin
+    MpnLshift(@vn[0], pb, n, s);
+    un[m] := MpnLshift(@un[0], pa, m, s);
+  end;
+  var vTop := vn[n - 1];
+  var vNext := vn[n - 2];
+  for var j := m - n downto 0 do begin
+    var qhat, rhat: TLimb;
+    var doneAdjust := false;
+    if un[j + n] = vTop then begin
+      qhat := High(TLimb);
+      rhat := un[j + n - 1] + vTop;
+      doneAdjust := rhat < vTop;
+    end else qhat := UDivLimb(un[j + n], un[j + n - 1], vTop, rhat);
+    while not doneAdjust do begin
+      var phi, plo: TLimb;
+      UMulLimb(qhat, vNext, phi, plo);
+      if (phi < rhat) or ((phi = rhat) and (plo <= un[j + n - 2])) then break;
+      dec(qhat);
+      rhat := rhat + vTop;
+      doneAdjust := rhat < vTop;
+    end;
+    var borrow := MpnSubMul1(@un[j], @vn[0], n, qhat);
+    var top := un[j + n];
+    un[j + n] := top - borrow;
+    if top < borrow then begin
+      dec(qhat);
+      un[j + n] := un[j + n] + MpnAddN(@un[j], @un[j], @vn[0], n);
+    end;
+    qb[j] := qhat;
+  end;
+  var ql := m - n + 1;
+  while (ql > 0) and (qb[ql - 1] = 0) do dec(ql);
+  qlen := ql;
+  if s = 0 then for var i := 0 to n - 1 do rb[i] := un[i]
+  else MpnRshift(rb, @un[0], n, s);
+  var rl := n;
+  while (rl > 0) and (rb[rl - 1] = 0) do dec(rl);
+  rlen := rl;
+end;
+
 
 // all TLimbs-returning routines build into a fresh local and assign the result
 // at the very end: the hidden result may alias an input (x := LAdd(x, y))
@@ -2494,12 +2960,12 @@ end;
 class operator UBigInt.:=(x: Int64): UBigInt;
 begin
   if x < 0 then RaiseNegativeUnsigned;
-  result.fLimbs := LFromQWord(QWord(x));
+  USetQWord(@result.fInline[0], result.fBlk, result.fLen, QWord(x));
 end;
 
 class operator UBigInt.:=(x: QWord): UBigInt;
 begin
-  result.fLimbs := LFromQWord(x);
+  USetQWord(@result.fInline[0], result.fBlk, result.fLen, x);
 end;
 
 class operator UBigInt.:=(const s: string): UBigInt;
@@ -2566,11 +3032,27 @@ end;
 
 class operator UBigInt.+(const a, b: UBigInt): UBigInt;
 begin
+  if (a.fBlk = nil) and (b.fBlk = nil) then begin
+    AddInline(@a.fInline[0], a.fLen, @b.fInline[0], b.fLen, @result.fInline[0], result.fBlk, result.fLen);
+    exit;
+  end;
   result.fLimbs := LAdd(a.fLimbs, b.fLimbs);
 end;
 
 class operator UBigInt.+(const a: UBigInt; b: Int64): UBigInt;
 begin
+  if a.fBlk = nil then begin
+    var bb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+    var bl := QToInline(if b >= 0 then QWord(b) else NegAbs64(b), @bb[0]);
+    if b >= 0 then AddInline(@a.fInline[0], a.fLen, @bb[0], bl, @result.fInline[0], result.fBlk, result.fLen)
+    else begin
+      var c := LCmpP(@a.fInline[0], a.fLen, @bb[0], bl);
+      if c < 0 then RaiseNegativeUnsigned;
+      if c = 0 then PutZero(@result.fInline[0], result.fBlk, result.fLen)
+      else SubInline(@a.fInline[0], a.fLen, @bb[0], @result.fInline[0], result.fBlk, result.fLen);
+    end;
+    exit;
+  end;
   if b >= 0 then result.fLimbs := LAdd(a.fLimbs, LFromQWord(QWord(b)))
   else result.fLimbs := LSubChecked(a.fLimbs, LFromQWord(NegAbs64(b)));
 end;
@@ -2582,11 +3064,30 @@ end;
 
 class operator UBigInt.-(const a, b: UBigInt): UBigInt;
 begin
+  if (a.fBlk = nil) and (b.fBlk = nil) then begin
+    var c := LCmpP(@a.fInline[0], a.fLen, @b.fInline[0], b.fLen);
+    if c < 0 then RaiseNegativeUnsigned;
+    if c = 0 then PutZero(@result.fInline[0], result.fBlk, result.fLen)
+    else SubInline(@a.fInline[0], a.fLen, @b.fInline[0], @result.fInline[0], result.fBlk, result.fLen);
+    exit;
+  end;
   result.fLimbs := LSubChecked(a.fLimbs, b.fLimbs);
 end;
 
 class operator UBigInt.-(const a: UBigInt; b: Int64): UBigInt;
 begin
+  if a.fBlk = nil then begin
+    var bb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+    var bl := QToInline(if b >= 0 then QWord(b) else NegAbs64(b), @bb[0]);
+    if b < 0 then AddInline(@a.fInline[0], a.fLen, @bb[0], bl, @result.fInline[0], result.fBlk, result.fLen)
+    else begin
+      var c := LCmpP(@a.fInline[0], a.fLen, @bb[0], bl);
+      if c < 0 then RaiseNegativeUnsigned;
+      if c = 0 then PutZero(@result.fInline[0], result.fBlk, result.fLen)
+      else SubInline(@a.fInline[0], a.fLen, @bb[0], @result.fInline[0], result.fBlk, result.fLen);
+    end;
+    exit;
+  end;
   if b >= 0 then result.fLimbs := LSubChecked(a.fLimbs, LFromQWord(QWord(b)))
   else result.fLimbs := LAdd(a.fLimbs, LFromQWord(NegAbs64(b)));
 end;
@@ -2599,14 +3100,24 @@ end;
 
 class operator UBigInt.*(const a, b: UBigInt): UBigInt;
 begin
+  if (a.fBlk = nil) and (b.fBlk = nil) then begin
+    MulInline(@a.fInline[0], a.fLen, @b.fInline[0], b.fLen, @result.fInline[0], result.fBlk, result.fLen);
+    exit;
+  end;
   result.fLimbs := LMul(a.fLimbs, b.fLimbs);
 end;
 
 class operator UBigInt.*(const a: UBigInt; b: Int64): UBigInt;
 begin
   if b < 0 then begin
-    if Length(a.fLimbs) <> 0 then RaiseNegativeUnsigned;
+    if a.fLen <> 0 then RaiseNegativeUnsigned;
     exit(default(UBigInt));
+  end;
+  if a.fBlk = nil then begin
+    var bb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+    var bl := QToInline(QWord(b), @bb[0]);
+    MulInline(@a.fInline[0], a.fLen, @bb[0], bl, @result.fInline[0], result.fBlk, result.fLen);
+    exit;
   end;
   result.fLimbs := LMulQ(a.fLimbs, QWord(b));
 end;
@@ -2620,7 +3131,14 @@ class operator UBigInt.div(const a, b: UBigInt): UBigInt;
 var
   q, r: TLimbs;
 begin
-  if Length(b.fLimbs) = 0 then RaiseDivByZero;
+  if b.fLen = 0 then RaiseDivByZero;
+  if (a.fBlk = nil) and (b.fBlk = nil) then begin
+    var qb, rb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+    var ql, rl: SizeInt;
+    DivModInline(@a.fInline[0], a.fLen, @b.fInline[0], b.fLen, @qb[0], ql, @rb[0], rl);
+    PutInline(@qb[0], ql, @result.fInline[0], result.fBlk, result.fLen);
+    exit;
+  end;
   LDivMod(a.fLimbs, b.fLimbs, q, r);
   result.fLimbs := q;
 end;
@@ -2634,8 +3152,23 @@ var
 begin
   if b = 0 then RaiseDivByZero;
   if b < 0 then begin
-    if Length(a.fLimbs) <> 0 then RaiseNegativeUnsigned;
+    if a.fLen <> 0 then RaiseNegativeUnsigned;
     exit(default(UBigInt));
+  end;
+  if a.fBlk = nil then begin
+    var db: array[0..1] of TLimb;
+    db[0] := TLimb(b);
+    {$if LIMB_BITS = 64}
+    var dl: SizeInt := 1;
+    {$else}
+    db[1] := TLimb(QWord(b) shr 32);
+    var dl: SizeInt := if db[1] <> 0 then 2 else 1;
+    {$endif}
+    var qb, rb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+    var ql, rl: SizeInt;
+    DivModInline(@a.fInline[0], a.fLen, @db[0], dl, @qb[0], ql, @rb[0], rl);
+    PutInline(@qb[0], ql, @result.fInline[0], result.fBlk, result.fLen);
+    exit;
   end;
   {$if LIMB_BITS = 64}
   result.fLimbs := LDivModW(a.fLimbs, TLimb(b), rw);
@@ -2652,7 +3185,14 @@ class operator UBigInt.mod(const a, b: UBigInt): UBigInt;
 var
   q, r: TLimbs;
 begin
-  if Length(b.fLimbs) = 0 then RaiseDivByZero;
+  if b.fLen = 0 then RaiseDivByZero;
+  if (a.fBlk = nil) and (b.fBlk = nil) then begin
+    var qb, rb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+    var ql, rl: SizeInt;
+    DivModInline(@a.fInline[0], a.fLen, @b.fInline[0], b.fLen, @qb[0], ql, @rb[0], rl);
+    PutInline(@rb[0], rl, @result.fInline[0], result.fBlk, result.fLen);
+    exit;
+  end;
   LDivMod(a.fLimbs, b.fLimbs, q, r);
   result.fLimbs := r;
 end;
@@ -2667,6 +3207,21 @@ begin
   if b = 0 then RaiseDivByZero;
   // remainder of a nonnegative dividend is nonnegative for either divisor sign
   var m: QWord := if b > 0 then QWord(b) else NegAbs64(b);
+  if a.fBlk = nil then begin
+    var db: array[0..1] of TLimb;
+    db[0] := TLimb(m);
+    {$if LIMB_BITS = 64}
+    var dl: SizeInt := 1;
+    {$else}
+    db[1] := TLimb(m shr 32);
+    var dl: SizeInt := if db[1] <> 0 then 2 else 1;
+    {$endif}
+    var qb, rb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+    var ql, rl: SizeInt;
+    DivModInline(@a.fInline[0], a.fLen, @db[0], dl, @qb[0], ql, @rb[0], rl);
+    PutInline(@rb[0], rl, @result.fInline[0], result.fBlk, result.fLen);
+    exit;
+  end;
   {$if LIMB_BITS = 64}
   LDivModW(a.fLimbs, TLimb(m), rw);
   result.fLimbs := LFromQWord(rw);
@@ -2703,12 +3258,12 @@ end;
 
 class operator UBigInt.**(const a, b: UBigInt): UBigInt;
 begin
-  if Length(b.fLimbs) = 0 then begin
+  if b.fLen = 0 then begin
     // x^0 = 1, including 0^0
     result.fLimbs := [1];
     exit;
   end;
-  if Length(a.fLimbs) = 0 then exit(default(UBigInt));
+  if a.fLen = 0 then exit(default(UBigInt));
   if a.isOne then exit(a);
   result.fLimbs := UPowQ(a.fLimbs, b.toUInt64);
 end;
@@ -2720,7 +3275,7 @@ begin
     result.fLimbs := [1];
     exit;
   end;
-  if Length(a.fLimbs) = 0 then exit(default(UBigInt));
+  if a.fLen = 0 then exit(default(UBigInt));
   result.fLimbs := UPowQ(a.fLimbs, QWord(e));
 end;
 
@@ -2737,7 +3292,7 @@ end;
 class operator UBigInt.shl(const a: UBigInt; n: Int64): UBigInt;
 begin
   if n < 0 then raise ERangeError.Create('negative shift count');
-  if Length(a.fLimbs) = 0 then exit(default(UBigInt));
+  if a.fLen = 0 then exit(default(UBigInt));
   if n > High(LongWord) then raise EBigIntError.Create('shift count out of range');
   result.fLimbs := LShl(a.fLimbs, LongWord(n));
 end;
@@ -2766,12 +3321,12 @@ end;
 
 class operator UBigInt.=(const a, b: UBigInt): boolean;
 begin
-  result := LCmp(a.fLimbs, b.fLimbs) = 0;
+  result := a.compare(b) = 0;
 end;
 
 class operator UBigInt.=(const a: UBigInt; b: Int64): boolean;
 begin
-  result := (b >= 0) and (LCmpQ(a.fLimbs, QWord(b)) = 0);
+  result := (b >= 0) and (LCmpQP(a.dataPtr, a.fLen, QWord(b)) = 0);
 end;
 
 class operator UBigInt.=(a: Int64; const b: UBigInt): boolean;
@@ -2781,7 +3336,7 @@ end;
 
 class operator UBigInt.<>(const a, b: UBigInt): boolean;
 begin
-  result := LCmp(a.fLimbs, b.fLimbs) <> 0;
+  result := a.compare(b) <> 0;
 end;
 
 class operator UBigInt.<>(const a: UBigInt; b: Int64): boolean;
@@ -2796,62 +3351,62 @@ end;
 
 class operator UBigInt.<(const a, b: UBigInt): boolean;
 begin
-  result := LCmp(a.fLimbs, b.fLimbs) < 0;
+  result := a.compare(b) < 0;
 end;
 
 class operator UBigInt.<(const a: UBigInt; b: Int64): boolean;
 begin
-  result := (b > 0) and (LCmpQ(a.fLimbs, QWord(b)) < 0);
+  result := (b > 0) and (LCmpQP(a.dataPtr, a.fLen, QWord(b)) < 0);
 end;
 
 class operator UBigInt.<(a: Int64; const b: UBigInt): boolean;
 begin
-  result := (a < 0) or (LCmpQ(b.fLimbs, QWord(a)) > 0);
+  result := (a < 0) or (LCmpQP(b.dataPtr, b.fLen, QWord(a)) > 0);
 end;
 
 class operator UBigInt.<=(const a, b: UBigInt): boolean;
 begin
-  result := LCmp(a.fLimbs, b.fLimbs) <= 0;
+  result := a.compare(b) <= 0;
 end;
 
 class operator UBigInt.<=(const a: UBigInt; b: Int64): boolean;
 begin
-  result := (b >= 0) and (LCmpQ(a.fLimbs, QWord(b)) <= 0);
+  result := (b >= 0) and (LCmpQP(a.dataPtr, a.fLen, QWord(b)) <= 0);
 end;
 
 class operator UBigInt.<=(a: Int64; const b: UBigInt): boolean;
 begin
-  result := (a < 0) or (LCmpQ(b.fLimbs, QWord(a)) >= 0);
+  result := (a < 0) or (LCmpQP(b.dataPtr, b.fLen, QWord(a)) >= 0);
 end;
 
 class operator UBigInt.>(const a, b: UBigInt): boolean;
 begin
-  result := LCmp(a.fLimbs, b.fLimbs) > 0;
+  result := a.compare(b) > 0;
 end;
 
 class operator UBigInt.>(const a: UBigInt; b: Int64): boolean;
 begin
-  result := (b < 0) or (LCmpQ(a.fLimbs, QWord(b)) > 0);
+  result := (b < 0) or (LCmpQP(a.dataPtr, a.fLen, QWord(b)) > 0);
 end;
 
 class operator UBigInt.>(a: Int64; const b: UBigInt): boolean;
 begin
-  result := (a > 0) and (LCmpQ(b.fLimbs, QWord(a)) < 0);
+  result := (a > 0) and (LCmpQP(b.dataPtr, b.fLen, QWord(a)) < 0);
 end;
 
 class operator UBigInt.>=(const a, b: UBigInt): boolean;
 begin
-  result := LCmp(a.fLimbs, b.fLimbs) >= 0;
+  result := a.compare(b) >= 0;
 end;
 
 class operator UBigInt.>=(const a: UBigInt; b: Int64): boolean;
 begin
-  result := (b < 0) or (LCmpQ(a.fLimbs, QWord(b)) >= 0);
+  result := (b < 0) or (LCmpQP(a.dataPtr, a.fLen, QWord(b)) >= 0);
 end;
 
 class operator UBigInt.>=(a: Int64; const b: UBigInt): boolean;
 begin
-  result := (a >= 0) and (LCmpQ(b.fLimbs, QWord(a)) <= 0);
+  result := (a >= 0) and (LCmpQP(b.dataPtr, b.fLen, QWord(a)) <= 0);
 end;
 
 function UBigInt.toString: string;
@@ -2883,49 +3438,49 @@ end;
 function UBigInt.toInt8: Int8;
 begin
   if not fitsInInt8 then raise ERangeError.Create('UBigInt value does not fit in Int8');
-  result := Int8(LToQWord(fLimbs));
+  result := Int8(LToQWordP(dataPtr, fLen));
 end;
 
 function UBigInt.toUInt8: UInt8;
 begin
   if not fitsInUInt8 then raise ERangeError.Create('UBigInt value does not fit in UInt8');
-  result := UInt8(LToQWord(fLimbs));
+  result := UInt8(LToQWordP(dataPtr, fLen));
 end;
 
 function UBigInt.toInt16: Int16;
 begin
   if not fitsInInt16 then raise ERangeError.Create('UBigInt value does not fit in Int16');
-  result := Int16(LToQWord(fLimbs));
+  result := Int16(LToQWordP(dataPtr, fLen));
 end;
 
 function UBigInt.toUInt16: UInt16;
 begin
   if not fitsInUInt16 then raise ERangeError.Create('UBigInt value does not fit in UInt16');
-  result := UInt16(LToQWord(fLimbs));
+  result := UInt16(LToQWordP(dataPtr, fLen));
 end;
 
 function UBigInt.toInt32: Int32;
 begin
   if not fitsInInt32 then raise ERangeError.Create('UBigInt value does not fit in Int32');
-  result := Int32(LToQWord(fLimbs));
+  result := Int32(LToQWordP(dataPtr, fLen));
 end;
 
 function UBigInt.toUInt32: UInt32;
 begin
   if not fitsInUInt32 then raise ERangeError.Create('UBigInt value does not fit in UInt32');
-  result := UInt32(LToQWord(fLimbs));
+  result := UInt32(LToQWordP(dataPtr, fLen));
 end;
 
 function UBigInt.toInt64: Int64;
 begin
   if not fitsInInt64 then raise ERangeError.Create('UBigInt value does not fit in Int64');
-  result := Int64(LToQWord(fLimbs));
+  result := Int64(LToQWordP(dataPtr, fLen));
 end;
 
 function UBigInt.toUInt64: UInt64;
 begin
   if not fitsInUInt64 then raise ERangeError.Create('UBigInt value does not fit in UInt64');
-  result := LToQWord(fLimbs);
+  result := LToQWordP(dataPtr, fLen);
 end;
 
 {$ifdef BIGINT_HAS_INT128}
@@ -2946,7 +3501,7 @@ function UBigInt.toDouble: Double;
 begin
   var bits := bitLength;
   if bits = 0 then exit(0.0);
-  if bits <= 64 then exit(LToQWord(fLimbs));
+  if bits <= 64 then exit(LToQWordP(dataPtr, fLen));
   // top 64 bits with a sticky low bit, scaled by the dropped bit count
   var e := integer(bits) - 64;
   var q := LExtract64(fLimbs, LongWord(e));
@@ -3017,22 +3572,22 @@ end;
 
 function UBigInt.isZero: boolean;
 begin
-  result := Length(fLimbs) = 0;
+  result := fLen = 0;
 end;
 
 function UBigInt.isOne: boolean;
 begin
-  result := (Length(fLimbs) = 1) and (fLimbs[0] = 1);
+  result := (fLen = 1) and (dataPtr[0] = 1);
 end;
 
 function UBigInt.isEven: boolean;
 begin
-  result := (Length(fLimbs) = 0) or (fLimbs[0] and 1 = 0);
+  result := (fLen = 0) or (dataPtr[0] and 1 = 0);
 end;
 
 function UBigInt.isOdd: boolean;
 begin
-  result := (Length(fLimbs) > 0) and (fLimbs[0] and 1 = 1);
+  result := (fLen > 0) and (dataPtr[0] and 1 = 1);
 end;
 
 function UBigInt.isPowerOfTwo: boolean;
@@ -3042,24 +3597,28 @@ end;
 
 function UBigInt.sign: integer;
 begin
-  result := if Length(fLimbs) = 0 then 0 else 1;
+  result := if fLen = 0 then 0 else 1;
 end;
 
 function UBigInt.bitLength: LongWord;
 begin
-  result := LBitLen(fLimbs);
+  if fLen = 0 then exit(0);
+  var p := dataPtr;
+  result := LongWord(fLen) * LIMB_BITS - (LIMB_BITS - 1 - LimbBsr(p[fLen - 1]));
 end;
 
 function UBigInt.popCount: LongWord;
 begin
   result := 0;
-  for var i := 0 to Length(fLimbs) - 1 do result := result + PopCnt(fLimbs[i]);
+  var p := dataPtr;
+  for var i := 0 to fLen - 1 do result := result + PopCnt(p[i]);
 end;
 
 function UBigInt.lowestSetBit: Int64;
 begin
-  for var i := 0 to Length(fLimbs) - 1 do
-    if fLimbs[i] <> 0 then exit(Int64(i) * LIMB_BITS + LimbBsf(fLimbs[i]));
+  var p := dataPtr;
+  for var i := 0 to fLen - 1 do
+    if p[i] <> 0 then exit(Int64(i) * LIMB_BITS + LimbBsf(p[i]));
   result := -1;
 end;
 
@@ -3071,25 +3630,28 @@ end;
 procedure UBigInt.setBit(i: LongWord);
 begin
   var limb := SizeInt(i shr LIMB_SHIFT);
-  SetLength(fLimbs, MaxS(Length(fLimbs), limb + 1)); // also un-shares the array
-  fLimbs[limb] := fLimbs[limb] or (TLimb(1) shl (i and LIMB_MASK));
+  var l := fLimbs;
+  SetLength(l, MaxS(Length(l), limb + 1));
+  l[limb] := l[limb] or (TLimb(1) shl (i and LIMB_MASK));
+  fLimbs := l;
 end;
 
 procedure UBigInt.clearBit(i: LongWord);
 begin
   var limb := SizeInt(i shr LIMB_SHIFT);
-  if limb >= Length(fLimbs) then exit;
-  SetLength(fLimbs, Length(fLimbs));
-  fLimbs[limb] := fLimbs[limb] and not (TLimb(1) shl (i and LIMB_MASK));
-  LNorm(fLimbs);
+  if limb >= fLen then exit;
+  var l := fLimbs;
+  l[limb] := l[limb] and not (TLimb(1) shl (i and LIMB_MASK));
+  fLimbs := l; // the setter normalizes
 end;
 
 procedure UBigInt.flipBit(i: LongWord);
 begin
   var limb := SizeInt(i shr LIMB_SHIFT);
-  SetLength(fLimbs, MaxS(Length(fLimbs), limb + 1));
-  fLimbs[limb] := fLimbs[limb] xor (TLimb(1) shl (i and LIMB_MASK));
-  LNorm(fLimbs);
+  var l := fLimbs;
+  SetLength(l, MaxS(Length(l), limb + 1));
+  l[limb] := l[limb] xor (TLimb(1) shl (i and LIMB_MASK));
+  fLimbs := l;
 end;
 
 function UBigInt.complement(width: LongWord): UBigInt;
@@ -3099,7 +3661,7 @@ begin
   if width = 0 then exit(default(UBigInt));
   var n := SizeInt((QWord(width) + LIMB_MASK) shr LIMB_SHIFT);
   SetLength(res, n);
-  for var i := 0 to n - 1 do res[i] := if i < Length(fLimbs) then not fLimbs[i] else High(TLimb);
+  for var i := 0 to n - 1 do res[i] := if i < fLen then not fLimbs[i] else High(TLimb);
   // mask off bits above width
   var topBits := integer(width and LIMB_MASK);
   if topBits <> 0 then res[n - 1] := res[n - 1] and (High(TLimb) shr (LIMB_BITS - topBits));
@@ -3117,32 +3679,50 @@ begin
   if v then setBit(i) else clearBit(i);
 end;
 
-function UBigInt.compare(const other: UBigInt): integer;
+function UBigInt.compare(const other: UBigInt): integer; inline;
 begin
-  result := LCmp(fLimbs, other.fLimbs);
+  // both inline: compare the significant limbs top-down right on the record
+  if (fBlk = nil) and (other.fBlk = nil) then begin
+    if fLen <> other.fLen then exit(if fLen < other.fLen then -1 else 1);
+    for var i := fLen - 1 downto 0 do
+      if fInline[i] <> other.fInline[i] then exit(if fInline[i] < other.fInline[i] then -1 else 1);
+    exit(0);
+  end;
+  result := LCmpP(dataPtr, fLen, other.dataPtr, other.fLen);
 end;
 
 function UBigInt.equals(const other: UBigInt): boolean;
 begin
-  result := LCmp(fLimbs, other.fLimbs) = 0;
+  result := (fLen = other.fLen) and (LCmpP(dataPtr, fLen, other.dataPtr, other.fLen) = 0);
 end;
 
 function UBigInt.min(const other: UBigInt): UBigInt;
 begin
-  result := if LCmp(fLimbs, other.fLimbs) <= 0 then self else other;
+  result := if LCmpP(dataPtr, fLen, other.dataPtr, other.fLen) <= 0 then self else other;
 end;
 
 function UBigInt.max(const other: UBigInt): UBigInt;
 begin
-  result := if LCmp(fLimbs, other.fLimbs) >= 0 then self else other;
+  result := if LCmpP(dataPtr, fLen, other.dataPtr, other.fLen) >= 0 then self else other;
 end;
 
 function UBigInt.divMod(const d: UBigInt): (q, r: UBigInt);
 var
   qq, rr: UBigInt;
 begin
-  if Length(d.fLimbs) = 0 then RaiseDivByZero;
-  LDivMod(fLimbs, d.fLimbs, qq.fLimbs, rr.fLimbs);
+  if d.fLen = 0 then RaiseDivByZero;
+  if (fBlk = nil) and (d.fBlk = nil) then begin
+    var qb, rb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+    var ql, rl: SizeInt;
+    DivModInline(@fInline[0], fLen, @d.fInline[0], d.fLen, @qb[0], ql, @rb[0], rl);
+    PutInline(@qb[0], ql, @qq.fInline[0], qq.fBlk, qq.fLen);
+    PutInline(@rb[0], rl, @rr.fInline[0], rr.fBlk, rr.fLen);
+    exit(qq, rr);
+  end;
+  var qm, rm: TLimbs;
+  LDivMod(fLimbs, d.fLimbs, qm, rm);
+  qq.fLimbs := qm;
+  rr.fLimbs := rm;
   exit(qq, rr);
 end;
 
@@ -3154,7 +3734,9 @@ end;
 
 procedure UBigInt.swap(var other: UBigInt);
 begin
-  SwapValues(fLimbs, other.fLimbs);
+  var t := self;
+  self := other;
+  other := t;
 end;
 
 class function UBigInt.parse(const s: string): UBigInt;
@@ -3170,24 +3752,22 @@ end;
 class function UBigInt.tryParse(const s: string; out v: UBigInt): boolean;
 var
   neg: boolean;
+  lm: TLimbs;
 begin
-  result := TryParseLimbs(s, 0, v.fLimbs, neg);
-  if result and neg and (Length(v.fLimbs) <> 0) then begin
-    v.fLimbs := nil;
-    result := false;
-  end;
+  result := TryParseLimbs(s, 0, lm, neg);
+  if result and neg and (Length(lm) <> 0) then result := false
+  else v.fLimbs := lm;
 end;
 
 class function UBigInt.tryParse(const s: string; base: integer; out v: UBigInt): boolean;
 var
   neg: boolean;
+  lm: TLimbs;
 begin
   if (base < 2) or (base > 36) then raise EBigIntError.Create($'invalid base {base}, expected 2..36');
-  result := TryParseLimbs(s, base, v.fLimbs, neg);
-  if result and neg and (Length(v.fLimbs) <> 0) then begin
-    v.fLimbs := nil;
-    result := false;
-  end;
+  result := TryParseLimbs(s, base, lm, neg);
+  if result and neg and (Length(lm) <> 0) then result := false
+  else v.fLimbs := lm;
 end;
 
 // ---------------------------------------------------------------------------
@@ -3226,7 +3806,7 @@ end;
 
 function UBigInt.sqrt: UBigInt;
 begin
-  if Length(fLimbs) = 0 then exit(default(UBigInt));
+  if fLen = 0 then exit(default(UBigInt));
   // Newton iteration seeded above the root converges downward to floor(sqrt)
   var x := UBigInt.pow2((bitLength + 1) div 2);
   repeat
@@ -3240,7 +3820,7 @@ end;
 function UBigInt.nthRoot(n: LongWord): UBigInt;
 begin
   if n = 0 then raise EBigIntError.Create('zeroth root is undefined');
-  if (n = 1) or (Length(fLimbs) = 0) or isOne then exit(self);
+  if (n = 1) or (fLen = 0) or isOne then exit(self);
   var x := UBigInt.pow2((bitLength + n - 1) div n);
   repeat
     var y := ((n - 1) * x + self div x.pow(n - 1)) div n;
@@ -3290,12 +3870,16 @@ var
   q, rr, bred, baseM, acc, t, oneVec: TLimbs;
   table: array of TLimbs;
 begin
-  var n := Length(m.fLimbs);
-  var mInv := MontInv(m.fLimbs[0]);
+  var n := m.fLen;
+  // materialize the modulus and exponent limbs once; MontMul/LGetBits run in a
+  // loop and would otherwise rebuild these arrays on every step
+  var mLimbs := m.fLimbs;
+  var eLimbs := e.fLimbs;
+  var mInv := MontInv(mLimbs[0]);
   // base*R mod m, costs one shift and two divisions
-  LDivMod(base.fLimbs, m.fLimbs, q, rr);
+  LDivMod(base.fLimbs, mLimbs, q, rr);
   bred := LShl(rr, LongWord(n) * LIMB_BITS);
-  LDivMod(bred, m.fLimbs, q, baseM);
+  LDivMod(bred, mLimbs, q, baseM);
   SetLength(baseM, n);
   var ebits := e.bitLength;
   var k := if ebits >= 1024 then 6 else if ebits >= 256 then 5 else if ebits >= 64 then 4 else if ebits >= 16 then 3 else if ebits >= 4 then 2 else 1;
@@ -3304,20 +3888,20 @@ begin
   table[1] := baseM;
   for var j := 2 to (1 shl k) - 1 do begin
     SetLength(table[j], n);
-    MontMul(@table[j][0], @table[j - 1][0], @baseM[0], m.fLimbs, mInv, n, t);
+    MontMul(@table[j][0], @table[j - 1][0], @baseM[0], mLimbs, mInv, n, t);
   end;
   // scan the exponent top-down in k-bit digits: k squarings then one table mul
   var chunks := (SizeInt(ebits) + k - 1) div k;
-  acc := Copy(table[LGetBits(e.fLimbs, LongWord((chunks - 1) * k), k)]);
+  acc := Copy(table[LGetBits(eLimbs, LongWord((chunks - 1) * k), k)]);
   for var c := chunks - 2 downto 0 do begin
-    for var s := 1 to k do MontMul(@acc[0], @acc[0], @acc[0], m.fLimbs, mInv, n, t);
-    var d := LGetBits(e.fLimbs, LongWord(c * k), k);
-    if d <> 0 then MontMul(@acc[0], @acc[0], @table[d][0], m.fLimbs, mInv, n, t);
+    for var s := 1 to k do MontMul(@acc[0], @acc[0], @acc[0], mLimbs, mInv, n, t);
+    var d := LGetBits(eLimbs, LongWord(c * k), k);
+    if d <> 0 then MontMul(@acc[0], @acc[0], @table[d][0], mLimbs, mInv, n, t);
   end;
   // back out of Montgomery form via a multiply by plain 1
   SetLength(oneVec, n);
   oneVec[0] := 1;
-  MontMul(@acc[0], @acc[0], @oneVec[0], m.fLimbs, mInv, n, t);
+  MontMul(@acc[0], @acc[0], @oneVec[0], mLimbs, mInv, n, t);
   LNorm(acc);
   result.fLimbs := acc;
 end;
@@ -3360,6 +3944,13 @@ function LModW(const a: TLimbs; w: TLimb): TLimb;
 begin
   result := 0;
   for var i := Length(a) - 1 downto 0 do UDivLimb(result, a[i], w, result);
+end;
+
+// remainder modulo a single limb over (ptr, len), no array materialization
+function LModWP(p: PLimb; len: SizeInt; w: TLimb): TLimb; inline;
+begin
+  result := 0;
+  for var i := len - 1 downto 0 do UDivLimb(result, p[i], w, result);
 end;
 
 function GcdQWord(a, b: QWord): QWord;
@@ -4185,7 +4776,7 @@ function UBigInt.hashCode: DWord;
 begin
   // FNV-1a over 32-bit chunks, identical result for either limb width
   result := 2166136261;
-  for var i := 0 to Length(fLimbs) - 1 do begin
+  for var i := 0 to fLen - 1 do begin
     result := (result xor DWord(fLimbs[i])) * 16777619;
     {$if LIMB_BITS = 64}
     result := (result xor DWord(fLimbs[i] shr 32)) * 16777619;
@@ -4755,10 +5346,10 @@ end;
 function BFromI64(x: Int64): BigInt;
 begin
   if x >= 0 then begin
-    result.fLimbs := LFromQWord(QWord(x));
+    USetQWord(@result.fInline[0], result.fBlk, result.fLen, QWord(x));
     result.fNeg := false;
   end else begin
-    result.fLimbs := LFromQWord(NegAbs64(x));
+    USetQWord(@result.fInline[0], result.fBlk, result.fLen, NegAbs64(x));
     result.fNeg := true;
   end;
 end;
@@ -4811,17 +5402,17 @@ end;
 function BCmp(const a, b: BigInt): integer;
 begin
   if a.fNeg <> b.fNeg then exit(if a.fNeg then -1 else 1);
-  var c := LCmp(a.fLimbs, b.fLimbs);
+  var c := LCmpP(a.dataPtr, a.fLen, b.dataPtr, b.fLen);
   result := if a.fNeg then -c else c;
 end;
 
 function BCmpI64(const a: BigInt; v: Int64): integer;
 begin
-  var sa := if Length(a.fLimbs) = 0 then 0 else if a.fNeg then -1 else 1;
+  var sa := if a.fLen = 0 then 0 else if a.fNeg then -1 else 1;
   var sv := if v > 0 then 1 else if v < 0 then -1 else 0;
   if sa <> sv then exit(if sa < sv then -1 else 1);
   if sa = 0 then exit(0);
-  var c := LCmpQ(a.fLimbs, if v > 0 then QWord(v) else NegAbs64(v));
+  var c := LCmpQP(a.dataPtr, a.fLen, if v > 0 then QWord(v) else NegAbs64(v));
   result := if sa < 0 then -c else c;
 end;
 
@@ -4861,8 +5452,8 @@ function BBitOp(const a, b: BigInt; op: TBitOp): BigInt;
 var
   res: TLimbs;
 begin
-  var la := Length(a.fLimbs);
-  var lb := Length(b.fLimbs);
+  var la := a.fLen;
+  var lb := b.fLen;
   // one limb above both operands captures the sign extension
   var n := MaxS(la, lb) + 1;
   var lowA := LLowestNZ(a.fLimbs);
@@ -4898,12 +5489,18 @@ end;
 
 class operator BigInt.:=(x: Int64): BigInt;
 begin
-  result := BFromI64(x);
+  if x >= 0 then begin
+    USetQWord(@result.fInline[0], result.fBlk, result.fLen, QWord(x));
+    result.fNeg := false;
+  end else begin
+    USetQWord(@result.fInline[0], result.fBlk, result.fLen, NegAbs64(x));
+    result.fNeg := true;
+  end;
 end;
 
 class operator BigInt.:=(x: QWord): BigInt;
 begin
-  result.fLimbs := LFromQWord(x);
+  USetQWord(@result.fInline[0], result.fBlk, result.fLen, x);
   result.fNeg := false;
 end;
 
@@ -4914,7 +5511,7 @@ end;
 
 class operator BigInt.:=(const u: UBigInt): BigInt;
 begin
-  result.fLimbs := u.fLimbs;
+  ShareMag(@u.fInline[0], u.fBlk, u.fLen, @result.fInline[0], result.fBlk, result.fLen);
   result.fNeg := false;
 end;
 
@@ -4926,7 +5523,7 @@ begin
   if d < 0 then begin
     u := UBigInt(-d);
     result.fLimbs := u.fLimbs;
-    result.fNeg := Length(u.fLimbs) > 0;
+    result.fNeg := u.fLen > 0;
   end else begin
     u := UBigInt(d);
     result.fLimbs := u.fLimbs;
@@ -4980,13 +5577,29 @@ begin
   result := a.toUBigInt;
 end;
 
+// signed add/sub of two small BigInts into typed destination fields; bNeg is
+// b's effective sign (flipped for subtraction). false = not both inline
+function BSignedInline(const a, b: BigInt; bNeg: boolean; dst: PLimb; var rblk: PBigIntBlock; var rlen: SizeInt; out rneg: boolean): boolean;
+begin
+  if (a.fBlk <> nil) or (b.fBlk <> nil) then exit(false);
+  SAddInlineP(@a.fInline[0], a.fLen, a.fNeg, @b.fInline[0], b.fLen, bNeg, dst, rblk, rlen, rneg);
+  result := true;
+end;
+
 class operator BigInt.+(const a, b: BigInt): BigInt;
 begin
+  if BSignedInline(a, b, b.fNeg, @result.fInline[0], result.fBlk, result.fLen, result.fNeg) then exit;
   result := SAddPair(a.fLimbs, a.fNeg, b.fLimbs, b.fNeg);
 end;
 
 class operator BigInt.+(const a: BigInt; b: Int64): BigInt;
 begin
+  if a.fBlk = nil then begin
+    var bb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+    var bl := QToInline(if b >= 0 then QWord(b) else NegAbs64(b), @bb[0]);
+    SAddInlineP(@a.fInline[0], a.fLen, a.fNeg, @bb[0], bl, b < 0, @result.fInline[0], result.fBlk, result.fLen, result.fNeg);
+    exit;
+  end;
   result := SAddPair(a.fLimbs, a.fNeg, LFromQWord(if b >= 0 then QWord(b) else NegAbs64(b)), b < 0);
 end;
 
@@ -4997,26 +5610,51 @@ end;
 
 class operator BigInt.-(const a, b: BigInt): BigInt;
 begin
+  if BSignedInline(a, b, not b.fNeg, @result.fInline[0], result.fBlk, result.fLen, result.fNeg) then exit;
   result := SAddPair(a.fLimbs, a.fNeg, b.fLimbs, not b.fNeg);
 end;
 
 class operator BigInt.-(const a: BigInt; b: Int64): BigInt;
 begin
+  if a.fBlk = nil then begin
+    var bb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+    var bl := QToInline(if b >= 0 then QWord(b) else NegAbs64(b), @bb[0]);
+    SAddInlineP(@a.fInline[0], a.fLen, a.fNeg, @bb[0], bl, b >= 0, @result.fInline[0], result.fBlk, result.fLen, result.fNeg);
+    exit;
+  end;
   result := SAddPair(a.fLimbs, a.fNeg, LFromQWord(if b >= 0 then QWord(b) else NegAbs64(b)), b >= 0);
 end;
 
 class operator BigInt.-(a: Int64; const b: BigInt): BigInt;
 begin
+  if b.fBlk = nil then begin
+    var ab: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+    var al := QToInline(if a >= 0 then QWord(a) else NegAbs64(a), @ab[0]);
+    SAddInlineP(@ab[0], al, a < 0, @b.fInline[0], b.fLen, not b.fNeg, @result.fInline[0], result.fBlk, result.fLen, result.fNeg);
+    exit;
+  end;
   result := SAddPair(LFromQWord(if a >= 0 then QWord(a) else NegAbs64(a)), a < 0, b.fLimbs, not b.fNeg);
 end;
 
 class operator BigInt.*(const a, b: BigInt): BigInt;
 begin
+  if (a.fBlk = nil) and (b.fBlk = nil) then begin
+    MulInline(@a.fInline[0], a.fLen, @b.fInline[0], b.fLen, @result.fInline[0], result.fBlk, result.fLen);
+    result.fNeg := (a.fNeg xor b.fNeg) and (result.fLen > 0);
+    exit;
+  end;
   result := SMulPair(a.fLimbs, a.fNeg, b.fLimbs, b.fNeg);
 end;
 
 class operator BigInt.*(const a: BigInt; b: Int64): BigInt;
 begin
+  if a.fBlk = nil then begin
+    var bb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+    var bl := QToInline(if b >= 0 then QWord(b) else NegAbs64(b), @bb[0]);
+    MulInline(@a.fInline[0], a.fLen, @bb[0], bl, @result.fInline[0], result.fBlk, result.fLen);
+    result.fNeg := (a.fNeg xor (b < 0)) and (result.fLen > 0);
+    exit;
+  end;
   result := SMulPair(a.fLimbs, a.fNeg, LFromQWord(if b >= 0 then QWord(b) else NegAbs64(b)), b < 0);
 end;
 
@@ -5029,7 +5667,15 @@ class operator BigInt.div(const a, b: BigInt): BigInt;
 var
   q, r: BigInt;
 begin
-  if Length(b.fLimbs) = 0 then RaiseDivByZero;
+  if b.fLen = 0 then RaiseDivByZero;
+  if (a.fBlk = nil) and (b.fBlk = nil) then begin
+    var qb, rb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+    var ql, rl: SizeInt;
+    DivModInline(@a.fInline[0], a.fLen, @b.fInline[0], b.fLen, @qb[0], ql, @rb[0], rl);
+    PutInline(@qb[0], ql, @result.fInline[0], result.fBlk, result.fLen);
+    result.fNeg := (a.fNeg xor b.fNeg) and (result.fLen > 0);
+    exit;
+  end;
   SDivModPair(a.fLimbs, a.fNeg, b.fLimbs, b.fNeg, q, r);
   result := q;
 end;
@@ -5043,7 +5689,15 @@ class operator BigInt.mod(const a, b: BigInt): BigInt;
 var
   q, r: BigInt;
 begin
-  if Length(b.fLimbs) = 0 then RaiseDivByZero;
+  if b.fLen = 0 then RaiseDivByZero;
+  if (a.fBlk = nil) and (b.fBlk = nil) then begin
+    var qb, rb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+    var ql, rl: SizeInt;
+    DivModInline(@a.fInline[0], a.fLen, @b.fInline[0], b.fLen, @qb[0], ql, @rb[0], rl);
+    PutInline(@rb[0], rl, @result.fInline[0], result.fBlk, result.fLen);
+    result.fNeg := a.fNeg and (result.fLen > 0);
+    exit;
+  end;
   SDivModPair(a.fLimbs, a.fNeg, b.fLimbs, b.fNeg, q, r);
   result := r;
 end;
@@ -5063,12 +5717,12 @@ var
   m: TLimbs;
 begin
   if b.fNeg then raise EBigIntError.Create('negative exponent for integer power');
-  if Length(b.fLimbs) = 0 then begin
+  if b.fLen = 0 then begin
     result.fLimbs := LFromQWord(1);
     result.fNeg := false;
     exit;
   end;
-  if Length(a.fLimbs) = 0 then exit(default(BigInt));
+  if a.fLen = 0 then exit(default(BigInt));
   m := UPowQ(a.fLimbs, b.toUInt64);
   result.fLimbs := m;
   result.fNeg := a.fNeg and (b.fLimbs[0] and 1 = 1);
@@ -5084,7 +5738,7 @@ begin
     result.fNeg := false;
     exit;
   end;
-  if Length(a.fLimbs) = 0 then exit(default(BigInt));
+  if a.fLen = 0 then exit(default(BigInt));
   m := UPowQ(a.fLimbs, QWord(e));
   result.fLimbs := m;
   result.fNeg := a.fNeg and (e and 1 = 1);
@@ -5102,8 +5756,9 @@ end;
 
 class operator BigInt.-(const a: BigInt): BigInt;
 begin
-  result.fLimbs := a.fLimbs;
-  result.fNeg := (not a.fNeg) and (Length(a.fLimbs) > 0);
+  var neg := (not a.fNeg) and (a.fLen > 0);
+  ShareMag(@a.fInline[0], a.fBlk, a.fLen, @result.fInline[0], result.fBlk, result.fLen);
+  result.fNeg := neg;
 end;
 
 class operator BigInt.+(const a: BigInt): BigInt;
@@ -5116,7 +5771,7 @@ var
   m: TLimbs;
 begin
   if n < 0 then raise ERangeError.Create('negative shift count');
-  if Length(a.fLimbs) = 0 then exit(default(BigInt));
+  if a.fLen = 0 then exit(default(BigInt));
   if n > High(LongWord) then raise EBigIntError.Create('shift count out of range');
   m := LShl(a.fLimbs, LongWord(n));
   result.fLimbs := m;
@@ -5128,7 +5783,7 @@ var
   m: TLimbs;
 begin
   if n < 0 then raise ERangeError.Create('negative shift count');
-  if Length(a.fLimbs) = 0 then exit(default(BigInt));
+  if a.fLen = 0 then exit(default(BigInt));
   if not a.fNeg then begin
     if n > High(LongWord) then exit(default(BigInt));
     m := LShr(a.fLimbs, LongWord(n));
@@ -5305,7 +5960,7 @@ end;
 function BigInt.toUInt8: UInt8;
 begin
   if not fitsInUInt8 then raise ERangeError.Create('BigInt value does not fit in UInt8');
-  result := UInt8(LToQWord(fLimbs));
+  result := UInt8(LToQWordP(dataPtr, fLen));
 end;
 
 function BigInt.toInt16: Int16;
@@ -5317,7 +5972,7 @@ end;
 function BigInt.toUInt16: UInt16;
 begin
   if not fitsInUInt16 then raise ERangeError.Create('BigInt value does not fit in UInt16');
-  result := UInt16(LToQWord(fLimbs));
+  result := UInt16(LToQWordP(dataPtr, fLen));
 end;
 
 function BigInt.toInt32: Int32;
@@ -5329,20 +5984,20 @@ end;
 function BigInt.toUInt32: UInt32;
 begin
   if not fitsInUInt32 then raise ERangeError.Create('BigInt value does not fit in UInt32');
-  result := UInt32(LToQWord(fLimbs));
+  result := UInt32(LToQWordP(dataPtr, fLen));
 end;
 
 function BigInt.toInt64: Int64;
 begin
   if not fitsInInt64 then raise ERangeError.Create('BigInt value does not fit in Int64');
-  var q := LToQWord(fLimbs);
+  var q := LToQWordP(dataPtr, fLen);
   result := if fNeg then Int64((not q) + 1) else Int64(q);
 end;
 
 function BigInt.toUInt64: UInt64;
 begin
   if not fitsInUInt64 then raise ERangeError.Create('BigInt value does not fit in UInt64');
-  result := LToQWord(fLimbs);
+  result := LToQWordP(dataPtr, fLen);
 end;
 
 {$ifdef BIGINT_HAS_INT128}
@@ -5369,7 +6024,7 @@ end;
 function BigInt.toUBigInt: UBigInt;
 begin
   if fNeg then RaiseNegativeUnsigned;
-  result.fLimbs := fLimbs;
+  ShareMag(@fInline[0], fBlk, fLen, @result.fInline[0], result.fBlk, result.fLen);
 end;
 
 // bitLength is the minimal two's complement width minus the sign bit, so a
@@ -5428,22 +6083,22 @@ end;
 
 function BigInt.isZero: boolean;
 begin
-  result := Length(fLimbs) = 0;
+  result := fLen = 0;
 end;
 
 function BigInt.isOne: boolean;
 begin
-  result := (not fNeg) and (Length(fLimbs) = 1) and (fLimbs[0] = 1);
+  result := (not fNeg) and (fLen = 1) and (dataPtr[0] = 1);
 end;
 
 function BigInt.isEven: boolean;
 begin
-  result := (Length(fLimbs) = 0) or (fLimbs[0] and 1 = 0);
+  result := (fLen = 0) or (dataPtr[0] and 1 = 0);
 end;
 
 function BigInt.isOdd: boolean;
 begin
-  result := (Length(fLimbs) > 0) and (fLimbs[0] and 1 = 1);
+  result := (fLen > 0) and (dataPtr[0] and 1 = 1);
 end;
 
 function BigInt.isNegative: boolean;
@@ -5453,7 +6108,7 @@ end;
 
 function BigInt.isPositive: boolean;
 begin
-  result := (not fNeg) and (Length(fLimbs) > 0);
+  result := (not fNeg) and (fLen > 0);
 end;
 
 function BigInt.isPowerOfTwo: boolean;
@@ -5463,30 +6118,37 @@ end;
 
 function BigInt.sign: integer;
 begin
-  result := if Length(fLimbs) = 0 then 0 else if fNeg then -1 else 1;
+  result := if fLen = 0 then 0 else if fNeg then -1 else 1;
 end;
 
 function BigInt.abs: BigInt;
 begin
-  result.fLimbs := fLimbs;
+  ShareMag(@fInline[0], fBlk, fLen, @result.fInline[0], result.fBlk, result.fLen);
   result.fNeg := false;
 end;
 
 function BigInt.magnitude: UBigInt;
 begin
-  result.fLimbs := fLimbs;
+  ShareMag(@fInline[0], fBlk, fLen, @result.fInline[0], result.fBlk, result.fLen);
 end;
 
 procedure BigInt.negate;
 begin
-  if Length(fLimbs) > 0 then fNeg := not fNeg;
+  if fLen > 0 then fNeg := not fNeg;
 end;
 
 function BigInt.bitLength: LongWord;
 begin
-  result := LBitLen(fLimbs);
+  if fLen = 0 then exit(0);
+  var p := dataPtr;
+  var top := p[fLen - 1];
+  result := LongWord(fLen) * LIMB_BITS - (LIMB_BITS - 1 - LimbBsr(top));
   // for negatives the minimal two's complement form of -2^k needs one bit less
-  if fNeg and (LPopCount(fLimbs) = 1) then dec(result);
+  if fNeg and (top and (top - 1) = 0) then begin
+    var isPow2 := true;
+    for var i := 0 to fLen - 2 do if p[i] <> 0 then begin isPow2 := false; break; end;
+    if isPow2 then dec(result);
+  end;
 end;
 
 function BigInt.popCount: LongWord;
@@ -5498,8 +6160,9 @@ end;
 function BigInt.lowestSetBit: Int64;
 begin
   // two's complement negation keeps the lowest set bit in place
-  for var i := 0 to Length(fLimbs) - 1 do
-    if fLimbs[i] <> 0 then exit(Int64(i) * LIMB_BITS + LimbBsf(fLimbs[i]));
+  var p := dataPtr;
+  for var i := 0 to fLen - 1 do
+    if p[i] <> 0 then exit(Int64(i) * LIMB_BITS + LimbBsf(p[i]));
   result := -1;
 end;
 
@@ -5514,8 +6177,10 @@ procedure BigInt.setBit(i: LongWord);
 begin
   if not fNeg then begin
     var limb := SizeInt(i shr LIMB_SHIFT);
-    SetLength(fLimbs, MaxS(Length(fLimbs), limb + 1)); // also un-shares the array
-    fLimbs[limb] := fLimbs[limb] or (TLimb(1) shl (i and LIMB_MASK));
+    var l := fLimbs;
+    SetLength(l, MaxS(Length(l), limb + 1));
+    l[limb] := l[limb] or (TLimb(1) shl (i and LIMB_MASK));
+    fLimbs := l;
   end else self := self or (BigInt(1) shl i);
 end;
 
@@ -5523,10 +6188,10 @@ procedure BigInt.clearBit(i: LongWord);
 begin
   if not fNeg then begin
     var limb := SizeInt(i shr LIMB_SHIFT);
-    if limb >= Length(fLimbs) then exit;
-    SetLength(fLimbs, Length(fLimbs));
-    fLimbs[limb] := fLimbs[limb] and not (TLimb(1) shl (i and LIMB_MASK));
-    LNorm(fLimbs);
+    if limb >= fLen then exit;
+    var l := fLimbs;
+    l[limb] := l[limb] and not (TLimb(1) shl (i and LIMB_MASK));
+    fLimbs := l; // the setter normalizes
   end else self := self and not (BigInt(1) shl i);
 end;
 
@@ -5534,9 +6199,10 @@ procedure BigInt.flipBit(i: LongWord);
 begin
   if not fNeg then begin
     var limb := SizeInt(i shr LIMB_SHIFT);
-    SetLength(fLimbs, MaxS(Length(fLimbs), limb + 1));
-    fLimbs[limb] := fLimbs[limb] xor (TLimb(1) shl (i and LIMB_MASK));
-    LNorm(fLimbs);
+    var l := fLimbs;
+    SetLength(l, MaxS(Length(l), limb + 1));
+    l[limb] := l[limb] xor (TLimb(1) shl (i and LIMB_MASK));
+    fLimbs := l;
   end else self := self xor (BigInt(1) shl i);
 end;
 
@@ -5574,7 +6240,17 @@ function BigInt.divMod(const d: BigInt): (q, r: BigInt);
 var
   qq, rr: BigInt;
 begin
-  if Length(d.fLimbs) = 0 then RaiseDivByZero;
+  if d.fLen = 0 then RaiseDivByZero;
+  if (fBlk = nil) and (d.fBlk = nil) then begin
+    var qb, rb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+    var ql, rl: SizeInt;
+    DivModInline(@fInline[0], fLen, @d.fInline[0], d.fLen, @qb[0], ql, @rb[0], rl);
+    PutInline(@qb[0], ql, @qq.fInline[0], qq.fBlk, qq.fLen);
+    qq.fNeg := (fNeg xor d.fNeg) and (qq.fLen > 0);
+    PutInline(@rb[0], rl, @rr.fInline[0], rr.fBlk, rr.fLen);
+    rr.fNeg := fNeg and (rr.fLen > 0);
+    exit(qq, rr);
+  end;
   SDivModPair(fLimbs, fNeg, d.fLimbs, d.fNeg, qq, rr);
   exit(qq, rr);
 end;
@@ -5599,8 +6275,9 @@ end;
 
 procedure BigInt.swap(var other: BigInt);
 begin
-  SwapValues(fLimbs, other.fLimbs);
-  SwapValues(fNeg, other.fNeg);
+  var t := self;
+  self := other;
+  other := t;
 end;
 
 class function BigInt.parse(const s: string): BigInt;
@@ -5616,23 +6293,27 @@ end;
 class function BigInt.tryParse(const s: string; out v: BigInt): boolean;
 var
   neg: boolean;
+  lm: TLimbs;
 begin
-  result := TryParseLimbs(s, 0, v.fLimbs, neg);
-  v.fNeg := result and neg and (Length(v.fLimbs) <> 0);
+  result := TryParseLimbs(s, 0, lm, neg);
+  v.fLimbs := lm;
+  v.fNeg := result and neg and (Length(lm) <> 0);
 end;
 
 class function BigInt.tryParse(const s: string; base: integer; out v: BigInt): boolean;
 var
   neg: boolean;
+  lm: TLimbs;
 begin
   if (base < 2) or (base > 36) then raise EBigIntError.Create($'invalid base {base}, expected 2..36');
-  result := TryParseLimbs(s, base, v.fLimbs, neg);
-  v.fNeg := result and neg and (Length(v.fLimbs) <> 0);
+  result := TryParseLimbs(s, base, lm, neg);
+  v.fLimbs := lm;
+  v.fNeg := result and neg and (Length(lm) <> 0);
 end;
 
 function TUBigIntBridge.toBigInt: BigInt;
 begin
-  result.fLimbs := fLimbs;
+  ShareMag(@fInline[0], fBlk, fLen, @result.fInline[0], result.fBlk, result.fLen);
   result.fNeg := false;
 end;
 
@@ -5668,7 +6349,7 @@ end;
 function BigInt.pow(e: LongWord): BigInt;
 begin
   result.fLimbs := UPowQ(fLimbs, e);
-  result.fNeg := fNeg and (e and 1 = 1) and (Length(result.fLimbs) > 0);
+  result.fNeg := fNeg and (e and 1 = 1) and (result.fLen > 0);
 end;
 
 function BigInt.modPow(const e, m: BigInt): BigInt;
@@ -5708,7 +6389,7 @@ end;
 
 function BigInt.nextPrime: BigInt;
 begin
-  if fNeg or (Length(fLimbs) = 0) then exit(BigInt(2));
+  if fNeg or (fLen = 0) then exit(BigInt(2));
   result := magnitude.nextPrime.toBigInt;
 end;
 
@@ -6378,17 +7059,30 @@ begin
   result := integer(e);
 end;
 
+// canonicalize a value whose mantissa is already in place: range-check the
+// exponent and strip trailing decimal zeros unless a guard digit keeps them
+procedure DecFinish(var d: BigDecimal; e: Int64; hidden: boolean);
+begin
+  d.fHidden := hidden and (d.fMan.fLen > 0);
+  if d.fMan.fLen = 0 then begin
+    d.fExp := 0;
+    exit;
+  end;
+  // only materialize and strip when the mantissa actually ends in a decimal
+  // zero; most results do not, so this skips an allocation on the hot path
+  if not d.fHidden and (LModWP(d.fMan.dataPtr, d.fMan.fLen, 10) = 0) then begin
+    var sm := d.fMan.fLimbs;
+    LStrip10(sm, e);
+    d.fMan.fLimbs := sm;
+  end;
+  d.fExp := DecExp(e);
+end;
+
 // assemble a value: canonical (no trailing zeros) unless it keeps a guard digit
 function DecMake(const m: BigInt; e: Int64; hidden: boolean): BigDecimal;
 begin
   result.fMan := m;
-  result.fHidden := hidden and (Length(m.fLimbs) > 0);
-  if Length(m.fLimbs) = 0 then begin
-    result.fExp := 0;
-    exit;
-  end;
-  if not result.fHidden then LStrip10(result.fMan.fLimbs, e);
-  result.fExp := DecExp(e);
+  DecFinish(result, e, hidden);
 end;
 
 // stored value as a canonical mantissa/exponent pair (guard digit kept,
@@ -6429,6 +7123,11 @@ begin
   var sb := b.fMan.sign;
   if sa <> sb then exit(if sa < sb then -1 else 1);
   if sa = 0 then exit(0);
+  // same scale and small mantissas: compare right on the records
+  if (a.fExp = b.fExp) and (a.fMan.fBlk = nil) and (b.fMan.fBlk = nil) then begin
+    var c := LCmpP(@a.fMan.fInline[0], a.fMan.fLen, @b.fMan.fInline[0], b.fMan.fLen);
+    exit(if sa < 0 then -c else c);
+  end;
   // disjoint leading-digit positions decide without aligning
   var loA, hiA, loB, hiB: Int64;
   DecMagBounds(a.fMan.fLimbs, a.fExp, loA, hiA);
@@ -6446,14 +7145,51 @@ end;
 
 function DecAddSub(const a, b: BigDecimal; negateB: boolean): BigDecimal;
 begin
-  if Length(b.fMan.fLimbs) = 0 then exit(a);
-  if Length(a.fMan.fLimbs) = 0 then begin
+  if b.fMan.fLen = 0 then exit(a);
+  if a.fMan.fLen = 0 then begin
     result := b;
     if negateB then result.fMan := -result.fMan;
     exit;
   end;
   // equal scale: no alignment multiply, add the mantissas as they are
-  if a.fExp = b.fExp then exit(DecMake(SAddPair(a.fMan.fLimbs, a.fMan.fNeg, b.fMan.fLimbs, b.fMan.fNeg xor negateB), Int64(a.fExp), a.fHidden or b.fHidden));
+  if a.fExp = b.fExp then begin
+    // small mantissas: signed add straight into the result record
+    if (a.fMan.fBlk = nil) and (b.fMan.fBlk = nil) then begin
+      SAddInlineP(@a.fMan.fInline[0], a.fMan.fLen, a.fMan.fNeg, @b.fMan.fInline[0], b.fMan.fLen, b.fMan.fNeg xor negateB, @result.fMan.fInline[0], result.fMan.fBlk, result.fMan.fLen, result.fMan.fNeg);
+      DecFinish(result, Int64(a.fExp), a.fHidden or b.fHidden);
+      exit;
+    end;
+    exit(DecMake(if negateB then a.fMan - b.fMan else a.fMan + b.fMan, Int64(a.fExp), a.fHidden or b.fHidden));
+  end;
+  // small mantissas over a modest gap: scale the higher-exponent one by a
+  // single-limb power of ten on the stack, then add inline with no allocation
+  if (a.fMan.fBlk = nil) and (b.fMan.fBlk = nil) then begin
+    var d := Int64(a.fExp) - b.fExp;
+    var k := if d > 0 then d else -d;
+    if k <= DEC_CHUNK_POW then begin
+      var hp: PLimb;
+      var hlen: SizeInt;
+      if d > 0 then begin
+        hp := @a.fMan.fInline[0];
+        hlen := a.fMan.fLen;
+      end else begin
+        hp := @b.fMan.fInline[0];
+        hlen := b.fMan.fLen;
+      end;
+      var sb: array[0..BIGINT_INLINE_LIMBS] of TLimb;
+      for var i := 0 to BIGINT_INLINE_LIMBS do sb[i] := 0;
+      sb[hlen] := MpnMul1(@sb[0], hp, hlen, TLimb(POW10Q[k]));
+      var slen: SizeInt := hlen + 1;
+      while (slen > 0) and (sb[slen - 1] = 0) do dec(slen);
+      if slen <= BIGINT_INLINE_LIMBS then begin
+        var ee := if d > 0 then Int64(b.fExp) else Int64(a.fExp);
+        if d > 0 then SAddInlineP(@sb[0], slen, a.fMan.fNeg, @b.fMan.fInline[0], b.fMan.fLen, b.fMan.fNeg xor negateB, @result.fMan.fInline[0], result.fMan.fBlk, result.fMan.fLen, result.fMan.fNeg)
+        else SAddInlineP(@a.fMan.fInline[0], a.fMan.fLen, a.fMan.fNeg, @sb[0], slen, b.fMan.fNeg xor negateB, @result.fMan.fInline[0], result.fMan.fBlk, result.fMan.fLen, result.fMan.fNeg);
+        DecFinish(result, ee, a.fHidden or b.fHidden);
+        exit;
+      end;
+    end;
+  end;
   // align both mantissas to the smaller exponent
   var e := if Int64(a.fExp) < b.fExp then Int64(a.fExp) else Int64(b.fExp);
   var am := LScale10(a.fMan.fLimbs, Int64(a.fExp) - e);
@@ -6547,6 +7283,13 @@ end;
 
 class operator BigDecimal.*(const a, b: BigDecimal): BigDecimal;
 begin
+  // small mantissas: multiply straight into the result record
+  if (a.fMan.fBlk = nil) and (b.fMan.fBlk = nil) then begin
+    MulInline(@a.fMan.fInline[0], a.fMan.fLen, @b.fMan.fInline[0], b.fMan.fLen, @result.fMan.fInline[0], result.fMan.fBlk, result.fMan.fLen);
+    result.fMan.fNeg := (a.fMan.fNeg xor b.fMan.fNeg) and (result.fMan.fLen > 0);
+    DecFinish(result, Int64(a.fExp) + b.fExp, a.fHidden or b.fHidden);
+    exit;
+  end;
   result := DecMake(SMulPair(a.fMan.fLimbs, a.fMan.fNeg, b.fMan.fLimbs, b.fMan.fNeg), Int64(a.fExp) + b.fExp, a.fHidden or b.fHidden);
 end;
 
@@ -6786,7 +7529,7 @@ end;
 
 function BigDecimal.isZero: boolean;
 begin
-  result := Length(fMan.fLimbs) = 0;
+  result := fMan.fLen = 0;
 end;
 
 function BigDecimal.isOne: boolean;
@@ -6974,7 +7717,7 @@ begin
   end;
   var m: BigInt;
   m.fLimbs := if up then LAdd(qm, LFromQWord(1)) else qm;
-  m.fNeg := neg and (Length(m.fLimbs) > 0);
+  m.fNeg := neg and (m.fLen > 0);
   result := DecMake(m, toDigit, false);
 end;
 
@@ -7128,10 +7871,12 @@ begin
     SetLength(digits, count);
     m.fLimbs := LFromDigits(digits, 10);
   end;
-  m.fNeg := neg and (Length(m.fLimbs) > 0);
+  m.fNeg := neg and (m.fLen > 0);
   var e := expPart - fracDigits;
-  LStrip10(m.fLimbs, e);
-  if Length(m.fLimbs) = 0 then e := 0;
+  var sm := m.fLimbs;
+  LStrip10(sm, e);
+  m.fLimbs := sm;
+  if m.fLen = 0 then e := 0;
   if (e > High(integer)) or (e < Low(integer)) then exit;
   v.fMan := m;
   v.fExp := integer(e);
@@ -7375,7 +8120,7 @@ end;
 // exponent range; ties to even, overflow gives infinity, underflow zero
 function DecToFloat(const a: BigDecimal; p, emin, emax: integer): Extended;
 begin
-  if Length(a.fMan.fLimbs) = 0 then exit(0.0);
+  if a.fMan.fLen = 0 then exit(0.0);
   var sgn: Extended := if a.fMan.fNeg then -1.0 else 1.0;
   var lo, hi: Int64;
   DecMagBounds(a.fMan.fLimbs, a.fExp, lo, hi);
@@ -7577,14 +8322,14 @@ begin
     LDivMod(a.fMan.fLimbs, UPow10(LongWord(-t)).fLimbs, q, r);
     result.fLimbs := q;
   end;
-  result.fNeg := a.fMan.fNeg and (Length(result.fLimbs) > 0);
+  result.fNeg := a.fMan.fNeg and (result.fLen > 0);
 end;
 
 // wrap a scaled result: v * 10^-w cut to p fractional digits (or p
 // significant digits for small values) plus the hidden guard digit
 function DecFromScaled(const v: BigInt; w: Int64; p: integer): BigDecimal;
 begin
-  if Length(v.fLimbs) = 0 then exit(default(BigDecimal));
+  if v.fLen = 0 then exit(default(BigDecimal));
   // exponent of the leading digit, bounded from below
   var msdLo := (Int64(LBitLen(v.fLimbs)) - 1) * 1233 div 4096 - w;
   var er := -Int64(p) - 1;
@@ -7596,14 +8341,14 @@ begin
     LDivMod(v.fLimbs, UPow10(LongWord(w + er)).fLimbs, q, r);
     m.fLimbs := q;
   end else m.fLimbs := v.fLimbs;
-  m.fNeg := v.fNeg and (Length(m.fLimbs) > 0);
+  m.fNeg := v.fNeg and (m.fLen > 0);
   result := DecMake(m, er, true);
 end;
 
 // cut an already computed value down to `p` fractional digits the same way
 function DecGuardCut(const a: BigDecimal; p: integer): BigDecimal;
 begin
-  if (Length(a.fMan.fLimbs) = 0) or (a.fExp >= 0) then exit(a);
+  if (a.fMan.fLen = 0) or (a.fExp >= 0) then exit(a);
   result := DecFromScaled(a.fMan, -Int64(a.fExp), p);
 end;
 
@@ -7687,7 +8432,7 @@ end;
 function ExpScaled(const X: BigInt; w: Int64): UBigInt;
 begin
   var p10 := UPow10(LongWord(w));
-  if Length(X.fLimbs) = 0 then exit(p10);
+  if X.fLen = 0 then exit(p10);
   var xu: UBigInt;
   xu.fLimbs := X.fLimbs;
   var k := Int64(LBitLen(X.fLimbs)) + 2 - LBitLen(p10.fLimbs);
@@ -7804,7 +8549,7 @@ begin
   until false;
   var r: BigInt;
   r.fLimbs := (s shl 7).fLimbs;
-  r.fNeg := zneg and (Length(r.fLimbs) > 0);
+  r.fNeg := zneg and (r.fLen > 0);
   if j2 <> 0 then r := r + BigInt(Int64(j2)) * Ln2Scaled(w).toBigInt;
   if f <> 0 then r := r + BigInt(f) * Ln10Scaled(w).toBigInt;
   result := DecFromScaled(r, w, p);
@@ -7835,7 +8580,7 @@ begin
   var lnr := DecToScaled(ln(p + 12), w);
   var q: BigInt;
   q.fLimbs := (lnr.magnitude * UPow10(LongWord(w)) div Ln2Scaled(w)).fLimbs;
-  q.fNeg := lnr.fNeg and (Length(q.fLimbs) > 0);
+  q.fNeg := lnr.fNeg and (q.fLen > 0);
   result := DecFromScaled(q, w, p);
 end;
 
@@ -7856,7 +8601,7 @@ begin
   var lnr := DecToScaled(ln(p + 12), w);
   var q: BigInt;
   q.fLimbs := (lnr.magnitude * UPow10(LongWord(w)) div Ln10Scaled(w)).fLimbs;
-  q.fNeg := lnr.fNeg and (Length(q.fLimbs) > 0);
+  q.fNeg := lnr.fNeg and (q.fLen > 0);
   result := DecFromScaled(q, w, p);
 end;
 
@@ -7914,7 +8659,7 @@ begin
   if exact then exact := root.pow(n) = nu;
   var m: BigInt;
   m.fLimbs := root.fLimbs;
-  m.fNeg := fMan.fNeg and (Length(root.fLimbs) > 0);
+  m.fNeg := fMan.fNeg and (root.fLen > 0);
   result := DecMake(m, -p1, not exact);
 end;
 
@@ -7939,7 +8684,7 @@ begin
   var rb := xu.toBigInt - (q * ph).toBigInt;
   quad := integer(LModW(q.fLimbs, 4));
   r.fLimbs := UScaleDown(rb.magnitude, wred - w).fLimbs;
-  r.fNeg := rb.fNeg and (Length(r.fLimbs) > 0);
+  r.fNeg := rb.fNeg and (r.fLen > 0);
 end;
 
 // sine and cosine of r = R/10^w for |r| below 0.8, both scaled by 10^w
@@ -7961,7 +8706,7 @@ begin
     sub := not sub;
   until false;
   sinS.fLimbs := s.fLimbs;
-  sinS.fNeg := r.fNeg and (Length(s.fLimbs) > 0);
+  sinS.fNeg := r.fNeg and (s.fLen > 0);
   var c := p10;
   t := p10;
   j := 0;
@@ -8034,7 +8779,7 @@ begin
     2: v := -ss;
     else begin
       v.fLimbs := cc.fLimbs;
-      v.fNeg := Length(cc.fLimbs) > 0;
+      v.fNeg := cc.fLen > 0;
     end;
   end;
   if fMan.fNeg then v := -v;
@@ -8061,7 +8806,7 @@ begin
     1: v := -ss;
     2: begin
       v.fLimbs := cc.fLimbs;
-      v.fNeg := Length(cc.fLimbs) > 0;
+      v.fNeg := cc.fLen > 0;
     end;
     else v := ss;
   end;
@@ -8087,12 +8832,12 @@ begin
   if quad and 1 = 0 then begin
     // tan r: the cosine of a reduced argument never vanishes
     v.fLimbs := (ss.magnitude * p10 div cc).fLimbs;
-    v.fNeg := ss.fNeg and (Length(v.fLimbs) > 0);
+    v.fNeg := ss.fNeg and (v.fLen > 0);
   end else begin
     // tan(pi/2 + r) = -cos r / sin r
     if ss.isZero then raise EBigIntError.Create('tangent pole');
     v.fLimbs := (cc * p10 div ss.magnitude).fLimbs;
-    v.fNeg := not ss.fNeg and (Length(v.fLimbs) > 0);
+    v.fNeg := not ss.fNeg and (v.fLen > 0);
   end;
   if fMan.fNeg then v := -v;
   result := DecFromScaled(v, w, p);
@@ -8186,7 +8931,7 @@ begin
     until false;
     var v: BigInt;
     v.fLimbs := s.fLimbs;
-    v.fNeg := fMan.fNeg and (Length(s.fLimbs) > 0);
+    v.fNeg := fMan.fNeg and (s.fLen > 0);
     exit(DecFromScaled(v, w, p));
   end;
   // (e^x - e^-x) / 2
@@ -8250,7 +8995,7 @@ begin
       s := s + t;
     until false;
     v.fLimbs := (s * p10 div (p10 * p10 + s.sqr).sqrt).fLimbs;
-    v.fNeg := fMan.fNeg and (Length(v.fLimbs) > 0);
+    v.fNeg := fMan.fNeg and (v.fLen > 0);
     exit(DecFromScaled(v, w, p));
   end;
   // (1 - u) / (1 + u) with u = e^(-2|x|); past the working scale u is zero
@@ -8298,7 +9043,7 @@ begin
   DecCanon(self, m, e);
   if e >= 0 then begin
     nn.fLimbs := LScale10(m, e);
-    nn.fNeg := fMan.fNeg and (Length(nn.fLimbs) > 0);
+    nn.fNeg := fMan.fNeg and (nn.fLen > 0);
     dd := 1;
   end else begin
     // the canonical mantissa shares only twos and fives with 10^-e
@@ -8973,7 +9718,7 @@ begin
   // trim the working digits back to `precision` plus the usual hidden guard
   if Int64(result.fExp) < -(Int64(p) + 1) then begin
     result := result.rounded(-(p + 1), bdrTrunc);
-    result.fHidden := (result.fExp = -(p + 1)) and (Length(result.fMan.fLimbs) > 0);
+    result.fHidden := (result.fExp = -(p + 1)) and (result.fMan.fLen > 0);
   end;
 end;
 

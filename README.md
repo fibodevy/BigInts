@@ -348,12 +348,12 @@ Every function maps to the method of the same name at the working precision, so 
 - `shr` on a negative `BigInt` is an arithmetic shift (rounds toward minus infinity); `shl` keeps the sign.
 - Bitwise ops on negative `BigInt` values use two's complement with infinite sign extension; `not x = -x-1`.
 - Formatting of negatives is sign-magnitude in every base: `-255` prints as `-FF` in hex.
-- Values are copy-on-write: assignment shares storage and is cheap, mutating methods un-share first, so no variable ever changes behind another one's back.
+- Values are cheap to copy: small values (up to 256 bits) sit inline in the value, larger ones share a refcounted block that mutating methods un-share first, so no variable ever changes behind another one's back.
 - `0 ** 0 = 1`, division by zero raises `EDivByZero`, conversions that do not fit raise `ERangeError`, parse errors raise `EConvertError`, domain errors (negative exponent, no inverse, non-residue) raise `EBigIntError`.
 
 ## Performance
 
-64-bit limbs with assembler inner loops on x86_64 (mul/adc row primitives, plus a mulx/adcx/adox `addmul_1` picked at runtime when the CPU has ADX); portable 32-bit Pascal limbs everywhere else. The assembler sits behind a `USEASM` define at the top of the unit - comment it out for a fully portable pure Pascal build (roughly 4-8x slower on x64 in the core operations). Knuth algorithm D division, Karatsuba then Toom-3 multiplication and squaring above tunable thresholds (`BigIntKaratsubaThreshold`, `BigIntToom3Threshold`), Montgomery modPow with a windowed exponent, divide-and-conquer base conversion, Lehmer gcd, exact-size result buffers built directly on the heap in the hot paths. On a desktop x64: `factorial(50000)` in ~12 ms, `fibonacci(1000000)` in ~10 ms.
+64-bit limbs with assembler inner loops on x86_64 (mul/adc row primitives, plus a mulx/adcx/adox `addmul_1` picked at runtime when the CPU has ADX); portable 32-bit Pascal limbs everywhere else. The assembler sits behind a `USEASM` define at the top of the unit - comment it out for a fully portable pure Pascal build (roughly 4-8x slower on x64 in the core operations). Knuth algorithm D division, Karatsuba then Toom-3 multiplication and squaring above tunable thresholds (`BigIntKaratsubaThreshold`, `BigIntToom3Threshold`), Montgomery modPow with a windowed exponent, divide-and-conquer base conversion, Lehmer gcd. Values up to 256 bits (`BIGINT_INLINE_LIMBS` limbs) live inline in the value with no heap allocation; larger results build exact-size heap buffers directly in the hot paths. On a desktop x64: `factorial(50000)` in ~12 ms, `fibonacci(1000000)` in ~10 ms.
 
 ### Benchmarks vs GMP
 
@@ -386,7 +386,7 @@ Measured against GMP 6.3.0 (the 64-bit-limb `libgmp-10.dll` that ships with Git 
 | gcd 1024b | 10.7 us | 2.50 us | 4.3x |
 | gcd 16384b | 434 us | 115 us | 3.8x |
 
-Bulk arithmetic lands at 1.3-4.5x of GMP. The remaining gap is GMP's hand-scheduled assembly, its higher Toom orders and FFT on huge operands, and sub-quadratic gcd and division that this unit does not implement. Tiny one/two-limb values compare at ~6-7x because a 40-50 ns operation is mostly allocation on the BigInts side; in absolute terms it is still tens of nanoseconds.
+Bulk arithmetic lands at 1.3-4.5x of GMP. The remaining gap is GMP's hand-scheduled assembly, its higher Toom orders and FFT on huge operands, and sub-quadratic gcd and division that this unit does not implement. Small values up to 256 bits are now held inline with no allocation, so a one/two-limb add or multiply runs in ~30 ns rather than the ~40-50 ns of the 128b rows above (measured before the inline optimization), which narrows the small-size gap to GMP.
 
 ## Examples
 
