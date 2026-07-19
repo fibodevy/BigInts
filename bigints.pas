@@ -69,25 +69,19 @@ const
   {$endif}
 
 type
-  // heap backing for values that do not fit inline: a reference count and a
-  // limb capacity, followed immediately by the limbs
-  PBigIntBlock = ^TBigIntBlock;
-  TBigIntBlock = record
-    refs: PtrInt;
-    cap: SizeInt;
-  end;
-
   { UBigInt - unsigned arbitrary precision integer }
 
   UBigInt = record
   private
     // small-value optimization: up to BIGINT_INLINE_LIMBS limbs sit inline
-    // with no allocation, larger values spill into fBlk; fLen is the
-    // significant limb count (0 = zero, highest limb nonzero). fLimbs is a
-    // property that materializes/stores a TBigIntLimbs, so the whole library
-    // keeps working on limb arrays while small values never touch the heap
+    // with no allocation, larger values spill into the fArr limb array (nil =
+    // value lives inline); fLen is the significant limb count (0 = zero,
+    // highest limb nonzero). fLimbs is a property view over either storage:
+    // for spilled values it shares fArr with no copy, so large-value paths
+    // cost the same as a plain limb-array field, while small values never
+    // touch the heap. fArr is compiler-managed (refcounted dynarray)
     fInline: array[0..BIGINT_INLINE_LIMBS - 1] of TBigIntLimb;
-    fBlk: PBigIntBlock;
+    fArr: TBigIntLimbs;
     fLen: SizeInt;
     function dataPtr: PBigIntLimb; inline;
     function getLimbs: TBigIntLimbs;
@@ -96,10 +90,9 @@ type
     procedure putBitProp(i: LongWord; v: boolean); inline;
     property fLimbs: TBigIntLimbs read getLimbs write setLimbs;
   public
+    // fArr is a managed field, so copy/addref/finalize are compiler-default;
+    // Initialize only zeroes the plain fields the compiler would leave alone
     class operator Initialize(var x: UBigInt);
-    class operator Finalize(var x: UBigInt);
-    class operator AddRef(var x: UBigInt);
-    class operator Copy(constref src: UBigInt; var dst: UBigInt);
     // conversions in (negative values raise ERangeError)
     class operator :=(x: Int64): UBigInt;
     class operator :=(x: QWord): UBigInt;
@@ -321,7 +314,7 @@ type
   private
     // same inline storage as UBigInt (see there), plus a sign flag
     fInline: array[0..BIGINT_INLINE_LIMBS - 1] of TBigIntLimb;
-    fBlk: PBigIntBlock;
+    fArr: TBigIntLimbs;
     fLen: SizeInt;
     fNeg: boolean;
     function dataPtr: PBigIntLimb; inline;
@@ -332,9 +325,6 @@ type
     property fLimbs: TBigIntLimbs read getLimbs write setLimbs;
   public
     class operator Initialize(var x: BigInt);
-    class operator Finalize(var x: BigInt);
-    class operator AddRef(var x: BigInt);
-    class operator Copy(constref src: BigInt; var dst: BigInt);
     // conversions in
     class operator :=(x: Int64): BigInt;
     class operator :=(x: QWord): BigInt;
@@ -1422,39 +1412,17 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
-// small-value optimization storage (inline limbs + refcounted spill block)
+// small-value optimization storage (inline limbs + spill limb array)
 // ---------------------------------------------------------------------------
 
-const
-  BIGINT_BLK_HDR = SizeOf(TBigIntBlock);
-
-// limbs of a spill block start right after its header
-function BlkData(b: PBigIntBlock): PLimb; inline;
+// read pointer to the limbs (inline array or spill array) without allocating.
+// pinl is the address of the record's inline array, parr the raw fArr pointer.
+// all storage helpers take typed PLimb rather than untyped var params: an
+// untyped var passed to an inline routine and dereferenced via @ miscompiles
+// on this toolchain
+function ViewPtr(pinl: PLimb; parr: Pointer): PLimb; inline;
 begin
-  result := PLimb(PByte(b) + BIGINT_BLK_HDR);
-end;
-
-function AllocBlk(cap: SizeInt): PBigIntBlock;
-begin
-  result := PBigIntBlock(GetMem(BIGINT_BLK_HDR + cap * SizeOf(TLimb)));
-  result^.refs := 1;
-  result^.cap := cap;
-end;
-
-procedure ReleaseBlk(b: PBigIntBlock); inline;
-begin
-  if b = nil then exit;
-  dec(b^.refs);
-  if b^.refs = 0 then FreeMem(b);
-end;
-
-// read pointer to the limbs (inline array or spill block) without allocating.
-// pinl is the address of the record's inline array. all storage helpers take
-// typed PLimb rather than untyped var params: an untyped var passed to an
-// inline routine and dereferenced via @ miscompiles on this toolchain
-function ViewPtr(pinl: PLimb; blk: PBigIntBlock): PLimb; inline;
-begin
-  result := if blk <> nil then BlkData(blk) else pinl;
+  result := if parr <> nil then PLimb(parr) else pinl;
 end;
 
 function MakeLimbs(p: PLimb; len: SizeInt): TLimbs; inline;
@@ -1465,112 +1433,77 @@ begin
   Move(p^, result[0], len * SizeOf(TLimb));
 end;
 
-// store a limb array into inline-or-block storage, normalizing the length;
-// releases any previous block. dst is the record's inline array. v never
-// aliases the block (callers pass a freshly materialized array)
-procedure StoreLimbs(const v: TLimbs; dst: PLimb; var blk: PBigIntBlock; var len: SizeInt);
+// store a limb array into inline-or-spill storage, normalizing the length.
+// dst is the record's inline array. normalized arrays are adopted by
+// reference (no copy); an unnormalized tail forces a trimming copy so the
+// invariant fLen = Length(fArr) holds for spilled values
+procedure StoreLimbs(const v: TLimbs; dst: PLimb; var arr: TLimbs; var len: SizeInt);
 begin
   var n := Length(v);
   while (n > 0) and (v[n - 1] = 0) do dec(n);
-  ReleaseBlk(blk);
-  blk := nil;
   len := n;
-  // inline invariant: limbs above len are zero, so fast paths read branchlessly
-  FillChar(dst^, BIGINT_INLINE_LIMBS * SizeOf(TLimb), 0);
-  if n = 0 then exit;
-  if n <= BIGINT_INLINE_LIMBS then Move(v[0], dst^, n * SizeOf(TLimb))
-  else begin
-    blk := AllocBlk(n);
-    Move(v[0], BlkData(blk)^, n * SizeOf(TLimb));
-  end;
+  if n <= BIGINT_INLINE_LIMBS then begin
+    // inline invariant: limbs above len are zero, so fast paths read branchlessly
+    FillChar(dst^, BIGINT_INLINE_LIMBS * SizeOf(TLimb), 0);
+    if n > 0 then Move(v[0], dst^, n * SizeOf(TLimb));
+    arr := nil;
+  end else if n = Length(v) then arr := v
+  else arr := Copy(v, 0, n);
 end;
 
 function UBigInt.dataPtr: PBigIntLimb; inline;
 begin
-  result := ViewPtr(@fInline[0], fBlk);
+  result := ViewPtr(@fInline[0], Pointer(fArr));
 end;
 
 function UBigInt.getLimbs: TBigIntLimbs;
 begin
-  result := MakeLimbs(ViewPtr(@fInline[0], fBlk), fLen);
+  // spilled values share the array by reference: reading fLimbs on a large
+  // value costs one refcount bump, same as a plain limb-array field
+  if fArr <> nil then begin
+    if fLen = Length(fArr) then exit(fArr);
+    exit(Copy(fArr, 0, fLen));
+  end;
+  result := MakeLimbs(@fInline[0], fLen);
 end;
 
 procedure UBigInt.setLimbs(const v: TBigIntLimbs);
 begin
-  StoreLimbs(v, @fInline[0], fBlk, fLen);
+  StoreLimbs(v, @fInline[0], fArr, fLen);
 end;
 
 class operator UBigInt.Initialize(var x: UBigInt);
 begin
-  x.fBlk := nil;
+  // fArr is nil-initialized by the compiler before this runs
   x.fLen := 0;
   FillChar(x.fInline, SizeOf(x.fInline), 0);
-end;
-
-class operator UBigInt.Finalize(var x: UBigInt);
-begin
-  ReleaseBlk(x.fBlk);
-  x.fBlk := nil;
-end;
-
-class operator UBigInt.AddRef(var x: UBigInt);
-begin
-  if x.fBlk <> nil then inc(x.fBlk^.refs);
-end;
-
-class operator UBigInt.Copy(constref src: UBigInt; var dst: UBigInt);
-begin
-  if @src = @dst then exit;
-  ReleaseBlk(dst.fBlk);
-  dst.fInline := src.fInline;
-  dst.fBlk := src.fBlk;
-  dst.fLen := src.fLen;
-  if dst.fBlk <> nil then inc(dst.fBlk^.refs);
 end;
 
 function BigInt.dataPtr: PBigIntLimb; inline;
 begin
-  result := ViewPtr(@fInline[0], fBlk);
+  result := ViewPtr(@fInline[0], Pointer(fArr));
 end;
 
 function BigInt.getLimbs: TBigIntLimbs;
 begin
-  result := MakeLimbs(ViewPtr(@fInline[0], fBlk), fLen);
+  if fArr <> nil then begin
+    if fLen = Length(fArr) then exit(fArr);
+    exit(Copy(fArr, 0, fLen));
+  end;
+  result := MakeLimbs(@fInline[0], fLen);
 end;
 
 procedure BigInt.setLimbs(const v: TBigIntLimbs);
 begin
-  StoreLimbs(v, @fInline[0], fBlk, fLen);
+  StoreLimbs(v, @fInline[0], fArr, fLen);
 end;
 
 class operator BigInt.Initialize(var x: BigInt);
 begin
-  x.fBlk := nil;
+  // fArr is nil-initialized by the compiler before this runs
   x.fLen := 0;
   x.fNeg := false;
   FillChar(x.fInline, SizeOf(x.fInline), 0);
-end;
-
-class operator BigInt.Finalize(var x: BigInt);
-begin
-  ReleaseBlk(x.fBlk);
-  x.fBlk := nil;
-end;
-
-class operator BigInt.AddRef(var x: BigInt);
-begin
-  if x.fBlk <> nil then inc(x.fBlk^.refs);
-end;
-
-class operator BigInt.Copy(constref src: BigInt; var dst: BigInt);
-begin
-  if @src = @dst then exit;
-  ReleaseBlk(dst.fBlk);
-  dst.fInline := src.fInline;
-  dst.fBlk := src.fBlk;
-  dst.fLen := src.fLen;
-  dst.fNeg := src.fNeg;
-  if dst.fBlk <> nil then inc(dst.fBlk^.refs);
 end;
 
 function LToQWord(const a: TLimbs): QWord; inline;
@@ -1669,16 +1602,16 @@ end;
 // ---------------------------------------------------------------------------
 // inline small-value fast paths (no allocation, no property materialization);
 // operands and results live in the zero-padded inline array. r is a fresh
-// operator result (fBlk = nil, inline zeroed)
+// operator result (fArr = nil, inline zeroed)
 // ---------------------------------------------------------------------------
 
 // all fast paths take typed PLimb pointers (never untyped var params - those
 // miscompile when inlined and dereferenced via @ on this toolchain). dst is
 // the destination record's inline array; the destination may be a reused
-// operator temp still holding a live block, so every finish releases it
+// operator temp still holding a live spill array, so every finish drops it
 
 // build a magnitude from a QWord straight into inline storage
-procedure USetQWord(dst: PLimb; var blk: PBigIntBlock; var len: SizeInt; q: QWord); inline;
+procedure USetQWord(dst: PLimb; var arr: TLimbs; var len: SizeInt; q: QWord); inline;
 begin
   {$if LIMB_BITS = 64}
   dst[0] := q;
@@ -1689,30 +1622,26 @@ begin
   var m: SizeInt := if q > High(TLimb) then 2 else if q <> 0 then 1 else 0;
   {$endif}
   for var i := m to BIGINT_INLINE_LIMBS - 1 do dst[i] := 0;
-  ReleaseBlk(blk);
-  blk := nil;
+  arr := nil;
   len := m;
 end;
 
 // finish a fast-path result as zero
-procedure PutZero(dst: PLimb; var rblk: PBigIntBlock; var rlen: SizeInt); inline;
+procedure PutZero(dst: PLimb; var rarr: TLimbs; var rlen: SizeInt); inline;
 begin
   for var i := 0 to BIGINT_INLINE_LIMBS - 1 do dst[i] := 0;
-  ReleaseBlk(rblk);
-  rblk := nil;
+  rarr := nil;
   rlen := 0;
 end;
 
 // share a source magnitude into a destination record's storage fields with no
-// materialization: bump the block refcount instead of copying limbs. safe when
-// source and destination alias (the refcount goes up before the release)
-procedure ShareMag(srcInline: PLimb; sblk: PBigIntBlock; slen: SizeInt; dstInline: PLimb; var dblk: PBigIntBlock; var dlen: SizeInt);
+// materialization: the spill array is shared by refcount instead of copying
+// limbs. safe when source and destination alias (dynarray assignment is)
+procedure ShareMag(srcInline: PLimb; const sarr: TLimbs; slen: SizeInt; dstInline: PLimb; var darr: TLimbs; var dlen: SizeInt);
 begin
-  if sblk <> nil then inc(sblk^.refs);
   if dstInline <> srcInline then
     for var i := 0 to BIGINT_INLINE_LIMBS - 1 do dstInline[i] := srcInline[i];
-  ReleaseBlk(dblk);
-  dblk := sblk;
+  darr := sarr;
   dlen := slen;
 end;
 
@@ -1734,30 +1663,27 @@ end;
 // copy a computed buffer of significance m into the destination and finish it.
 // the fast paths compute into a local buffer first, so the result may safely
 // alias an operand (the compiler reuses operand temps as the result slot)
-procedure PutInline(buf: PLimb; m: SizeInt; dst: PLimb; var rblk: PBigIntBlock; var rlen: SizeInt);
+procedure PutInline(buf: PLimb; m: SizeInt; dst: PLimb; var rarr: TLimbs; var rlen: SizeInt);
 begin
   for var i := 0 to m - 1 do dst[i] := buf[i];
   for var i := m to BIGINT_INLINE_LIMBS - 1 do dst[i] := 0;
-  ReleaseBlk(rblk);
-  rblk := nil;
+  rarr := nil;
   rlen := m;
 end;
 
 // spill finisher for fast-path results just past the inline capacity; copies
-// into a fresh block before releasing the old one (result may be a reused temp)
-procedure PutSpill(buf: PLimb; m: SizeInt; dst: PLimb; var rblk: PBigIntBlock; var rlen: SizeInt);
+// into a fresh array before dropping the old one (result may be a reused temp)
+procedure PutSpill(buf: PLimb; m: SizeInt; var rarr: TLimbs; var rlen: SizeInt);
 begin
-  var nb := AllocBlk(m);
-  Move(buf^, BlkData(nb)^, m * SizeOf(TLimb));
-  FillChar(dst^, BIGINT_INLINE_LIMBS * SizeOf(TLimb), 0);
-  ReleaseBlk(rblk);
-  rblk := nb;
+  var nb := LNew(m);
+  Move(buf^, nb[0], m * SizeOf(TLimb));
+  rarr := nb;
   rlen := m;
 end;
 
-// r := a + b for two inline operands; spills to a block only when the carry
+// r := a + b for two inline operands; spills to an array only when the carry
 // actually runs past the inline capacity
-procedure AddInline(pa: PLimb; alen: SizeInt; pb: PLimb; blen: SizeInt; dst: PLimb; var rblk: PBigIntBlock; var rlen: SizeInt);
+procedure AddInline(pa: PLimb; alen: SizeInt; pb: PLimb; blen: SizeInt; dst: PLimb; var rarr: TLimbs; var rlen: SizeInt);
 begin
   var n := if alen > blen then alen else blen;
   var buf: array[0..BIGINT_INLINE_LIMBS] of TLimb;
@@ -1777,12 +1703,12 @@ begin
     m := n;
     while (m > 0) and (buf[m - 1] = 0) do dec(m);
   end;
-  if m <= BIGINT_INLINE_LIMBS then PutInline(@buf[0], m, dst, rblk, rlen)
-  else PutSpill(@buf[0], m, dst, rblk, rlen);
+  if m <= BIGINT_INLINE_LIMBS then PutInline(@buf[0], m, dst, rarr, rlen)
+  else PutSpill(@buf[0], m, rarr, rlen);
 end;
 
 // magnitude subtract a - b for a >= b, both inline
-procedure SubInline(pa: PLimb; alen: SizeInt; pb: PLimb; dst: PLimb; var rblk: PBigIntBlock; var rlen: SizeInt);
+procedure SubInline(pa: PLimb; alen: SizeInt; pb: PLimb; dst: PLimb; var rarr: TLimbs; var rlen: SizeInt);
 begin
   var buf: array[0..BIGINT_INLINE_LIMBS] of TLimb;
   var borrow: TLimb := 0;
@@ -1797,15 +1723,15 @@ begin
   end;
   var m := alen;
   while (m > 0) and (buf[m - 1] = 0) do dec(m);
-  PutInline(@buf[0], m, dst, rblk, rlen);
+  PutInline(@buf[0], m, dst, rarr, rlen);
 end;
 
 // r := a * b for two inline operands; the product (at most twice the inline
-// capacity) is computed on the stack and spills to a block only when it has to
-procedure MulInline(pa: PLimb; alen: SizeInt; pb: PLimb; blen: SizeInt; dst: PLimb; var rblk: PBigIntBlock; var rlen: SizeInt);
+// capacity) is computed on the stack and spills to an array only when it has to
+procedure MulInline(pa: PLimb; alen: SizeInt; pb: PLimb; blen: SizeInt; dst: PLimb; var rarr: TLimbs; var rlen: SizeInt);
 begin
   if (alen = 0) or (blen = 0) then begin
-    PutZero(dst, rblk, rlen);
+    PutZero(dst, rarr, rlen);
     exit;
   end;
   var buf: array[0..2 * BIGINT_INLINE_LIMBS - 1] of TLimb;
@@ -1813,28 +1739,28 @@ begin
   for var i := 0 to alen - 1 do buf[i + blen] := MpnAddMul1(@buf[i], pb, blen, pa[i]);
   var m := alen + blen;
   while (m > 0) and (buf[m - 1] = 0) do dec(m);
-  if m <= BIGINT_INLINE_LIMBS then PutInline(@buf[0], m, dst, rblk, rlen)
-  else PutSpill(@buf[0], m, dst, rblk, rlen);
+  if m <= BIGINT_INLINE_LIMBS then PutInline(@buf[0], m, dst, rarr, rlen)
+  else PutSpill(@buf[0], m, rarr, rlen);
 end;
 
 // signed add of two small magnitudes given as zero-padded (ptr, len, neg)
-// operands; dst/rblk/rlen/rneg are the destination record's storage fields
-procedure SAddInlineP(pa: PLimb; alen: SizeInt; aneg: boolean; pb: PLimb; blen: SizeInt; bneg: boolean; dst: PLimb; var rblk: PBigIntBlock; var rlen: SizeInt; out rneg: boolean);
+// operands; dst/rarr/rlen/rneg are the destination record's storage fields
+procedure SAddInlineP(pa: PLimb; alen: SizeInt; aneg: boolean; pb: PLimb; blen: SizeInt; bneg: boolean; dst: PLimb; var rarr: TLimbs; var rlen: SizeInt; out rneg: boolean);
 begin
   if aneg = bneg then begin
-    AddInline(pa, alen, pb, blen, dst, rblk, rlen);
+    AddInline(pa, alen, pb, blen, dst, rarr, rlen);
     rneg := aneg and (rlen > 0);
     exit;
   end;
   var c := LCmpP(pa, alen, pb, blen);
   if c = 0 then begin
-    PutZero(dst, rblk, rlen);
+    PutZero(dst, rarr, rlen);
     rneg := false;
   end else if c > 0 then begin
-    SubInline(pa, alen, pb, dst, rblk, rlen);
+    SubInline(pa, alen, pb, dst, rarr, rlen);
     rneg := aneg and (rlen > 0);
   end else begin
-    SubInline(pb, blen, pa, dst, rblk, rlen);
+    SubInline(pb, blen, pa, dst, rarr, rlen);
     rneg := bneg and (rlen > 0);
   end;
 end;
@@ -2960,12 +2886,12 @@ end;
 class operator UBigInt.:=(x: Int64): UBigInt;
 begin
   if x < 0 then RaiseNegativeUnsigned;
-  USetQWord(@result.fInline[0], result.fBlk, result.fLen, QWord(x));
+  USetQWord(@result.fInline[0], result.fArr, result.fLen, QWord(x));
 end;
 
 class operator UBigInt.:=(x: QWord): UBigInt;
 begin
-  USetQWord(@result.fInline[0], result.fBlk, result.fLen, x);
+  USetQWord(@result.fInline[0], result.fArr, result.fLen, x);
 end;
 
 class operator UBigInt.:=(const s: string): UBigInt;
@@ -3032,8 +2958,8 @@ end;
 
 class operator UBigInt.+(const a, b: UBigInt): UBigInt;
 begin
-  if (a.fBlk = nil) and (b.fBlk = nil) then begin
-    AddInline(@a.fInline[0], a.fLen, @b.fInline[0], b.fLen, @result.fInline[0], result.fBlk, result.fLen);
+  if (a.fArr = nil) and (b.fArr = nil) then begin
+    AddInline(@a.fInline[0], a.fLen, @b.fInline[0], b.fLen, @result.fInline[0], result.fArr, result.fLen);
     exit;
   end;
   result.fLimbs := LAdd(a.fLimbs, b.fLimbs);
@@ -3041,15 +2967,15 @@ end;
 
 class operator UBigInt.+(const a: UBigInt; b: Int64): UBigInt;
 begin
-  if a.fBlk = nil then begin
+  if a.fArr = nil then begin
     var bb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
     var bl := QToInline(if b >= 0 then QWord(b) else NegAbs64(b), @bb[0]);
-    if b >= 0 then AddInline(@a.fInline[0], a.fLen, @bb[0], bl, @result.fInline[0], result.fBlk, result.fLen)
+    if b >= 0 then AddInline(@a.fInline[0], a.fLen, @bb[0], bl, @result.fInline[0], result.fArr, result.fLen)
     else begin
       var c := LCmpP(@a.fInline[0], a.fLen, @bb[0], bl);
       if c < 0 then RaiseNegativeUnsigned;
-      if c = 0 then PutZero(@result.fInline[0], result.fBlk, result.fLen)
-      else SubInline(@a.fInline[0], a.fLen, @bb[0], @result.fInline[0], result.fBlk, result.fLen);
+      if c = 0 then PutZero(@result.fInline[0], result.fArr, result.fLen)
+      else SubInline(@a.fInline[0], a.fLen, @bb[0], @result.fInline[0], result.fArr, result.fLen);
     end;
     exit;
   end;
@@ -3064,11 +2990,11 @@ end;
 
 class operator UBigInt.-(const a, b: UBigInt): UBigInt;
 begin
-  if (a.fBlk = nil) and (b.fBlk = nil) then begin
+  if (a.fArr = nil) and (b.fArr = nil) then begin
     var c := LCmpP(@a.fInline[0], a.fLen, @b.fInline[0], b.fLen);
     if c < 0 then RaiseNegativeUnsigned;
-    if c = 0 then PutZero(@result.fInline[0], result.fBlk, result.fLen)
-    else SubInline(@a.fInline[0], a.fLen, @b.fInline[0], @result.fInline[0], result.fBlk, result.fLen);
+    if c = 0 then PutZero(@result.fInline[0], result.fArr, result.fLen)
+    else SubInline(@a.fInline[0], a.fLen, @b.fInline[0], @result.fInline[0], result.fArr, result.fLen);
     exit;
   end;
   result.fLimbs := LSubChecked(a.fLimbs, b.fLimbs);
@@ -3076,15 +3002,15 @@ end;
 
 class operator UBigInt.-(const a: UBigInt; b: Int64): UBigInt;
 begin
-  if a.fBlk = nil then begin
+  if a.fArr = nil then begin
     var bb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
     var bl := QToInline(if b >= 0 then QWord(b) else NegAbs64(b), @bb[0]);
-    if b < 0 then AddInline(@a.fInline[0], a.fLen, @bb[0], bl, @result.fInline[0], result.fBlk, result.fLen)
+    if b < 0 then AddInline(@a.fInline[0], a.fLen, @bb[0], bl, @result.fInline[0], result.fArr, result.fLen)
     else begin
       var c := LCmpP(@a.fInline[0], a.fLen, @bb[0], bl);
       if c < 0 then RaiseNegativeUnsigned;
-      if c = 0 then PutZero(@result.fInline[0], result.fBlk, result.fLen)
-      else SubInline(@a.fInline[0], a.fLen, @bb[0], @result.fInline[0], result.fBlk, result.fLen);
+      if c = 0 then PutZero(@result.fInline[0], result.fArr, result.fLen)
+      else SubInline(@a.fInline[0], a.fLen, @bb[0], @result.fInline[0], result.fArr, result.fLen);
     end;
     exit;
   end;
@@ -3100,8 +3026,8 @@ end;
 
 class operator UBigInt.*(const a, b: UBigInt): UBigInt;
 begin
-  if (a.fBlk = nil) and (b.fBlk = nil) then begin
-    MulInline(@a.fInline[0], a.fLen, @b.fInline[0], b.fLen, @result.fInline[0], result.fBlk, result.fLen);
+  if (a.fArr = nil) and (b.fArr = nil) then begin
+    MulInline(@a.fInline[0], a.fLen, @b.fInline[0], b.fLen, @result.fInline[0], result.fArr, result.fLen);
     exit;
   end;
   result.fLimbs := LMul(a.fLimbs, b.fLimbs);
@@ -3113,10 +3039,10 @@ begin
     if a.fLen <> 0 then RaiseNegativeUnsigned;
     exit(default(UBigInt));
   end;
-  if a.fBlk = nil then begin
+  if a.fArr = nil then begin
     var bb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
     var bl := QToInline(QWord(b), @bb[0]);
-    MulInline(@a.fInline[0], a.fLen, @bb[0], bl, @result.fInline[0], result.fBlk, result.fLen);
+    MulInline(@a.fInline[0], a.fLen, @bb[0], bl, @result.fInline[0], result.fArr, result.fLen);
     exit;
   end;
   result.fLimbs := LMulQ(a.fLimbs, QWord(b));
@@ -3132,11 +3058,11 @@ var
   q, r: TLimbs;
 begin
   if b.fLen = 0 then RaiseDivByZero;
-  if (a.fBlk = nil) and (b.fBlk = nil) then begin
+  if (a.fArr = nil) and (b.fArr = nil) then begin
     var qb, rb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
     var ql, rl: SizeInt;
     DivModInline(@a.fInline[0], a.fLen, @b.fInline[0], b.fLen, @qb[0], ql, @rb[0], rl);
-    PutInline(@qb[0], ql, @result.fInline[0], result.fBlk, result.fLen);
+    PutInline(@qb[0], ql, @result.fInline[0], result.fArr, result.fLen);
     exit;
   end;
   LDivMod(a.fLimbs, b.fLimbs, q, r);
@@ -3155,7 +3081,7 @@ begin
     if a.fLen <> 0 then RaiseNegativeUnsigned;
     exit(default(UBigInt));
   end;
-  if a.fBlk = nil then begin
+  if a.fArr = nil then begin
     var db: array[0..1] of TLimb;
     db[0] := TLimb(b);
     {$if LIMB_BITS = 64}
@@ -3167,7 +3093,7 @@ begin
     var qb, rb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
     var ql, rl: SizeInt;
     DivModInline(@a.fInline[0], a.fLen, @db[0], dl, @qb[0], ql, @rb[0], rl);
-    PutInline(@qb[0], ql, @result.fInline[0], result.fBlk, result.fLen);
+    PutInline(@qb[0], ql, @result.fInline[0], result.fArr, result.fLen);
     exit;
   end;
   {$if LIMB_BITS = 64}
@@ -3186,11 +3112,11 @@ var
   q, r: TLimbs;
 begin
   if b.fLen = 0 then RaiseDivByZero;
-  if (a.fBlk = nil) and (b.fBlk = nil) then begin
+  if (a.fArr = nil) and (b.fArr = nil) then begin
     var qb, rb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
     var ql, rl: SizeInt;
     DivModInline(@a.fInline[0], a.fLen, @b.fInline[0], b.fLen, @qb[0], ql, @rb[0], rl);
-    PutInline(@rb[0], rl, @result.fInline[0], result.fBlk, result.fLen);
+    PutInline(@rb[0], rl, @result.fInline[0], result.fArr, result.fLen);
     exit;
   end;
   LDivMod(a.fLimbs, b.fLimbs, q, r);
@@ -3207,7 +3133,7 @@ begin
   if b = 0 then RaiseDivByZero;
   // remainder of a nonnegative dividend is nonnegative for either divisor sign
   var m: QWord := if b > 0 then QWord(b) else NegAbs64(b);
-  if a.fBlk = nil then begin
+  if a.fArr = nil then begin
     var db: array[0..1] of TLimb;
     db[0] := TLimb(m);
     {$if LIMB_BITS = 64}
@@ -3219,7 +3145,7 @@ begin
     var qb, rb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
     var ql, rl: SizeInt;
     DivModInline(@a.fInline[0], a.fLen, @db[0], dl, @qb[0], ql, @rb[0], rl);
-    PutInline(@rb[0], rl, @result.fInline[0], result.fBlk, result.fLen);
+    PutInline(@rb[0], rl, @result.fInline[0], result.fArr, result.fLen);
     exit;
   end;
   {$if LIMB_BITS = 64}
@@ -3641,6 +3567,7 @@ begin
   var limb := SizeInt(i shr LIMB_SHIFT);
   if limb >= fLen then exit;
   var l := fLimbs;
+  SetLength(l, Length(l)); // un-share: the getter may hand out fArr itself
   l[limb] := l[limb] and not (TLimb(1) shl (i and LIMB_MASK));
   fLimbs := l; // the setter normalizes
 end;
@@ -3682,7 +3609,7 @@ end;
 function UBigInt.compare(const other: UBigInt): integer; inline;
 begin
   // both inline: compare the significant limbs top-down right on the record
-  if (fBlk = nil) and (other.fBlk = nil) then begin
+  if (fArr = nil) and (other.fArr = nil) then begin
     if fLen <> other.fLen then exit(if fLen < other.fLen then -1 else 1);
     for var i := fLen - 1 downto 0 do
       if fInline[i] <> other.fInline[i] then exit(if fInline[i] < other.fInline[i] then -1 else 1);
@@ -3711,12 +3638,12 @@ var
   qq, rr: UBigInt;
 begin
   if d.fLen = 0 then RaiseDivByZero;
-  if (fBlk = nil) and (d.fBlk = nil) then begin
+  if (fArr = nil) and (d.fArr = nil) then begin
     var qb, rb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
     var ql, rl: SizeInt;
     DivModInline(@fInline[0], fLen, @d.fInline[0], d.fLen, @qb[0], ql, @rb[0], rl);
-    PutInline(@qb[0], ql, @qq.fInline[0], qq.fBlk, qq.fLen);
-    PutInline(@rb[0], rl, @rr.fInline[0], rr.fBlk, rr.fLen);
+    PutInline(@qb[0], ql, @qq.fInline[0], qq.fArr, qq.fLen);
+    PutInline(@rb[0], rl, @rr.fInline[0], rr.fArr, rr.fLen);
     exit(qq, rr);
   end;
   var qm, rm: TLimbs;
@@ -5346,10 +5273,10 @@ end;
 function BFromI64(x: Int64): BigInt;
 begin
   if x >= 0 then begin
-    USetQWord(@result.fInline[0], result.fBlk, result.fLen, QWord(x));
+    USetQWord(@result.fInline[0], result.fArr, result.fLen, QWord(x));
     result.fNeg := false;
   end else begin
-    USetQWord(@result.fInline[0], result.fBlk, result.fLen, NegAbs64(x));
+    USetQWord(@result.fInline[0], result.fArr, result.fLen, NegAbs64(x));
     result.fNeg := true;
   end;
 end;
@@ -5490,17 +5417,17 @@ end;
 class operator BigInt.:=(x: Int64): BigInt;
 begin
   if x >= 0 then begin
-    USetQWord(@result.fInline[0], result.fBlk, result.fLen, QWord(x));
+    USetQWord(@result.fInline[0], result.fArr, result.fLen, QWord(x));
     result.fNeg := false;
   end else begin
-    USetQWord(@result.fInline[0], result.fBlk, result.fLen, NegAbs64(x));
+    USetQWord(@result.fInline[0], result.fArr, result.fLen, NegAbs64(x));
     result.fNeg := true;
   end;
 end;
 
 class operator BigInt.:=(x: QWord): BigInt;
 begin
-  USetQWord(@result.fInline[0], result.fBlk, result.fLen, x);
+  USetQWord(@result.fInline[0], result.fArr, result.fLen, x);
   result.fNeg := false;
 end;
 
@@ -5511,7 +5438,7 @@ end;
 
 class operator BigInt.:=(const u: UBigInt): BigInt;
 begin
-  ShareMag(@u.fInline[0], u.fBlk, u.fLen, @result.fInline[0], result.fBlk, result.fLen);
+  ShareMag(@u.fInline[0], u.fArr, u.fLen, @result.fInline[0], result.fArr, result.fLen);
   result.fNeg := false;
 end;
 
@@ -5579,25 +5506,25 @@ end;
 
 // signed add/sub of two small BigInts into typed destination fields; bNeg is
 // b's effective sign (flipped for subtraction). false = not both inline
-function BSignedInline(const a, b: BigInt; bNeg: boolean; dst: PLimb; var rblk: PBigIntBlock; var rlen: SizeInt; out rneg: boolean): boolean;
+function BSignedInline(const a, b: BigInt; bNeg: boolean; dst: PLimb; var rarr: TLimbs; var rlen: SizeInt; out rneg: boolean): boolean;
 begin
-  if (a.fBlk <> nil) or (b.fBlk <> nil) then exit(false);
-  SAddInlineP(@a.fInline[0], a.fLen, a.fNeg, @b.fInline[0], b.fLen, bNeg, dst, rblk, rlen, rneg);
+  if (a.fArr <> nil) or (b.fArr <> nil) then exit(false);
+  SAddInlineP(@a.fInline[0], a.fLen, a.fNeg, @b.fInline[0], b.fLen, bNeg, dst, rarr, rlen, rneg);
   result := true;
 end;
 
 class operator BigInt.+(const a, b: BigInt): BigInt;
 begin
-  if BSignedInline(a, b, b.fNeg, @result.fInline[0], result.fBlk, result.fLen, result.fNeg) then exit;
+  if BSignedInline(a, b, b.fNeg, @result.fInline[0], result.fArr, result.fLen, result.fNeg) then exit;
   result := SAddPair(a.fLimbs, a.fNeg, b.fLimbs, b.fNeg);
 end;
 
 class operator BigInt.+(const a: BigInt; b: Int64): BigInt;
 begin
-  if a.fBlk = nil then begin
+  if a.fArr = nil then begin
     var bb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
     var bl := QToInline(if b >= 0 then QWord(b) else NegAbs64(b), @bb[0]);
-    SAddInlineP(@a.fInline[0], a.fLen, a.fNeg, @bb[0], bl, b < 0, @result.fInline[0], result.fBlk, result.fLen, result.fNeg);
+    SAddInlineP(@a.fInline[0], a.fLen, a.fNeg, @bb[0], bl, b < 0, @result.fInline[0], result.fArr, result.fLen, result.fNeg);
     exit;
   end;
   result := SAddPair(a.fLimbs, a.fNeg, LFromQWord(if b >= 0 then QWord(b) else NegAbs64(b)), b < 0);
@@ -5610,16 +5537,16 @@ end;
 
 class operator BigInt.-(const a, b: BigInt): BigInt;
 begin
-  if BSignedInline(a, b, not b.fNeg, @result.fInline[0], result.fBlk, result.fLen, result.fNeg) then exit;
+  if BSignedInline(a, b, not b.fNeg, @result.fInline[0], result.fArr, result.fLen, result.fNeg) then exit;
   result := SAddPair(a.fLimbs, a.fNeg, b.fLimbs, not b.fNeg);
 end;
 
 class operator BigInt.-(const a: BigInt; b: Int64): BigInt;
 begin
-  if a.fBlk = nil then begin
+  if a.fArr = nil then begin
     var bb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
     var bl := QToInline(if b >= 0 then QWord(b) else NegAbs64(b), @bb[0]);
-    SAddInlineP(@a.fInline[0], a.fLen, a.fNeg, @bb[0], bl, b >= 0, @result.fInline[0], result.fBlk, result.fLen, result.fNeg);
+    SAddInlineP(@a.fInline[0], a.fLen, a.fNeg, @bb[0], bl, b >= 0, @result.fInline[0], result.fArr, result.fLen, result.fNeg);
     exit;
   end;
   result := SAddPair(a.fLimbs, a.fNeg, LFromQWord(if b >= 0 then QWord(b) else NegAbs64(b)), b >= 0);
@@ -5627,10 +5554,10 @@ end;
 
 class operator BigInt.-(a: Int64; const b: BigInt): BigInt;
 begin
-  if b.fBlk = nil then begin
+  if b.fArr = nil then begin
     var ab: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
     var al := QToInline(if a >= 0 then QWord(a) else NegAbs64(a), @ab[0]);
-    SAddInlineP(@ab[0], al, a < 0, @b.fInline[0], b.fLen, not b.fNeg, @result.fInline[0], result.fBlk, result.fLen, result.fNeg);
+    SAddInlineP(@ab[0], al, a < 0, @b.fInline[0], b.fLen, not b.fNeg, @result.fInline[0], result.fArr, result.fLen, result.fNeg);
     exit;
   end;
   result := SAddPair(LFromQWord(if a >= 0 then QWord(a) else NegAbs64(a)), a < 0, b.fLimbs, not b.fNeg);
@@ -5638,8 +5565,8 @@ end;
 
 class operator BigInt.*(const a, b: BigInt): BigInt;
 begin
-  if (a.fBlk = nil) and (b.fBlk = nil) then begin
-    MulInline(@a.fInline[0], a.fLen, @b.fInline[0], b.fLen, @result.fInline[0], result.fBlk, result.fLen);
+  if (a.fArr = nil) and (b.fArr = nil) then begin
+    MulInline(@a.fInline[0], a.fLen, @b.fInline[0], b.fLen, @result.fInline[0], result.fArr, result.fLen);
     result.fNeg := (a.fNeg xor b.fNeg) and (result.fLen > 0);
     exit;
   end;
@@ -5648,10 +5575,10 @@ end;
 
 class operator BigInt.*(const a: BigInt; b: Int64): BigInt;
 begin
-  if a.fBlk = nil then begin
+  if a.fArr = nil then begin
     var bb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
     var bl := QToInline(if b >= 0 then QWord(b) else NegAbs64(b), @bb[0]);
-    MulInline(@a.fInline[0], a.fLen, @bb[0], bl, @result.fInline[0], result.fBlk, result.fLen);
+    MulInline(@a.fInline[0], a.fLen, @bb[0], bl, @result.fInline[0], result.fArr, result.fLen);
     result.fNeg := (a.fNeg xor (b < 0)) and (result.fLen > 0);
     exit;
   end;
@@ -5668,11 +5595,11 @@ var
   q, r: BigInt;
 begin
   if b.fLen = 0 then RaiseDivByZero;
-  if (a.fBlk = nil) and (b.fBlk = nil) then begin
+  if (a.fArr = nil) and (b.fArr = nil) then begin
     var qb, rb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
     var ql, rl: SizeInt;
     DivModInline(@a.fInline[0], a.fLen, @b.fInline[0], b.fLen, @qb[0], ql, @rb[0], rl);
-    PutInline(@qb[0], ql, @result.fInline[0], result.fBlk, result.fLen);
+    PutInline(@qb[0], ql, @result.fInline[0], result.fArr, result.fLen);
     result.fNeg := (a.fNeg xor b.fNeg) and (result.fLen > 0);
     exit;
   end;
@@ -5690,11 +5617,11 @@ var
   q, r: BigInt;
 begin
   if b.fLen = 0 then RaiseDivByZero;
-  if (a.fBlk = nil) and (b.fBlk = nil) then begin
+  if (a.fArr = nil) and (b.fArr = nil) then begin
     var qb, rb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
     var ql, rl: SizeInt;
     DivModInline(@a.fInline[0], a.fLen, @b.fInline[0], b.fLen, @qb[0], ql, @rb[0], rl);
-    PutInline(@rb[0], rl, @result.fInline[0], result.fBlk, result.fLen);
+    PutInline(@rb[0], rl, @result.fInline[0], result.fArr, result.fLen);
     result.fNeg := a.fNeg and (result.fLen > 0);
     exit;
   end;
@@ -5757,7 +5684,7 @@ end;
 class operator BigInt.-(const a: BigInt): BigInt;
 begin
   var neg := (not a.fNeg) and (a.fLen > 0);
-  ShareMag(@a.fInline[0], a.fBlk, a.fLen, @result.fInline[0], result.fBlk, result.fLen);
+  ShareMag(@a.fInline[0], a.fArr, a.fLen, @result.fInline[0], result.fArr, result.fLen);
   result.fNeg := neg;
 end;
 
@@ -6024,7 +5951,7 @@ end;
 function BigInt.toUBigInt: UBigInt;
 begin
   if fNeg then RaiseNegativeUnsigned;
-  ShareMag(@fInline[0], fBlk, fLen, @result.fInline[0], result.fBlk, result.fLen);
+  ShareMag(@fInline[0], fArr, fLen, @result.fInline[0], result.fArr, result.fLen);
 end;
 
 // bitLength is the minimal two's complement width minus the sign bit, so a
@@ -6123,13 +6050,13 @@ end;
 
 function BigInt.abs: BigInt;
 begin
-  ShareMag(@fInline[0], fBlk, fLen, @result.fInline[0], result.fBlk, result.fLen);
+  ShareMag(@fInline[0], fArr, fLen, @result.fInline[0], result.fArr, result.fLen);
   result.fNeg := false;
 end;
 
 function BigInt.magnitude: UBigInt;
 begin
-  ShareMag(@fInline[0], fBlk, fLen, @result.fInline[0], result.fBlk, result.fLen);
+  ShareMag(@fInline[0], fArr, fLen, @result.fInline[0], result.fArr, result.fLen);
 end;
 
 procedure BigInt.negate;
@@ -6190,6 +6117,7 @@ begin
     var limb := SizeInt(i shr LIMB_SHIFT);
     if limb >= fLen then exit;
     var l := fLimbs;
+    SetLength(l, Length(l)); // un-share: the getter may hand out fArr itself
     l[limb] := l[limb] and not (TLimb(1) shl (i and LIMB_MASK));
     fLimbs := l; // the setter normalizes
   end else self := self and not (BigInt(1) shl i);
@@ -6241,13 +6169,13 @@ var
   qq, rr: BigInt;
 begin
   if d.fLen = 0 then RaiseDivByZero;
-  if (fBlk = nil) and (d.fBlk = nil) then begin
+  if (fArr = nil) and (d.fArr = nil) then begin
     var qb, rb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
     var ql, rl: SizeInt;
     DivModInline(@fInline[0], fLen, @d.fInline[0], d.fLen, @qb[0], ql, @rb[0], rl);
-    PutInline(@qb[0], ql, @qq.fInline[0], qq.fBlk, qq.fLen);
+    PutInline(@qb[0], ql, @qq.fInline[0], qq.fArr, qq.fLen);
     qq.fNeg := (fNeg xor d.fNeg) and (qq.fLen > 0);
-    PutInline(@rb[0], rl, @rr.fInline[0], rr.fBlk, rr.fLen);
+    PutInline(@rb[0], rl, @rr.fInline[0], rr.fArr, rr.fLen);
     rr.fNeg := fNeg and (rr.fLen > 0);
     exit(qq, rr);
   end;
@@ -6313,7 +6241,7 @@ end;
 
 function TUBigIntBridge.toBigInt: BigInt;
 begin
-  ShareMag(@fInline[0], fBlk, fLen, @result.fInline[0], result.fBlk, result.fLen);
+  ShareMag(@fInline[0], fArr, fLen, @result.fInline[0], result.fArr, result.fLen);
   result.fNeg := false;
 end;
 
@@ -7124,7 +7052,7 @@ begin
   if sa <> sb then exit(if sa < sb then -1 else 1);
   if sa = 0 then exit(0);
   // same scale and small mantissas: compare right on the records
-  if (a.fExp = b.fExp) and (a.fMan.fBlk = nil) and (b.fMan.fBlk = nil) then begin
+  if (a.fExp = b.fExp) and (a.fMan.fArr = nil) and (b.fMan.fArr = nil) then begin
     var c := LCmpP(@a.fMan.fInline[0], a.fMan.fLen, @b.fMan.fInline[0], b.fMan.fLen);
     exit(if sa < 0 then -c else c);
   end;
@@ -7154,8 +7082,8 @@ begin
   // equal scale: no alignment multiply, add the mantissas as they are
   if a.fExp = b.fExp then begin
     // small mantissas: signed add straight into the result record
-    if (a.fMan.fBlk = nil) and (b.fMan.fBlk = nil) then begin
-      SAddInlineP(@a.fMan.fInline[0], a.fMan.fLen, a.fMan.fNeg, @b.fMan.fInline[0], b.fMan.fLen, b.fMan.fNeg xor negateB, @result.fMan.fInline[0], result.fMan.fBlk, result.fMan.fLen, result.fMan.fNeg);
+    if (a.fMan.fArr = nil) and (b.fMan.fArr = nil) then begin
+      SAddInlineP(@a.fMan.fInline[0], a.fMan.fLen, a.fMan.fNeg, @b.fMan.fInline[0], b.fMan.fLen, b.fMan.fNeg xor negateB, @result.fMan.fInline[0], result.fMan.fArr, result.fMan.fLen, result.fMan.fNeg);
       DecFinish(result, Int64(a.fExp), a.fHidden or b.fHidden);
       exit;
     end;
@@ -7163,7 +7091,7 @@ begin
   end;
   // small mantissas over a modest gap: scale the higher-exponent one by a
   // single-limb power of ten on the stack, then add inline with no allocation
-  if (a.fMan.fBlk = nil) and (b.fMan.fBlk = nil) then begin
+  if (a.fMan.fArr = nil) and (b.fMan.fArr = nil) then begin
     var d := Int64(a.fExp) - b.fExp;
     var k := if d > 0 then d else -d;
     if k <= DEC_CHUNK_POW then begin
@@ -7183,8 +7111,8 @@ begin
       while (slen > 0) and (sb[slen - 1] = 0) do dec(slen);
       if slen <= BIGINT_INLINE_LIMBS then begin
         var ee := if d > 0 then Int64(b.fExp) else Int64(a.fExp);
-        if d > 0 then SAddInlineP(@sb[0], slen, a.fMan.fNeg, @b.fMan.fInline[0], b.fMan.fLen, b.fMan.fNeg xor negateB, @result.fMan.fInline[0], result.fMan.fBlk, result.fMan.fLen, result.fMan.fNeg)
-        else SAddInlineP(@a.fMan.fInline[0], a.fMan.fLen, a.fMan.fNeg, @sb[0], slen, b.fMan.fNeg xor negateB, @result.fMan.fInline[0], result.fMan.fBlk, result.fMan.fLen, result.fMan.fNeg);
+        if d > 0 then SAddInlineP(@sb[0], slen, a.fMan.fNeg, @b.fMan.fInline[0], b.fMan.fLen, b.fMan.fNeg xor negateB, @result.fMan.fInline[0], result.fMan.fArr, result.fMan.fLen, result.fMan.fNeg)
+        else SAddInlineP(@a.fMan.fInline[0], a.fMan.fLen, a.fMan.fNeg, @sb[0], slen, b.fMan.fNeg xor negateB, @result.fMan.fInline[0], result.fMan.fArr, result.fMan.fLen, result.fMan.fNeg);
         DecFinish(result, ee, a.fHidden or b.fHidden);
         exit;
       end;
@@ -7284,8 +7212,8 @@ end;
 class operator BigDecimal.*(const a, b: BigDecimal): BigDecimal;
 begin
   // small mantissas: multiply straight into the result record
-  if (a.fMan.fBlk = nil) and (b.fMan.fBlk = nil) then begin
-    MulInline(@a.fMan.fInline[0], a.fMan.fLen, @b.fMan.fInline[0], b.fMan.fLen, @result.fMan.fInline[0], result.fMan.fBlk, result.fMan.fLen);
+  if (a.fMan.fArr = nil) and (b.fMan.fArr = nil) then begin
+    MulInline(@a.fMan.fInline[0], a.fMan.fLen, @b.fMan.fInline[0], b.fMan.fLen, @result.fMan.fInline[0], result.fMan.fArr, result.fMan.fLen);
     result.fMan.fNeg := (a.fMan.fNeg xor b.fMan.fNeg) and (result.fMan.fLen > 0);
     DecFinish(result, Int64(a.fExp) + b.fExp, a.fHidden or b.fHidden);
     exit;
