@@ -1558,6 +1558,28 @@ begin
   result := false;
 end;
 
+// signed counterparts for BigInt (zero always carries fNeg = false)
+function BLess(const a, b: BigInt): boolean; inline;
+begin
+  if a.fNeg <> b.fNeg then exit(a.fNeg);
+  if a.fLen <> b.fLen then exit((a.fLen < b.fLen) xor a.fNeg);
+  var pa := a.dataPtr;
+  var pb := b.dataPtr;
+  for var i := a.fLen - 1 downto 0 do
+    if pa[i] <> pb[i] then exit((pa[i] < pb[i]) xor a.fNeg);
+  result := false;
+end;
+
+function BEqB(const a, b: BigInt): boolean; inline;
+begin
+  if (a.fNeg <> b.fNeg) or (a.fLen <> b.fLen) then exit(false);
+  var pa := a.dataPtr;
+  var pb := b.dataPtr;
+  for var i := 0 to a.fLen - 1 do
+    if pa[i] <> pb[i] then exit(false);
+  result := true;
+end;
+
 
 function LToQWord(const a: TLimbs): QWord; inline;
 begin
@@ -2672,18 +2694,27 @@ begin
   result := LXorP(PLimb(Pointer(a)), Length(a), PLimb(Pointer(b)), Length(b));
 end;
 
+function LBitLenP(p: PLimb; len: SizeInt): LongWord; inline;
+begin
+  if len = 0 then exit(0);
+  result := LongWord(len - 1) * LIMB_BITS + LimbBsr(p[len - 1]) + 1;
+end;
+
 function LBitLen(const a: TLimbs): LongWord;
 begin
-  var la := Length(a);
-  if la = 0 then exit(0);
-  result := LongWord(la - 1) * LIMB_BITS + LimbBsr(a[la - 1]) + 1;
+  result := LBitLenP(PLimb(Pointer(a)), Length(a));
+end;
+
+function LTestBitP(p: PLimb; len: SizeInt; i: LongWord): boolean; inline;
+begin
+  var limb := SizeInt(i shr LIMB_SHIFT);
+  if limb >= len then exit(false);
+  result := (p[limb] shr (i and LIMB_MASK)) and 1 <> 0;
 end;
 
 function LTestBit(const a: TLimbs; i: LongWord): boolean;
 begin
-  var limb := SizeInt(i shr LIMB_SHIFT);
-  if limb >= Length(a) then exit(false);
-  result := (a[limb] shr (i and LIMB_MASK)) and 1 <> 0;
+  result := LTestBitP(PLimb(Pointer(a)), Length(a), i);
 end;
 
 // ---------------------------------------------------------------------------
@@ -3812,7 +3843,7 @@ end;
 
 function UBigInt.testBit(i: LongWord): boolean;
 begin
-  result := LTestBit(fLimbs, i);
+  result := LTestBitP(dataPtr, fLen, i);
 end;
 
 procedure UBigInt.setBit(i: LongWord);
@@ -5677,32 +5708,32 @@ begin
 end;
 
 // lowest nonzero limb index, -1 for zero
-function LLowestNZ(const m: TLimbs): SizeInt;
+function LLowestNZP(p: PLimb; len: SizeInt): SizeInt;
 begin
-  for var i := 0 to Length(m) - 1 do
-    if m[i] <> 0 then exit(i);
+  for var i := 0 to len - 1 do
+    if p[i] <> 0 then exit(i);
   result := -1;
 end;
 
-// i-th limb of the infinite two's complement form of (m, neg)
-function TCLimbAt(const m: TLimbs; neg: boolean; lowNZ, i: SizeInt): TLimb; inline;
+// i-th limb of the infinite two's complement form of (p, len, neg)
+function TCLimbAtP(p: PLimb; len: SizeInt; neg: boolean; lowNZ, i: SizeInt): TLimb; inline;
 begin
-  if not neg then result := if i < Length(m) then m[i] else 0
+  if not neg then result := if i < len then p[i] else 0
   else if i < lowNZ then result := 0
-  else if i = lowNZ then result := (not m[i]) + 1
-  else if i < Length(m) then result := not m[i]
+  else if i = lowNZ then result := (not p[i]) + 1
+  else if i < len then result := not p[i]
   else result := High(TLimb);
 end;
 
-// negate a two's complement limb array in place (not + 1): limbs below the
+// negate a two's complement limb run in place (not + 1): limbs below the
 // lowest nonzero one stay zero, that one negates, everything above inverts
-procedure LTCNegateInPlace(var a: TLimbs);
+procedure LTCNegateInPlaceP(p: PLimb; len: SizeInt);
 begin
   var i := 0;
-  while (i < Length(a)) and (a[i] = 0) do inc(i);
-  if i >= Length(a) then exit;
-  a[i] := TLimb(0) - a[i];
-  for var j := i + 1 to Length(a) - 1 do a[j] := not a[j];
+  while (i < len) and (p[i] = 0) do inc(i);
+  if i >= len then exit;
+  p[i] := TLimb(0) - p[i];
+  for var j := i + 1 to len - 1 do p[j] := not p[j];
 end;
 
 type
@@ -5711,41 +5742,54 @@ type
 function BBitOp(const a, b: BigInt; op: TBitOp): BigInt;
 var
   res: TLimbs;
+  buf: array[0..BIGINT_INLINE_LIMBS] of TLimb;
 begin
   var la := a.fLen;
   var lb := b.fLen;
-  var am := a.fLimbs;
-  var bm := b.fLimbs;
-  // one limb above both operands captures the sign extension
+  var pa := a.dataPtr;
+  var pb := b.dataPtr;
+  // one limb above both operands captures the sign extension; small operands
+  // compute on the stack with no allocation
   var n := MaxS(la, lb) + 1;
-  var lowA := LLowestNZ(am);
-  var lowB := LLowestNZ(bm);
-  SetLength(res, n);
+  var lowA := LLowestNZP(pa, la);
+  var lowB := LLowestNZP(pb, lb);
+  var pd: PLimb := @buf[0];
+  if n > BIGINT_INLINE_LIMBS + 1 then begin
+    res := LNew(n);
+    pd := PLimb(Pointer(res));
+  end;
   for var i := 0 to n - 1 do begin
-    var x := TCLimbAt(am, a.fNeg, lowA, i);
-    var y := TCLimbAt(bm, b.fNeg, lowB, i);
-    res[i] := case op of
+    var x := TCLimbAtP(pa, la, a.fNeg, lowA, i);
+    var y := TCLimbAtP(pb, lb, b.fNeg, lowB, i);
+    pd[i] := case op of
       boAnd: x and y;
       boOr: x or y;
       boXor: x xor y;
     end;
   end;
   // the top limb came out either all zeros or all ones
-  var neg := res[n - 1] <> 0;
-  if neg then LTCNegateInPlace(res);
-  LNorm(res);
-  result.fNeg := neg and (Length(res) > 0);
-  MoveArr(res, @result.fInline[0], result.fArr, result.fLen);
+  var neg := pd[n - 1] <> 0;
+  if neg then LTCNegateInPlaceP(pd, n);
+  var m := n;
+  while (m > 0) and (pd[m - 1] = 0) do dec(m);
+  result.fNeg := neg and (m > 0);
+  if res = nil then begin
+    if m <= BIGINT_INLINE_LIMBS then PutInline(@buf[0], m, @result.fInline[0], result.fArr, result.fLen)
+    else PutSpill(@buf[0], m, result.fArr, result.fLen);
+  end else begin
+    SetLength(res, m);
+    MoveArr(res, @result.fInline[0], result.fArr, result.fLen);
+  end;
 end;
 
 // any nonzero bit among the n lowest bits (the bits a shr n drops)
-function LAnyDroppedBits(const a: TLimbs; n: LongWord): boolean;
+function LAnyDroppedBitsP(p: PLimb; len: SizeInt; n: LongWord): boolean;
 begin
   var limbShift := SizeInt(n shr LIMB_SHIFT);
   var bitShift := n and LIMB_MASK;
-  for var i := 0 to MinS(limbShift, Length(a)) - 1 do
-    if a[i] <> 0 then exit(true);
-  if (bitShift > 0) and (limbShift < Length(a)) then exit(a[limbShift] and ((TLimb(1) shl bitShift) - 1) <> 0);
+  for var i := 0 to MinS(limbShift, len) - 1 do
+    if p[i] <> 0 then exit(true);
+  if (bitShift > 0) and (limbShift < len) then exit(p[limbShift] and ((TLimb(1) shl bitShift) - 1) <> 0);
   result := false;
 end;
 
@@ -6079,9 +6123,26 @@ begin
     result.fNeg := true;
     exit;
   end;
-  var am := a.fLimbs;
-  m := LShr(am, LongWord(n));
-  if LAnyDroppedBits(am, LongWord(n)) then m := LAdd(m, LFromQWord(1));
+  var dropped := LAnyDroppedBitsP(a.dataPtr, a.fLen, LongWord(n));
+  if a.fArr = nil then begin
+    ShrInline(@a.fInline[0], a.fLen, LongWord(n), @result.fInline[0], result.fArr, result.fLen);
+    if dropped then begin
+      var ob: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+      var ol := QToInline(1, @ob[0]);
+      AddInline(@result.fInline[0], result.fLen, @ob[0], ol, @result.fInline[0], result.fArr, result.fLen);
+    end;
+    result.fNeg := result.fLen > 0;
+    exit;
+  end;
+  m := LShrP(a.dataPtr, a.fLen, LongWord(n));
+  if dropped then begin
+    // m is freshly built: increment in place, growing only on a full carry
+    if Length(m) = 0 then m := LFromQWord(1)
+    else if MpnAdd1(PLimb(Pointer(m)), PLimb(Pointer(m)), Length(m), 1) <> 0 then begin
+      SetLength(m, Length(m) + 1);
+      m[High(m)] := 1;
+    end;
+  end;
   result.fNeg := Length(m) > 0;
   MoveArr(m, @result.fInline[0], result.fArr, result.fLen);
 end;
@@ -6131,7 +6192,7 @@ end;
 
 class operator BigInt.=(const a, b: BigInt): boolean;
 begin
-  result := BCmp(a, b) = 0;
+  result := BEqB(a, b);
 end;
 
 class operator BigInt.=(const a: BigInt; b: Int64): boolean;
@@ -6146,7 +6207,7 @@ end;
 
 class operator BigInt.<>(const a, b: BigInt): boolean;
 begin
-  result := BCmp(a, b) <> 0;
+  result := not BEqB(a, b);
 end;
 
 class operator BigInt.<>(const a: BigInt; b: Int64): boolean;
@@ -6161,7 +6222,7 @@ end;
 
 class operator BigInt.<(const a, b: BigInt): boolean;
 begin
-  result := BCmp(a, b) < 0;
+  result := BLess(a, b);
 end;
 
 class operator BigInt.<(const a: BigInt; b: Int64): boolean;
@@ -6176,7 +6237,7 @@ end;
 
 class operator BigInt.<=(const a, b: BigInt): boolean;
 begin
-  result := BCmp(a, b) <= 0;
+  result := not BLess(b, a);
 end;
 
 class operator BigInt.<=(const a: BigInt; b: Int64): boolean;
@@ -6191,7 +6252,7 @@ end;
 
 class operator BigInt.>(const a, b: BigInt): boolean;
 begin
-  result := BCmp(a, b) > 0;
+  result := BLess(b, a);
 end;
 
 class operator BigInt.>(const a: BigInt; b: Int64): boolean;
@@ -6206,7 +6267,7 @@ end;
 
 class operator BigInt.>=(const a, b: BigInt): boolean;
 begin
-  result := BCmp(a, b) >= 0;
+  result := not BLess(a, b);
 end;
 
 class operator BigInt.>=(const a: BigInt; b: Int64): boolean;
@@ -6462,8 +6523,8 @@ end;
 
 function BigInt.testBit(i: LongWord): boolean;
 begin
-  if not fNeg then exit(LTestBit(fLimbs, i));
-  var v := TCLimbAt(fLimbs, true, LLowestNZ(fLimbs), SizeInt(i shr LIMB_SHIFT));
+  if not fNeg then exit(LTestBitP(dataPtr, fLen, i));
+  var v := TCLimbAtP(dataPtr, fLen, true, LLowestNZP(dataPtr, fLen), SizeInt(i shr LIMB_SHIFT));
   result := (v shr (i and LIMB_MASK)) and 1 <> 0;
 end;
 
@@ -6878,8 +6939,9 @@ begin
   // minimal two's complement including the sign bit
   var n := SizeInt(bitLength div 8) + 1;
   SetLength(res, n);
-  var low := LLowestNZ(fLimbs);
-  for var i := 0 to n - 1 do res[i] := byte(TCLimbAt(fLimbs, fNeg, low, i shr BYTES_SHIFT) shr ((i and BYTES_MASK) * 8));
+  var p := dataPtr;
+  var low := LLowestNZP(p, fLen);
+  for var i := 0 to n - 1 do res[i] := byte(TCLimbAtP(p, fLen, fNeg, low, i shr BYTES_SHIFT) shr ((i and BYTES_MASK) * 8));
   result := res;
 end;
 
@@ -6901,7 +6963,7 @@ begin
   // sign-extend the incomplete top limb (a full top limb gets all its bytes)
   if neg and (n and BYTES_MASK <> 0) then res[limbCount - 1] := High(TLimb) shl ((n and BYTES_MASK) * 8);
   for var i := 0 to n - 1 do res[i shr BYTES_SHIFT] := res[i shr BYTES_SHIFT] or (TLimb(bytes[i]) shl ((i and BYTES_MASK) * 8));
-  if neg then LTCNegateInPlace(res);
+  if neg then LTCNegateInPlaceP(PLimb(Pointer(res)), Length(res));
   LNorm(res);
   result.fLimbs := res;
   result.fNeg := neg and (Length(res) > 0);
@@ -7343,24 +7405,37 @@ begin
   r := LAdd(LShl(r2, k), LSub(m, LShl(m1, k)));
 end;
 
-// multiply a magnitude by 10^k
-function LScale10(const a: TLimbs; k: Int64): TLimbs;
+// multiply a (ptr, len) magnitude view by 10^k; k <= 0 hands back a copy
+function LScale10P(p: PLimb; len: SizeInt; k: Int64): TLimbs;
 begin
-  result := a;
-  if (k <= 0) or (Length(a) = 0) then exit;
+  if (k <= 0) or (len = 0) then exit(MakeLimbs(p, len));
   if k <= 2 * DEC_CHUNK_POW then begin
-    var r := a;
-    while k >= DEC_CHUNK_POW do begin
-      r := LMulW(r, DEC_CHUNK);
+    var r: TLimbs;
+    if k >= DEC_CHUNK_POW then begin
+      r := LMulWP(p, len, DEC_CHUNK);
       k := k - DEC_CHUNK_POW;
-    end;
-    if k > 0 then r := LMulW(r, TLimb(POW10Q[k]));
+      if k >= DEC_CHUNK_POW then begin
+        r := LMulW(r, DEC_CHUNK);
+        k := k - DEC_CHUNK_POW;
+      end;
+      if k > 0 then r := LMulW(r, TLimb(POW10Q[k]));
+    end else r := LMulWP(p, len, TLimb(POW10Q[k]));
     result := r;
-  end else if k <= 128 then result := LMul(a, UPow10(LongWord(k)).fLimbs)
-  else
+  end else if k <= 128 then begin
+    var f := UPow10(LongWord(k)).fLimbs;
+    result := LMulP(p, len, PLimb(Pointer(f)), Length(f));
+  end else begin
     // large gap: 10^k = 5^k shl k; 5^k has ~30% fewer bits than 10^k, so both
     // building it and the multiply are cheaper and the binary shift is linear
-    result := LShl(LMul(a, UPow5(LongWord(k))), LongWord(k));
+    var f := UPow5(LongWord(k));
+    result := LShl(LMulP(p, len, PLimb(Pointer(f)), Length(f)), LongWord(k));
+  end;
+end;
+
+function LScale10(const a: TLimbs; k: Int64): TLimbs;
+begin
+  if (k <= 0) or (Length(a) = 0) then exit(a);
+  result := LScale10P(PLimb(Pointer(a)), Length(a), k);
 end;
 
 // strip trailing decimal zeros of a magnitude, bumping the exponent
@@ -7414,12 +7489,14 @@ begin
     d.fExp := 0;
     exit;
   end;
-  // only materialize and strip when the mantissa actually ends in a decimal
-  // zero; most results do not, so this skips an allocation on the hot path
-  if not d.fHidden and (LModWP(d.fMan.dataPtr, d.fMan.fLen, 10) = 0) then begin
+  // an odd mantissa cannot end in a decimal zero, so most results skip the
+  // strip without touching more than the low limb; LStrip10 bounds its own
+  // work by the 2-adic valuation for the rest
+  if not d.fHidden and (d.fMan.dataPtr[0] and 1 = 0) then begin
+    var e0 := e;
     var sm := d.fMan.fLimbs;
     LStrip10(sm, e);
-    d.fMan.fLimbs := sm;
+    if e <> e0 then d.fMan.fLimbs := sm;
   end;
   d.fExp := DecExp(e);
 end;
@@ -7456,9 +7533,9 @@ begin
 end;
 
 // bounds for the exponent of the leading decimal digit (1233/4096 < log10 2)
-procedure DecMagBounds(const m: TLimbs; e: Int64; out lo, hi: Int64);
+procedure DecMagBoundsP(p: PLimb; len: SizeInt; e: Int64; out lo, hi: Int64);
 begin
-  var bl := Int64(LBitLen(m));
+  var bl := Int64(LBitLenP(p, len));
   lo := (bl - 1) * 1233 div 4096 + e;
   hi := bl * 1233 div 4096 + 1 + e;
 end;
@@ -7469,22 +7546,27 @@ begin
   var sb := b.fMan.sign;
   if sa <> sb then exit(if sa < sb then -1 else 1);
   if sa = 0 then exit(0);
-  // same scale and small mantissas: compare right on the records
-  if (a.fExp = b.fExp) and (a.fMan.fArr = nil) and (b.fMan.fArr = nil) then begin
-    var c := LCmpP(@a.fMan.fInline[0], a.fMan.fLen, @b.fMan.fInline[0], b.fMan.fLen);
+  // same scale: the mantissas compare directly, whatever their storage
+  if a.fExp = b.fExp then begin
+    var c := LCmpP(a.fMan.dataPtr, a.fMan.fLen, b.fMan.dataPtr, b.fMan.fLen);
     exit(if sa < 0 then -c else c);
   end;
   // disjoint leading-digit positions decide without aligning
   var loA, hiA, loB, hiB: Int64;
-  DecMagBounds(a.fMan.fLimbs, a.fExp, loA, hiA);
-  DecMagBounds(b.fMan.fLimbs, b.fExp, loB, hiB);
+  DecMagBoundsP(a.fMan.dataPtr, a.fMan.fLen, a.fExp, loA, hiA);
+  DecMagBoundsP(b.fMan.dataPtr, b.fMan.fLen, b.fExp, loB, hiB);
   var c: integer;
   if hiA < loB then c := -1
   else if hiB < loA then c := 1
   else begin
     var d := Int64(a.fExp) - b.fExp;
-    if d >= 0 then c := LCmp(LScale10(a.fMan.fLimbs, d), b.fMan.fLimbs)
-    else c := LCmp(a.fMan.fLimbs, LScale10(b.fMan.fLimbs, -d));
+    if d > 0 then begin
+      var t := LScale10P(a.fMan.dataPtr, a.fMan.fLen, d);
+      c := LCmpP(PLimb(Pointer(t)), Length(t), b.fMan.dataPtr, b.fMan.fLen);
+    end else begin
+      var t := LScale10P(b.fMan.dataPtr, b.fMan.fLen, -d);
+      c := -LCmpP(PLimb(Pointer(t)), Length(t), a.fMan.dataPtr, a.fMan.fLen);
+    end;
   end;
   result := if sa < 0 then -c else c;
 end;
@@ -7505,7 +7587,10 @@ begin
       DecFinish(result, Int64(a.fExp), a.fHidden or b.fHidden);
       exit;
     end;
-    exit(DecMake(if negateB then a.fMan - b.fMan else a.fMan + b.fMan, Int64(a.fExp), a.fHidden or b.fHidden));
+    if negateB then result.fMan := a.fMan - b.fMan
+    else result.fMan := a.fMan + b.fMan;
+    DecFinish(result, Int64(a.fExp), a.fHidden or b.fHidden);
+    exit;
   end;
   // small mantissas over a modest gap: scale the higher-exponent one by a
   // single-limb power of ten on the stack, then add inline with no allocation
@@ -7536,11 +7621,19 @@ begin
       end;
     end;
   end;
-  // align both mantissas to the smaller exponent
-  var e := if Int64(a.fExp) < b.fExp then Int64(a.fExp) else Int64(b.fExp);
-  var am := LScale10(a.fMan.fLimbs, Int64(a.fExp) - e);
-  var bm := LScale10(b.fMan.fLimbs, Int64(b.fExp) - e);
-  result := DecMake(SAddPair(am, a.fMan.fNeg, bm, b.fMan.fNeg xor negateB), e, a.fHidden or b.fHidden);
+  // align to the smaller exponent: only the higher-exponent side is scaled,
+  // the other one is read in place
+  var d2 := Int64(a.fExp) - b.fExp;
+  var sm: TLimbs;
+  if d2 > 0 then begin
+    sm := LScale10P(a.fMan.dataPtr, a.fMan.fLen, d2);
+    SAddP(PLimb(Pointer(sm)), Length(sm), a.fMan.fNeg, b.fMan.dataPtr, b.fMan.fLen, b.fMan.fNeg xor negateB, @result.fMan.fInline[0], result.fMan.fArr, result.fMan.fLen, result.fMan.fNeg);
+    DecFinish(result, Int64(b.fExp), a.fHidden or b.fHidden);
+  end else begin
+    sm := LScale10P(b.fMan.dataPtr, b.fMan.fLen, -d2);
+    SAddP(a.fMan.dataPtr, a.fMan.fLen, a.fMan.fNeg, PLimb(Pointer(sm)), Length(sm), b.fMan.fNeg xor negateB, @result.fMan.fInline[0], result.fMan.fArr, result.fMan.fLen, result.fMan.fNeg);
+    DecFinish(result, Int64(a.fExp), a.fHidden or b.fHidden);
+  end;
 end;
 
 class operator BigDecimal.:=(x: Int64): BigDecimal;
@@ -7636,7 +7729,8 @@ begin
     DecFinish(result, Int64(a.fExp) + b.fExp, a.fHidden or b.fHidden);
     exit;
   end;
-  result := DecMake(SMulPair(a.fMan.fLimbs, a.fMan.fNeg, b.fMan.fLimbs, b.fMan.fNeg), Int64(a.fExp) + b.fExp, a.fHidden or b.fHidden);
+  SMulP(a.fMan.dataPtr, a.fMan.fLen, a.fMan.fNeg, b.fMan.dataPtr, b.fMan.fLen, b.fMan.fNeg, @result.fMan.fInline[0], result.fMan.fArr, result.fMan.fLen, result.fMan.fNeg);
+  DecFinish(result, Int64(a.fExp) + b.fExp, a.fHidden or b.fHidden);
 end;
 
 class operator BigDecimal./(const a, b: BigDecimal): BigDecimal;
@@ -8094,7 +8188,7 @@ begin
   if precision < 0 then precision := 0;
   // guard position: below the requested fractional digits, both operands'
   // last digits, and `precision` significant digits of a small quotient
-  var ms := (Int64(LBitLen(fMan.fLimbs)) - LBitLen(other.fMan.fLimbs) - 1) * 1233;
+  var ms := (Int64(LBitLenP(fMan.dataPtr, fMan.fLen)) - LBitLenP(other.fMan.dataPtr, other.fMan.fLen) - 1) * 1233;
   ms := (if ms >= 0 then ms div 4096 else -((-ms + 4095) div 4096)) + fExp - other.fExp;
   var er := -Int64(precision);
   if fExp < er then er := fExp;
@@ -8102,20 +8196,18 @@ begin
   if ms - precision + 1 < er then er := ms - precision + 1;
   er := er - 1;
   var t := Int64(fExp) - other.fExp - er;
-  var n, dm: TLimbs;
-  if t >= 0 then begin
-    n := LScale10(fMan.fLimbs, t);
-    dm := other.fMan.fLimbs;
-  end else begin
-    n := fMan.fLimbs;
-    dm := LScale10(other.fMan.fLimbs, -t);
-  end;
+  var s: TLimbs;
   var q, r: TLimbs;
-  LDivMod(n, dm, q, r);
-  var m: BigInt;
-  m.fLimbs := q;
-  m.fNeg := (fMan.fNeg xor other.fMan.fNeg) and (Length(q) > 0);
-  result := DecMake(m, er, Length(r) > 0);
+  if t > 0 then begin
+    s := LScale10P(fMan.dataPtr, fMan.fLen, t);
+    LDivModP(PLimb(Pointer(s)), Length(s), other.fMan.dataPtr, other.fMan.fLen, q, r);
+  end else if t < 0 then begin
+    s := LScale10P(other.fMan.dataPtr, other.fMan.fLen, -t);
+    LDivModP(fMan.dataPtr, fMan.fLen, PLimb(Pointer(s)), Length(s), q, r);
+  end else LDivModP(fMan.dataPtr, fMan.fLen, other.fMan.dataPtr, other.fMan.fLen, q, r);
+  result.fMan.fNeg := (fMan.fNeg xor other.fMan.fNeg) and (Length(q) > 0);
+  MoveArr(q, @result.fMan.fInline[0], result.fMan.fArr, result.fMan.fLen);
+  DecFinish(result, er, Length(r) > 0);
 end;
 
 function BigDecimal.divMod(const d: BigDecimal): (q, r: BigDecimal);
@@ -8469,7 +8561,7 @@ begin
   if a.fMan.fLen = 0 then exit(0.0);
   var sgn: Extended := if a.fMan.fNeg then -1.0 else 1.0;
   var lo, hi: Int64;
-  DecMagBounds(a.fMan.fLimbs, a.fExp, lo, hi);
+  DecMagBoundsP(a.fMan.dataPtr, a.fMan.fLen, a.fExp, lo, hi);
   // decimal guards keep absurd exponents from materializing huge powers
   if lo > 4940 then exit(sgn * Infinity);
   if hi < -4970 then exit(sgn * 0.0);
@@ -8835,7 +8927,7 @@ begin
   if p < 0 then p := 0;
   if fMan.isZero then exit(BigDecimal.one);
   var lo, hi: Int64;
-  DecMagBounds(fMan.fLimbs, fExp, lo, hi);
+  DecMagBoundsP(fMan.dataPtr, fMan.fLen, fExp, lo, hi);
   // e^(10^10) does not fit a 32-bit decimal exponent anymore
   if hi >= 10 then RaiseDecExpRange;
   var ax := toDouble;
@@ -9020,7 +9112,7 @@ end;
 procedure TrigReduce(const a: BigDecimal; w: Int64; out r: BigInt; out quad: integer);
 begin
   var lo, hi: Int64;
-  DecMagBounds(a.fMan.fLimbs, a.fExp, lo, hi);
+  DecMagBoundsP(a.fMan.dataPtr, a.fMan.fLen, a.fExp, lo, hi);
   var wred := w + 8;
   if hi > 0 then wred := wred + hi;
   var xu: UBigInt;
@@ -9282,7 +9374,7 @@ begin
   end;
   // (e^x - e^-x) / 2
   var lo, hi: Int64;
-  DecMagBounds(fMan.fLimbs, fExp, lo, hi);
+  DecMagBoundsP(fMan.dataPtr, fMan.fLen, fExp, lo, hi);
   if hi >= 10 then RaiseDecExpRange;
   var ax := toDouble;
   if ax < 0 then ax := -ax;
@@ -9302,7 +9394,7 @@ begin
   if p < 0 then p := 0;
   if fMan.isZero then exit(BigDecimal.one);
   var lo, hi: Int64;
-  DecMagBounds(fMan.fLimbs, fExp, lo, hi);
+  DecMagBoundsP(fMan.dataPtr, fMan.fLen, fExp, lo, hi);
   if hi >= 10 then RaiseDecExpRange;
   var ax := toDouble;
   if ax < 0 then ax := -ax;
