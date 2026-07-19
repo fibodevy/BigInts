@@ -15,7 +15,8 @@ unit BigInts;
 {$mode unleashed}
 
 // asm inner loops on x86_64; comment out to build the fully portable pure
-// Pascal core (32-bit limbs) on every target
+// Pascal core (64-bit limbs when the compiler provides a native UInt128 on a
+// 64-bit CPU, 32-bit limbs otherwise)
 {$define USEASM}
 
 {$if defined(CPUX86_64) and defined(USEASM)}{$define BIGINT_ASM}{$endif}
@@ -29,13 +30,17 @@ unit BigInts;
 
 interface
 
-// native UInt128 (x86_64 compilers that provide it): double-limb products and
+// native UInt128 (compilers that provide it): double-limb products and
 // the PCG64 state advance become single inline multiplies instead of calls
 // (declared() only resolves system types from the interface part on)
 // BIGINT_HAS_INT128 gates the public Int128/UInt128 conversions (they need
-// only the type); BIGINT_INT128 additionally requires the asm build and drives
-// the inline double-limb product and PCG64 advance
-{$if declared(UInt128)}{$define BIGINT_HAS_INT128}{$if defined(BIGINT_ASM)}{$define BIGINT_INT128}{$endif}{$endif}
+// only the type); BIGINT_INT128 additionally requires a 64-bit CPU and drives
+// the inline double-limb product and PCG64 advance; BIGINT_PP128 marks the
+// pure Pascal build that still gets 64-bit limbs, with UInt128 double-limb
+// temps in the portable kernels
+{$if declared(UInt128)}{$define BIGINT_HAS_INT128}{$if defined(CPU64)}{$define BIGINT_INT128}{$endif}{$endif}
+{$if defined(BIGINT_INT128) and not defined(BIGINT_ASM)}{$define BIGINT_PP128}{$endif}
+{$if defined(BIGINT_ASM) or defined(BIGINT_PP128)}{$define BIGINT_LIMB64}{$endif}
 
 uses SysUtils;
 
@@ -49,9 +54,9 @@ type
   // the RandSeed-driven System.Random stream, rngOS reads OS entropy per call
   TBigIntRngAlgo = (rngXoshiro256ss, rngPcg64, rngSplitMix64, rngSystem, rngOS);
 
-  // internal storage: little-endian array of limbs (64-bit on x86_64, 32-bit
-  // elsewhere), highest limb nonzero, nil = 0
-  {$ifdef BIGINT_ASM}
+  // internal storage: little-endian array of limbs (64-bit on 64-bit CPUs,
+  // 32-bit elsewhere), highest limb nonzero, nil = 0
+  {$ifdef BIGINT_LIMB64}
   TBigIntLimb = QWord;
   {$else}
   TBigIntLimb = DWord;
@@ -62,7 +67,7 @@ type
 const
   // values up to this many limbs (256 bits) live inline in the record with no
   // heap allocation; larger ones spill into a refcounted block. tunable
-  {$ifdef BIGINT_ASM}
+  {$ifdef BIGINT_LIMB64}
   BIGINT_INLINE_LIMBS = 4;
   {$else}
   BIGINT_INLINE_LIMBS = 8;
@@ -866,7 +871,7 @@ end;
 {$ifdef BIGINT_ASM}{$asmmode intel}{$endif}
 
 const
-{$ifdef BIGINT_ASM}
+{$ifdef BIGINT_LIMB64}
   LIMB_BITS = 64;
   LIMB_SHIFT = 6;               // shl/shr LIMB_SHIFT = mul/div by LIMB_BITS
 {$else}
@@ -1258,32 +1263,49 @@ end;
 
 {$else}
 
-// portable 32-bit primitives: carries ride in the top half of QWord temps
+// portable primitives: carries ride in the top half of double-width temps
+// (UInt128 with 64-bit limbs, QWord with 32-bit)
+
+type
+  {$ifdef BIGINT_PP128}
+  TWide = UInt128;
+  {$else}
+  TWide = QWord;
+  {$endif}
 
 function LimbBsr(x: TLimb): LongWord; inline;
 begin
+  {$ifdef BIGINT_PP128}
+  result := BsrQWord(x);
+  {$else}
   result := BsrDWord(x);
+  {$endif}
 end;
 
 function LimbBsf(x: TLimb): LongWord; inline;
 begin
+  {$ifdef BIGINT_PP128}
+  result := BsfQWord(x);
+  {$else}
   result := BsfDWord(x);
+  {$endif}
 end;
 
 // 2-limb product of a * b
 procedure UMulLimb(a, b: TLimb; out hi, lo: TLimb); inline;
 begin
-  var p := QWord(a) * b;
+  var p := TWide(a) * b;
   lo := TLimb(p);
-  hi := TLimb(p shr 32);
+  hi := TLimb(p shr LIMB_BITS);
 end;
 
 // (hi:lo) div d and its remainder, caller guarantees hi < d
 function UDivLimb(hi, lo, d: TLimb; out rem: TLimb): TLimb; inline;
 begin
-  var cur := (QWord(hi) shl 32) or lo;
+  var cur := (TWide(hi) shl LIMB_BITS) or lo;
   result := TLimb(cur div d);
-  rem := TLimb(cur mod d);
+  // remainder fits a limb, so mul-back in limb width beats a second wide mod
+  rem := TLimb(cur) - result * d;
 end;
 
 // mpn-style row primitives: fixed-length limb runs behind raw pointers with
@@ -1292,11 +1314,11 @@ end;
 // rp := ap + bp over n limbs, returns carry
 function MpnAddN(rp, ap, bp: PLimb; n: SizeInt): TLimb;
 begin
-  var carry: QWord := 0;
+  var carry: TWide := 0;
   for var i := 0 to n - 1 do begin
     carry := carry + ap[i] + bp[i];
     rp[i] := TLimb(carry);
-    carry := carry shr 32;
+    carry := carry shr LIMB_BITS;
   end;
   result := TLimb(carry);
 end;
@@ -1304,11 +1326,11 @@ end;
 // rp := ap - bp over n limbs, returns borrow
 function MpnSubN(rp, ap, bp: PLimb; n: SizeInt): TLimb;
 begin
-  var borrow: QWord := 0;
+  var borrow: TWide := 0;
   for var i := 0 to n - 1 do begin
-    var t := QWord(ap[i]) - bp[i] - borrow;
+    var t := TWide(ap[i]) - bp[i] - borrow;
     rp[i] := TLimb(t);
-    borrow := (t shr 32) and 1;
+    borrow := (t shr LIMB_BITS) and 1;
   end;
   result := TLimb(borrow);
 end;
@@ -1346,11 +1368,11 @@ end;
 // rp := ap * b, returns the high limb
 function MpnMul1(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb;
 begin
-  var carry: QWord := 0;
+  var carry: TWide := 0;
   for var i := 0 to n - 1 do begin
-    carry := QWord(ap[i]) * b + carry;
+    carry := TWide(ap[i]) * b + carry;
     rp[i] := TLimb(carry);
-    carry := carry shr 32;
+    carry := carry shr LIMB_BITS;
   end;
   result := TLimb(carry);
 end;
@@ -1358,11 +1380,11 @@ end;
 // rp += ap * b, returns the carry limb
 function MpnAddMul1(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb;
 begin
-  var carry: QWord := 0;
+  var carry: TWide := 0;
   for var i := 0 to n - 1 do begin
-    carry := QWord(rp[i]) + QWord(ap[i]) * b + carry;
+    carry := TWide(rp[i]) + TWide(ap[i]) * b + carry;
     rp[i] := TLimb(carry);
-    carry := carry shr 32;
+    carry := carry shr LIMB_BITS;
   end;
   result := TLimb(carry);
 end;
@@ -1370,12 +1392,12 @@ end;
 // rp -= ap * b, returns the borrow limb
 function MpnSubMul1(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb;
 begin
-  var carry: QWord := 0;
+  var carry: TWide := 0;
   for var i := 0 to n - 1 do begin
-    var p := QWord(ap[i]) * b + carry;
-    var t := QWord(rp[i]) - TLimb(p);
+    var p := TWide(ap[i]) * b + carry;
+    var t := TWide(rp[i]) - TLimb(p);
     rp[i] := TLimb(t);
-    carry := (p shr 32) + ((t shr 32) and 1);
+    carry := (p shr LIMB_BITS) + ((t shr LIMB_BITS) and 1);
   end;
   result := TLimb(carry);
 end;
