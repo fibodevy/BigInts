@@ -931,6 +931,10 @@ end;
 // mpn-style row primitives: fixed-length limb runs behind raw pointers with
 // the carry/borrow returned to the caller; rp may alias ap (and bp)
 
+// 64-byte entry alignment pins the inner-loop labels to fixed cache-line
+// offsets, so kernel timing does not drift with the binary's code layout
+{$codealign proc=64}
+
 // rp := ap + bp over n limbs, returns carry
 function MpnAddN(rp, ap, bp: PLimb; n: SizeInt): TLimb; assembler; nostackframe;
 asm
@@ -1097,6 +1101,7 @@ asm
 @even:
   test al, al              // CF = 0, OF = 0: both chains start clean
   jrcxz @fold
+  align 32                 // pin the loop to a fixed cache-line offset
 @loop:
   mulx r9, rax, [r10]
   adcx rax, r11            // CF chain: previous high limb
@@ -1153,7 +1158,7 @@ begin
 end;
 
 // rp -= ap * b, returns the borrow limb
-function MpnSubMul1(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb; assembler; nostackframe;
+function MpnSubMul1Gen(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb; assembler; nostackframe;
 asm
   mov r10, rdx
   xor r11d, r11d
@@ -1173,6 +1178,36 @@ asm
   jnz @loop
 @done:
   mov rax, r11
+end;
+
+// two-chain variant: the product row rides the OF chain (adox), the borrow
+// rides the CF chain through the memory subtract, so the serial part is one
+// sbb per limb instead of four flag-coupled ops
+function MpnSubMul1Adx(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb; assembler; nostackframe;
+asm
+  mov r10, rdx        // ap
+  mov rdx, r9         // b, implicit mulx operand
+  xor r11d, r11d      // row carry = 0, CF = 0, OF = 0
+  test r8, r8
+  jz @done
+@loop:
+  mulx r9, rax, [r10]
+  adox rax, r11       // lo += row carry, OF = overflow
+  mov r11d, 0
+  adox r11, r9        // row carry = hi + overflow (cannot wrap), OF = 0
+  sbb [rcx], rax      // borrow chain lives in CF across iterations
+  lea r10, [r10 + 8]
+  lea rcx, [rcx + 8]
+  dec r8              // dec leaves CF alone
+  jnz @loop
+@done:
+  mov rax, r11
+  adc rax, 0          // fold the final borrow into the carry limb
+end;
+
+function MpnSubMul1(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb; inline;
+begin
+  result := if UseAdx then MpnSubMul1Adx(rp, ap, n, b) else MpnSubMul1Gen(rp, ap, n, b);
 end;
 
 // rp := ap shl cnt for cnt in 1..LIMB_BITS-1, walks high to low so rp may
@@ -1221,6 +1256,8 @@ asm
   shr rax, cl
   mov [r11 + r8*8 - 8], rax
 end;
+
+{$codealign proc=16}
 
 {$else}
 
@@ -1425,6 +1462,14 @@ begin
   if len = 0 then exit;
   result := LNew(len);
   Move(p^, result[0], len * SizeOf(TLimb));
+end;
+
+// true when the spill array is exclusively owned (dynarray refcount 1), so
+// bit mutators may edit it in place with no copy; reads the FPC dynarray
+// header (refcount, high) that sits right before the data
+function ArrUnshared(const a: TLimbs): boolean; inline;
+begin
+  result := PPtrInt(Pointer(a))[-2] = 1;
 end;
 
 // store a limb array into inline-or-spill storage, normalizing the length.
@@ -1856,12 +1901,14 @@ begin
   end;
 end;
 
-// (pa, alen) divMod (pb, blen) for values that fit inline, blen >= 1; the
-// quotient (<= alen limbs) and remainder (< blen limbs) always fit inline.
+// (pa, alen) divMod (pb, blen) for alen up to twice the inline capacity and
+// an inline divisor (blen in 1..BIGINT_INLINE_LIMBS): covers the common
+// double-width-dividend division with no heap allocation. qb must hold alen
+// limbs, rb MaxS(alen, blen) limbs (a < b leaves the whole dividend in rb).
 // computes into caller stack buffers qb/rb, so results may alias the operands
 procedure DivModInline(pa: PLimb; alen: SizeInt; pb: PLimb; blen: SizeInt; qb: PLimb; out qlen: SizeInt; rb: PLimb; out rlen: SizeInt);
 var
-  un: array[0..BIGINT_INLINE_LIMBS] of TLimb;
+  un: array[0..2 * BIGINT_INLINE_LIMBS] of TLimb;
   vn: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
 begin
   if LCmpP(pa, alen, pb, blen) < 0 then begin
@@ -2083,6 +2130,14 @@ begin
   // the row order writes every limb before it is read, no zero fill needed
   res := LNew(la + lb);
   res[la] := MpnMul1(@res[0], pa, la, pb[0]);
+  {$ifdef BIGINT_ASM}
+  // hoist the adx dispatch out of the row loop
+  if UseAdx then begin
+    for var j := 1 to lb - 1 do res[la + j] := MpnAddMul1Adx(@res[j], pa, la, pb[j]);
+    LNorm(res);
+    exit(res);
+  end;
+  {$endif}
   for var j := 1 to lb - 1 do res[la + j] := MpnAddMul1(@res[j], pa, la, pb[j]);
   LNorm(res);
   result := res;
@@ -2389,9 +2444,16 @@ end;
 // full division, Knuth algorithm D; v <> 0 guaranteed by callers
 // q and r are out params, so callers must pass fresh locals, never anything
 // that may alias u or v (managed out params are finalized on entry)
+const
+  // stack scratch for the normalized dividend+divisor in LDivModP: covers
+  // divisions with up to a 4KB working set (32k-bit dividends on 64-bit
+  // limbs) with no heap traffic and layout-independent addresses
+  DIVMOD_STACK_LIMBS = 512;
+
 procedure LDivModP(pu: PLimb; m: SizeInt; pv: PLimb; n: SizeInt; out q, r: TLimbs);
 var
-  un, vn: TLimbs;
+  scratch: TLimbs;
+  stackBuf: array[0..DIVMOD_STACK_LIMBS - 1] of TLimb;
   rw: TLimb;
 begin
   if LCmpP(pu, m, pv, n) < 0 then begin
@@ -2404,10 +2466,15 @@ begin
     r := LFromQWord(rw);
     exit;
   end;
-  // normalize so the top bit of vn[n-1] is set
+  // normalize so the top bit of vn[n-1] is set; un and vn share one scratch
+  // block (un at 0, vn right after), on the stack whenever it fits
   var s := LIMB_MASK - integer(LimbBsr(pv[n - 1]));
-  vn := LNew(n);
-  un := LNew(m + 1);
+  var un: PLimb := @stackBuf[0];
+  if m + 1 + n > DIVMOD_STACK_LIMBS then begin
+    scratch := LNew(m + 1 + n);
+    un := @scratch[0];
+  end;
+  var vn: PLimb := @un[m + 1];
   if s = 0 then begin
     Move(pv^, vn[0], n * SizeOf(TLimb));
     Move(pu^, un[0], m * SizeOf(TLimb));
@@ -3220,11 +3287,12 @@ var
   q, r: TLimbs;
 begin
   if b.fLen = 0 then RaiseDivByZero;
-  if (a.fArr = nil) and (b.fArr = nil) then begin
-    var qb, rb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+  if (b.fArr = nil) and (a.fLen <= 2 * BIGINT_INLINE_LIMBS) then begin
+    var qb, rb: array[0..2 * BIGINT_INLINE_LIMBS - 1] of TLimb;
     var ql, rl: SizeInt;
-    DivModInline(@a.fInline[0], a.fLen, @b.fInline[0], b.fLen, @qb[0], ql, @rb[0], rl);
-    PutInline(@qb[0], ql, @result.fInline[0], result.fArr, result.fLen);
+    DivModInline(a.dataPtr, a.fLen, @b.fInline[0], b.fLen, @qb[0], ql, @rb[0], rl);
+    if ql <= BIGINT_INLINE_LIMBS then PutInline(@qb[0], ql, @result.fInline[0], result.fArr, result.fLen)
+    else PutSpill(@qb[0], ql, result.fArr, result.fLen);
     exit;
   end;
   LDivModP(a.dataPtr, a.fLen, b.dataPtr, b.fLen, q, r);
@@ -3243,7 +3311,7 @@ begin
     if a.fLen <> 0 then RaiseNegativeUnsigned;
     exit(default(UBigInt));
   end;
-  if a.fArr = nil then begin
+  if a.fLen <= 2 * BIGINT_INLINE_LIMBS then begin
     var db: array[0..1] of TLimb;
     db[0] := TLimb(b);
     {$if LIMB_BITS = 64}
@@ -3252,10 +3320,11 @@ begin
     db[1] := TLimb(QWord(b) shr 32);
     var dl: SizeInt := if db[1] <> 0 then 2 else 1;
     {$endif}
-    var qb, rb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+    var qb, rb: array[0..2 * BIGINT_INLINE_LIMBS - 1] of TLimb;
     var ql, rl: SizeInt;
-    DivModInline(@a.fInline[0], a.fLen, @db[0], dl, @qb[0], ql, @rb[0], rl);
-    PutInline(@qb[0], ql, @result.fInline[0], result.fArr, result.fLen);
+    DivModInline(a.dataPtr, a.fLen, @db[0], dl, @qb[0], ql, @rb[0], rl);
+    if ql <= BIGINT_INLINE_LIMBS then PutInline(@qb[0], ql, @result.fInline[0], result.fArr, result.fLen)
+    else PutSpill(@qb[0], ql, result.fArr, result.fLen);
     exit;
   end;
   {$if LIMB_BITS = 64}
@@ -3277,11 +3346,13 @@ var
   q, r: TLimbs;
 begin
   if b.fLen = 0 then RaiseDivByZero;
-  if (a.fArr = nil) and (b.fArr = nil) then begin
-    var qb, rb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+  if (b.fArr = nil) and (a.fLen <= 2 * BIGINT_INLINE_LIMBS) then begin
+    var qb, rb: array[0..2 * BIGINT_INLINE_LIMBS - 1] of TLimb;
     var ql, rl: SizeInt;
-    DivModInline(@a.fInline[0], a.fLen, @b.fInline[0], b.fLen, @qb[0], ql, @rb[0], rl);
-    PutInline(@rb[0], rl, @result.fInline[0], result.fArr, result.fLen);
+    DivModInline(a.dataPtr, a.fLen, @b.fInline[0], b.fLen, @qb[0], ql, @rb[0], rl);
+    // a < b leaves the whole dividend as the remainder, which can spill
+    if rl <= BIGINT_INLINE_LIMBS then PutInline(@rb[0], rl, @result.fInline[0], result.fArr, result.fLen)
+    else PutSpill(@rb[0], rl, result.fArr, result.fLen);
     exit;
   end;
   LDivModP(a.dataPtr, a.fLen, b.dataPtr, b.fLen, q, r);
@@ -3298,7 +3369,7 @@ begin
   if b = 0 then RaiseDivByZero;
   // remainder of a nonnegative dividend is nonnegative for either divisor sign
   var m: QWord := if b > 0 then QWord(b) else NegAbs64(b);
-  if a.fArr = nil then begin
+  if a.fLen <= 2 * BIGINT_INLINE_LIMBS then begin
     var db: array[0..1] of TLimb;
     db[0] := TLimb(m);
     {$if LIMB_BITS = 64}
@@ -3307,10 +3378,11 @@ begin
     db[1] := TLimb(m shr 32);
     var dl: SizeInt := if db[1] <> 0 then 2 else 1;
     {$endif}
-    var qb, rb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+    var qb, rb: array[0..2 * BIGINT_INLINE_LIMBS - 1] of TLimb;
     var ql, rl: SizeInt;
-    DivModInline(@a.fInline[0], a.fLen, @db[0], dl, @qb[0], ql, @rb[0], rl);
-    PutInline(@rb[0], rl, @result.fInline[0], result.fArr, result.fLen);
+    DivModInline(a.dataPtr, a.fLen, @db[0], dl, @qb[0], ql, @rb[0], rl);
+    if rl <= BIGINT_INLINE_LIMBS then PutInline(@rb[0], rl, @result.fInline[0], result.fArr, result.fLen)
+    else PutSpill(@rb[0], rl, result.fArr, result.fLen);
     exit;
   end;
   {$if LIMB_BITS = 64}
@@ -3746,9 +3818,26 @@ end;
 procedure UBigInt.setBit(i: LongWord);
 begin
   var limb := SizeInt(i shr LIMB_SHIFT);
+  var mask := TLimb(1) shl (i and LIMB_MASK);
+  if limb < fLen then begin
+    // within the significant limbs: edit in place when the storage is ours
+    if fArr = nil then begin
+      fInline[limb] := fInline[limb] or mask;
+      exit;
+    end;
+    if ArrUnshared(fArr) then begin
+      fArr[limb] := fArr[limb] or mask;
+      exit;
+    end;
+  end else if (fArr = nil) and (limb < BIGINT_INLINE_LIMBS) then begin
+    // grows within the inline capacity: limbs above fLen are already zero
+    fInline[limb] := mask;
+    fLen := limb + 1;
+    exit;
+  end;
   var l := fLimbs;
   SetLength(l, MaxS(Length(l), limb + 1));
-  l[limb] := l[limb] or (TLimb(1) shl (i and LIMB_MASK));
+  l[limb] := l[limb] or mask;
   fLimbs := l;
 end;
 
@@ -3756,18 +3845,47 @@ procedure UBigInt.clearBit(i: LongWord);
 begin
   var limb := SizeInt(i shr LIMB_SHIFT);
   if limb >= fLen then exit;
+  var mask := not (TLimb(1) shl (i and LIMB_MASK));
+  if fArr = nil then begin
+    fInline[limb] := fInline[limb] and mask;
+    while (fLen > 0) and (fInline[fLen - 1] = 0) do dec(fLen);
+    exit;
+  end;
+  if ArrUnshared(fArr) then begin
+    // in place; a shortened value keeps its (now oversized) array
+    fArr[limb] := fArr[limb] and mask;
+    while (fLen > 0) and (fArr[fLen - 1] = 0) do dec(fLen);
+    exit;
+  end;
   var l := fLimbs;
   SetLength(l, Length(l)); // un-share: the getter may hand out fArr itself
-  l[limb] := l[limb] and not (TLimb(1) shl (i and LIMB_MASK));
+  l[limb] := l[limb] and mask;
   fLimbs := l; // the setter normalizes
 end;
 
 procedure UBigInt.flipBit(i: LongWord);
 begin
   var limb := SizeInt(i shr LIMB_SHIFT);
+  var mask := TLimb(1) shl (i and LIMB_MASK);
+  if limb < fLen then begin
+    if fArr = nil then begin
+      fInline[limb] := fInline[limb] xor mask;
+      while (fLen > 0) and (fInline[fLen - 1] = 0) do dec(fLen);
+      exit;
+    end;
+    if ArrUnshared(fArr) then begin
+      fArr[limb] := fArr[limb] xor mask;
+      while (fLen > 0) and (fArr[fLen - 1] = 0) do dec(fLen);
+      exit;
+    end;
+  end else if (fArr = nil) and (limb < BIGINT_INLINE_LIMBS) then begin
+    fInline[limb] := mask;
+    fLen := limb + 1;
+    exit;
+  end;
   var l := fLimbs;
   SetLength(l, MaxS(Length(l), limb + 1));
-  l[limb] := l[limb] xor (TLimb(1) shl (i and LIMB_MASK));
+  l[limb] := l[limb] xor mask;
   fLimbs := l;
 end;
 
@@ -3827,12 +3945,14 @@ var
   qq, rr: UBigInt;
 begin
   if d.fLen = 0 then RaiseDivByZero;
-  if (fArr = nil) and (d.fArr = nil) then begin
-    var qb, rb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+  if (d.fArr = nil) and (fLen <= 2 * BIGINT_INLINE_LIMBS) then begin
+    var qb, rb: array[0..2 * BIGINT_INLINE_LIMBS - 1] of TLimb;
     var ql, rl: SizeInt;
-    DivModInline(@fInline[0], fLen, @d.fInline[0], d.fLen, @qb[0], ql, @rb[0], rl);
-    PutInline(@qb[0], ql, @qq.fInline[0], qq.fArr, qq.fLen);
-    PutInline(@rb[0], rl, @rr.fInline[0], rr.fArr, rr.fLen);
+    DivModInline(dataPtr, fLen, @d.fInline[0], d.fLen, @qb[0], ql, @rb[0], rl);
+    if ql <= BIGINT_INLINE_LIMBS then PutInline(@qb[0], ql, @qq.fInline[0], qq.fArr, qq.fLen)
+    else PutSpill(@qb[0], ql, qq.fArr, qq.fLen);
+    if rl <= BIGINT_INLINE_LIMBS then PutInline(@rb[0], rl, @rr.fInline[0], rr.fArr, rr.fLen)
+    else PutSpill(@rb[0], rl, rr.fArr, rr.fLen);
     exit(qq, rr);
   end;
   var qm, rm: TLimbs;
@@ -5818,11 +5938,12 @@ var
   q, r: BigInt;
 begin
   if b.fLen = 0 then RaiseDivByZero;
-  if (a.fArr = nil) and (b.fArr = nil) then begin
-    var qb, rb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+  if (b.fArr = nil) and (a.fLen <= 2 * BIGINT_INLINE_LIMBS) then begin
+    var qb, rb: array[0..2 * BIGINT_INLINE_LIMBS - 1] of TLimb;
     var ql, rl: SizeInt;
-    DivModInline(@a.fInline[0], a.fLen, @b.fInline[0], b.fLen, @qb[0], ql, @rb[0], rl);
-    PutInline(@qb[0], ql, @result.fInline[0], result.fArr, result.fLen);
+    DivModInline(a.dataPtr, a.fLen, @b.fInline[0], b.fLen, @qb[0], ql, @rb[0], rl);
+    if ql <= BIGINT_INLINE_LIMBS then PutInline(@qb[0], ql, @result.fInline[0], result.fArr, result.fLen)
+    else PutSpill(@qb[0], ql, result.fArr, result.fLen);
     result.fNeg := (a.fNeg xor b.fNeg) and (result.fLen > 0);
     exit;
   end;
@@ -5840,11 +5961,12 @@ var
   q, r: BigInt;
 begin
   if b.fLen = 0 then RaiseDivByZero;
-  if (a.fArr = nil) and (b.fArr = nil) then begin
-    var qb, rb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+  if (b.fArr = nil) and (a.fLen <= 2 * BIGINT_INLINE_LIMBS) then begin
+    var qb, rb: array[0..2 * BIGINT_INLINE_LIMBS - 1] of TLimb;
     var ql, rl: SizeInt;
-    DivModInline(@a.fInline[0], a.fLen, @b.fInline[0], b.fLen, @qb[0], ql, @rb[0], rl);
-    PutInline(@rb[0], rl, @result.fInline[0], result.fArr, result.fLen);
+    DivModInline(a.dataPtr, a.fLen, @b.fInline[0], b.fLen, @qb[0], ql, @rb[0], rl);
+    if rl <= BIGINT_INLINE_LIMBS then PutInline(@rb[0], rl, @result.fInline[0], result.fArr, result.fLen)
+    else PutSpill(@rb[0], rl, result.fArr, result.fLen);
     result.fNeg := a.fNeg and (result.fLen > 0);
     exit;
   end;
@@ -6349,9 +6471,24 @@ procedure BigInt.setBit(i: LongWord);
 begin
   if not fNeg then begin
     var limb := SizeInt(i shr LIMB_SHIFT);
+    var mask := TLimb(1) shl (i and LIMB_MASK);
+    if limb < fLen then begin
+      if fArr = nil then begin
+        fInline[limb] := fInline[limb] or mask;
+        exit;
+      end;
+      if ArrUnshared(fArr) then begin
+        fArr[limb] := fArr[limb] or mask;
+        exit;
+      end;
+    end else if (fArr = nil) and (limb < BIGINT_INLINE_LIMBS) then begin
+      fInline[limb] := mask;
+      fLen := limb + 1;
+      exit;
+    end;
     var l := fLimbs;
     SetLength(l, MaxS(Length(l), limb + 1));
-    l[limb] := l[limb] or (TLimb(1) shl (i and LIMB_MASK));
+    l[limb] := l[limb] or mask;
     fLimbs := l;
   end else self := self or (BigInt(1) shl i);
 end;
@@ -6361,9 +6498,20 @@ begin
   if not fNeg then begin
     var limb := SizeInt(i shr LIMB_SHIFT);
     if limb >= fLen then exit;
+    var mask := not (TLimb(1) shl (i and LIMB_MASK));
+    if fArr = nil then begin
+      fInline[limb] := fInline[limb] and mask;
+      while (fLen > 0) and (fInline[fLen - 1] = 0) do dec(fLen);
+      exit;
+    end;
+    if ArrUnshared(fArr) then begin
+      fArr[limb] := fArr[limb] and mask;
+      while (fLen > 0) and (fArr[fLen - 1] = 0) do dec(fLen);
+      exit;
+    end;
     var l := fLimbs;
     SetLength(l, Length(l)); // un-share: the getter may hand out fArr itself
-    l[limb] := l[limb] and not (TLimb(1) shl (i and LIMB_MASK));
+    l[limb] := l[limb] and mask;
     fLimbs := l; // the setter normalizes
   end else self := self and not (BigInt(1) shl i);
 end;
@@ -6372,9 +6520,26 @@ procedure BigInt.flipBit(i: LongWord);
 begin
   if not fNeg then begin
     var limb := SizeInt(i shr LIMB_SHIFT);
+    var mask := TLimb(1) shl (i and LIMB_MASK);
+    if limb < fLen then begin
+      if fArr = nil then begin
+        fInline[limb] := fInline[limb] xor mask;
+        while (fLen > 0) and (fInline[fLen - 1] = 0) do dec(fLen);
+        exit;
+      end;
+      if ArrUnshared(fArr) then begin
+        fArr[limb] := fArr[limb] xor mask;
+        while (fLen > 0) and (fArr[fLen - 1] = 0) do dec(fLen);
+        exit;
+      end;
+    end else if (fArr = nil) and (limb < BIGINT_INLINE_LIMBS) then begin
+      fInline[limb] := mask;
+      fLen := limb + 1;
+      exit;
+    end;
     var l := fLimbs;
     SetLength(l, MaxS(Length(l), limb + 1));
-    l[limb] := l[limb] xor (TLimb(1) shl (i and LIMB_MASK));
+    l[limb] := l[limb] xor mask;
     fLimbs := l;
   end else self := self xor (BigInt(1) shl i);
 end;
@@ -6414,13 +6579,15 @@ var
   qq, rr: BigInt;
 begin
   if d.fLen = 0 then RaiseDivByZero;
-  if (fArr = nil) and (d.fArr = nil) then begin
-    var qb, rb: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+  if (d.fArr = nil) and (fLen <= 2 * BIGINT_INLINE_LIMBS) then begin
+    var qb, rb: array[0..2 * BIGINT_INLINE_LIMBS - 1] of TLimb;
     var ql, rl: SizeInt;
-    DivModInline(@fInline[0], fLen, @d.fInline[0], d.fLen, @qb[0], ql, @rb[0], rl);
-    PutInline(@qb[0], ql, @qq.fInline[0], qq.fArr, qq.fLen);
+    DivModInline(dataPtr, fLen, @d.fInline[0], d.fLen, @qb[0], ql, @rb[0], rl);
+    if ql <= BIGINT_INLINE_LIMBS then PutInline(@qb[0], ql, @qq.fInline[0], qq.fArr, qq.fLen)
+    else PutSpill(@qb[0], ql, qq.fArr, qq.fLen);
     qq.fNeg := (fNeg xor d.fNeg) and (qq.fLen > 0);
-    PutInline(@rb[0], rl, @rr.fInline[0], rr.fArr, rr.fLen);
+    if rl <= BIGINT_INLINE_LIMBS then PutInline(@rb[0], rl, @rr.fInline[0], rr.fArr, rr.fLen)
+    else PutSpill(@rb[0], rl, rr.fArr, rr.fLen);
     rr.fNeg := fNeg and (rr.fLen > 0);
     exit(qq, rr);
   end;
