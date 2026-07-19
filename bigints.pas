@@ -1415,15 +1415,9 @@ end;
 // small-value optimization storage (inline limbs + spill limb array)
 // ---------------------------------------------------------------------------
 
-// read pointer to the limbs (inline array or spill array) without allocating.
-// pinl is the address of the record's inline array, parr the raw fArr pointer.
 // all storage helpers take typed PLimb rather than untyped var params: an
 // untyped var passed to an inline routine and dereferenced via @ miscompiles
 // on this toolchain
-function ViewPtr(pinl: PLimb; parr: Pointer): PLimb; inline;
-begin
-  result := if parr <> nil then PLimb(parr) else pinl;
-end;
 
 function MakeLimbs(p: PLimb; len: SizeInt): TLimbs; inline;
 begin
@@ -1453,7 +1447,8 @@ end;
 
 function UBigInt.dataPtr: PBigIntLimb; inline;
 begin
-  result := ViewPtr(@fInline[0], Pointer(fArr));
+  result := PBigIntLimb(Pointer(fArr));
+  if result = nil then result := @fInline[0];
 end;
 
 function UBigInt.getLimbs: TBigIntLimbs;
@@ -1481,7 +1476,8 @@ end;
 
 function BigInt.dataPtr: PBigIntLimb; inline;
 begin
-  result := ViewPtr(@fInline[0], Pointer(fArr));
+  result := PBigIntLimb(Pointer(fArr));
+  if result = nil then result := @fInline[0];
 end;
 
 function BigInt.getLimbs: TBigIntLimbs;
@@ -1505,6 +1501,18 @@ begin
   x.fNeg := false;
   FillChar(x.fInline, SizeOf(x.fInline), 0);
 end;
+// strict a < b magnitude test: cheaper than the three-way compare for the
+// ordering operators
+function ULessU(const a, b: UBigInt): boolean; inline;
+begin
+  if a.fLen <> b.fLen then exit(a.fLen < b.fLen);
+  var pa := a.dataPtr;
+  var pb := b.dataPtr;
+  for var i := a.fLen - 1 downto 0 do
+    if pa[i] <> pb[i] then exit(pa[i] < pb[i]);
+  result := false;
+end;
+
 
 function LToQWord(const a: TLimbs): QWord; inline;
 begin
@@ -1671,6 +1679,23 @@ begin
   rlen := m;
 end;
 
+// move a freshly built normalized array into a record's storage fields,
+// transferring ownership with no refcount traffic (the caller's local is
+// nil-ed out); small results land inline, keeping the zero-pad invariant
+procedure MoveArr(var v: TLimbs; dst: PLimb; var arr: TLimbs; var len: SizeInt);
+begin
+  len := Length(v);
+  if len <= BIGINT_INLINE_LIMBS then begin
+    FillChar(dst^, BIGINT_INLINE_LIMBS * SizeOf(TLimb), 0);
+    if len > 0 then Move(Pointer(v)^, dst^, len * SizeOf(TLimb));
+    arr := nil; // drops any reused-temp spill
+    exit;
+  end;
+  arr := nil; // no-op for a fresh result temp, releases a reused one
+  Pointer(arr) := Pointer(v);
+  Pointer(v) := nil;
+end;
+
 // spill finisher for fast-path results just past the inline capacity; copies
 // into a fresh array before dropping the old one (result may be a reused temp)
 procedure PutSpill(buf: PLimb; m: SizeInt; var rarr: TLimbs; var rlen: SizeInt);
@@ -1741,6 +1766,72 @@ begin
   while (m > 0) and (buf[m - 1] = 0) do dec(m);
   if m <= BIGINT_INLINE_LIMBS then PutInline(@buf[0], m, dst, rarr, rlen)
   else PutSpill(@buf[0], m, rarr, rlen);
+end;
+
+// r := a and b; fits inline whenever either operand does (the result is never
+// longer than the shorter operand), so pa/pb may point into a spill array
+procedure AndInline(pa: PLimb; alen: SizeInt; pb: PLimb; blen: SizeInt; dst: PLimb; var rarr: TLimbs; var rlen: SizeInt);
+begin
+  var n := if alen < blen then alen else blen;
+  while (n > 0) and ((pa[n - 1] and pb[n - 1]) = 0) do dec(n);
+  var buf: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+  for var i := 0 to n - 1 do buf[i] := pa[i] and pb[i];
+  PutInline(@buf[0], n, dst, rarr, rlen);
+end;
+
+// r := a or b for two inline operands; n is max(alen, blen). the top limb of
+// the longer operand survives, so no trim is needed
+procedure OrInline(pa, pb: PLimb; n: SizeInt; dst: PLimb; var rarr: TLimbs; var rlen: SizeInt);
+begin
+  var buf: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+  for var i := 0 to n - 1 do buf[i] := pa[i] or pb[i];
+  PutInline(@buf[0], n, dst, rarr, rlen);
+end;
+
+// r := a xor b for two inline operands; n is max(alen, blen), equal-length
+// operands may cancel top limbs so the trim runs before the copy
+procedure XorInline(pa, pb: PLimb; n: SizeInt; dst: PLimb; var rarr: TLimbs; var rlen: SizeInt);
+begin
+  while (n > 0) and ((pa[n - 1] xor pb[n - 1]) = 0) do dec(n);
+  var buf: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+  for var i := 0 to n - 1 do buf[i] := pa[i] xor pb[i];
+  PutInline(@buf[0], n, dst, rarr, rlen);
+end;
+
+// r := a shl n for an inline operand, alen >= 1; caller guarantees
+// alen + (n div LIMB_BITS) <= BIGINT_INLINE_LIMBS, so at most one limb spills
+procedure ShlInline(pa: PLimb; alen: SizeInt; n: LongWord; dst: PLimb; var rarr: TLimbs; var rlen: SizeInt);
+begin
+  var ls := SizeInt(n shr LIMB_SHIFT);
+  var bs := integer(n and LIMB_MASK);
+  var buf: array[0..BIGINT_INLINE_LIMBS] of TLimb;
+  for var i := 0 to ls - 1 do buf[i] := 0;
+  var top: TLimb := 0;
+  if bs = 0 then
+    for var i := 0 to alen - 1 do buf[ls + i] := pa[i]
+  else top := MpnLshift(@buf[ls], pa, alen, bs);
+  buf[ls + alen] := top;
+  var m := ls + alen + SizeInt(ord(top <> 0));
+  if m <= BIGINT_INLINE_LIMBS then PutInline(@buf[0], m, dst, rarr, rlen)
+  else PutSpill(@buf[0], m, rarr, rlen);
+end;
+
+// r := a shr n for an inline operand; the result always fits inline
+procedure ShrInline(pa: PLimb; alen: SizeInt; n: LongWord; dst: PLimb; var rarr: TLimbs; var rlen: SizeInt);
+begin
+  var ls := SizeInt(n shr LIMB_SHIFT);
+  var rl := alen - ls;
+  if rl <= 0 then begin
+    PutZero(dst, rarr, rlen);
+    exit;
+  end;
+  var bs := integer(n and LIMB_MASK);
+  var buf: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+  if bs = 0 then for var i := 0 to rl - 1 do buf[i] := pa[ls + i]
+  else MpnRshift(@buf[0], @pa[ls], rl, bs);
+  // only the top limb can shift to zero on a normalized operand
+  if buf[rl - 1] = 0 then dec(rl);
+  PutInline(@buf[0], rl, dst, rarr, rlen);
 end;
 
 // signed add of two small magnitudes given as zero-padded (ptr, len, neg)
@@ -1842,18 +1933,19 @@ end;
 
 // all TLimbs-returning routines build into a fresh local and assign the result
 // at the very end: the hidden result may alias an input (x := LAdd(x, y))
-function LAdd(const a, b: TLimbs): TLimbs;
+// pointer-based cores build the result array directly from (ptr, len) views,
+// so operators never materialize an operand; the TLimbs entry points below
+// are thin wrappers over them for array-based callers
+function LAddP(pa: PLimb; la: SizeInt; pb: PLimb; lb: SizeInt): TLimbs;
 var
   res: TLimbs;
 begin
-  var la := Length(a);
-  var lb := Length(b);
   if (la <= 2) and (lb <= 2) then begin
     // two-limb fast path: exact-size allocation, no trim
-    var a0: TLimb := if la > 0 then a[0] else 0;
-    var a1: TLimb := if la > 1 then a[1] else 0;
-    var b1: TLimb := if lb > 1 then b[1] else 0;
-    var s0: TLimb := a0 + (if lb > 0 then b[0] else 0);
+    var a0: TLimb := if la > 0 then pa[0] else 0;
+    var a1: TLimb := if la > 1 then pa[1] else 0;
+    var b1: TLimb := if lb > 1 then pb[1] else 0;
+    var s0: TLimb := a0 + (if lb > 0 then pb[0] else 0);
     var c: TLimb := TLimb(ord(s0 < a0));
     var s1: TLimb := a1 + b1;
     var c1: TLimb := TLimb(ord(s1 < a1));
@@ -1874,30 +1966,33 @@ begin
     end;
     exit(res);
   end;
-  if la < lb then exit(LAdd(b, a));
-  if lb = 0 then exit(Copy(a));
+  if la < lb then exit(LAddP(pb, lb, pa, la));
+  if lb = 0 then exit(MakeLimbs(pa, la));
   res := LNew(la + 1);
-  var carry := MpnAddN(@res[0], @a[0], @b[0], lb);
-  res[la] := MpnAdd1(@res[lb], @a[lb], la - lb, carry);
+  var carry := MpnAddN(@res[0], pa, pb, lb);
+  res[la] := MpnAdd1(@res[lb], @pa[lb], la - lb, carry);
   LNorm(res);
   result := res;
 end;
 
+function LAdd(const a, b: TLimbs): TLimbs;
+begin
+  result := LAddP(PLimb(Pointer(a)), Length(a), PLimb(Pointer(b)), Length(b));
+end;
+
 // a - b, caller guarantees a >= b
-function LSub(const a, b: TLimbs): TLimbs;
+function LSubP(pa: PLimb; la: SizeInt; pb: PLimb; lb: SizeInt): TLimbs;
 var
   res: TLimbs;
 begin
-  var la := Length(a);
-  var lb := Length(b);
   if la <= 2 then begin
     // b is no longer than a here
-    var a1: TLimb := if la > 1 then a[1] else 0;
-    var d0: TLimb := if la > 0 then a[0] else 0;
-    var b0: TLimb := if lb > 0 then b[0] else 0;
+    var a1: TLimb := if la > 1 then pa[1] else 0;
+    var d0: TLimb := if la > 0 then pa[0] else 0;
+    var b0: TLimb := if lb > 0 then pb[0] else 0;
     var brw: TLimb := TLimb(ord(d0 < b0));
     d0 := d0 - b0;
-    var d1: TLimb := a1 - (if lb > 1 then b[1] else 0) - brw;
+    var d1: TLimb := a1 - (if lb > 1 then pb[1] else 0) - brw;
     if d1 <> 0 then begin
       res := LNew(2);
       res[0] := d0;
@@ -1908,12 +2003,17 @@ begin
     end;
     exit(res);
   end;
-  if lb = 0 then exit(Copy(a));
+  if lb = 0 then exit(MakeLimbs(pa, la));
   res := LNew(la);
-  var borrow := MpnSubN(@res[0], @a[0], @b[0], lb);
-  MpnSub1(@res[lb], @a[lb], la - lb, borrow);
+  var borrow := MpnSubN(@res[0], pa, pb, lb);
+  MpnSub1(@res[lb], @pa[lb], la - lb, borrow);
   LNorm(res);
   result := res;
+end;
+
+function LSub(const a, b: TLimbs): TLimbs;
+begin
+  result := LSubP(PLimb(Pointer(a)), Length(a), PLimb(Pointer(b)), Length(b));
 end;
 
 // a - b with underflow check
@@ -1923,16 +2023,14 @@ begin
   result := LSub(a, b);
 end;
 
-function LMulBasic(const a, b: TLimbs): TLimbs;
+function LMulBasicP(pa: PLimb; la: SizeInt; pb: PLimb; lb: SizeInt): TLimbs;
 var
   res: TLimbs;
 begin
-  var la := Length(a);
-  var lb := Length(b);
   if (la = 0) or (lb = 0) then exit(nil);
   if (la = 1) and (lb = 1) then begin
     var hi, lo: TLimb;
-    UMulLimb(a[0], b[0], hi, lo);
+    UMulLimb(pa[0], pb[0], hi, lo);
     if hi <> 0 then begin
       res := LNew(2);
       res[0] := lo;
@@ -1943,19 +2041,19 @@ begin
     end;
     exit(res);
   end;
-  if la < lb then exit(LMulBasic(b, a));
+  if la < lb then exit(LMulBasicP(pb, lb, pa, la));
   if la = 2 then begin
     // 2x1 and 2x2 by hand: exact-size result, no trim
     var h0, l0, h1, l1: TLimb;
-    UMulLimb(a[0], b[0], h0, l0);
-    UMulLimb(a[1], b[0], h1, l1);
+    UMulLimb(pa[0], pb[0], h0, l0);
+    UMulLimb(pa[1], pb[0], h1, l1);
     var r1: TLimb := h0 + l1;
     var c: TLimb := TLimb(ord(r1 < h0));
     var r2: TLimb := h1 + c;
     var r3: TLimb := 0;
     if lb = 2 then begin
       var hx, lx: TLimb;
-      UMulLimb(a[0], b[1], hx, lx);
+      UMulLimb(pa[0], pb[1], hx, lx);
       r1 := r1 + lx;
       c := TLimb(ord(r1 < lx));
       r2 := r2 + c;
@@ -1963,7 +2061,7 @@ begin
       var t: TLimb := r2 + hx;
       c := c + TLimb(ord(t < hx));
       r2 := t;
-      UMulLimb(a[1], b[1], hx, lx);
+      UMulLimb(pa[1], pb[1], hx, lx);
       t := r2 + lx;
       c := c + TLimb(ord(t < lx));
       r2 := t;
@@ -1984,22 +2082,21 @@ begin
   // one mul_1 row, then addmul_1 rows with the longer operand innermost;
   // the row order writes every limb before it is read, no zero fill needed
   res := LNew(la + lb);
-  res[la] := MpnMul1(@res[0], @a[0], la, b[0]);
-  for var j := 1 to lb - 1 do res[la + j] := MpnAddMul1(@res[j], @a[0], la, b[j]);
+  res[la] := MpnMul1(@res[0], pa, la, pb[0]);
+  for var j := 1 to lb - 1 do res[la + j] := MpnAddMul1(@res[j], pa, la, pb[j]);
   LNorm(res);
   result := res;
 end;
 
 // schoolbook squaring: cross products once, doubled, plus the diagonal
-function LSqrBasic(const a: TLimbs): TLimbs;
+function LSqrBasicP(pa: PLimb; la: SizeInt): TLimbs;
 var
   res: TLimbs;
 begin
-  var la := Length(a);
   if la = 0 then exit(nil);
   if la = 1 then begin
     var hi, lo: TLimb;
-    UMulLimb(a[0], a[0], hi, lo);
+    UMulLimb(pa[0], pa[0], hi, lo);
     if hi <> 0 then begin
       res := LNew(2);
       res[0] := lo;
@@ -2012,8 +2109,8 @@ begin
   end;
   res := LNewZ(2 * la);
   if la > 1 then begin
-    res[la] := MpnMul1(@res[1], @a[1], la - 1, a[0]);
-    for var i := 1 to la - 2 do res[la + i] := MpnAddMul1(@res[2 * i + 1], @a[i + 1], la - 1 - i, a[i]);
+    res[la] := MpnMul1(@res[1], @pa[1], la - 1, pa[0]);
+    for var i := 1 to la - 2 do res[la + i] := MpnAddMul1(@res[2 * i + 1], @pa[i + 1], la - 1 - i, pa[i]);
     // double the cross part
     MpnLshift(@res[0], @res[0], 2 * la, 1);
   end;
@@ -2021,7 +2118,7 @@ begin
   var cy: TLimb := 0;
   for var i := 0 to la - 1 do begin
     var hi, lo: TLimb;
-    UMulLimb(a[i], a[i], hi, lo);
+    UMulLimb(pa[i], pa[i], hi, lo);
     var s: TLimb := res[2 * i] + cy;
     var c: TLimb := TLimb(ord(s < cy));
     s := s + lo;
@@ -2043,11 +2140,11 @@ function LShl(const a: TLimbs; n: LongWord): TLimbs; forward;
 function LShr(const a: TLimbs; n: LongWord): TLimbs; forward;
 function LDivModW(const a: TLimbs; w: TLimb; out rem: TLimb): TLimbs; forward;
 
-// normalized copy of a[start..start+count-1]
-function LSlice(const a: TLimbs; start, count: SizeInt): TLimbs;
+// normalized copy of a[start..start+count-1] out of a (ptr, len) view
+function LSliceP(pa: PLimb; la, start, count: SizeInt): TLimbs;
 begin
-  if start >= Length(a) then exit(nil);
-  result := Copy(a, start, MinS(count, Length(a) - start));
+  if start >= la then exit(nil);
+  result := MakeLimbs(@pa[start], MinS(count, la - start));
   LNorm(result);
 end;
 
@@ -2061,17 +2158,15 @@ begin
 end;
 
 // Karatsuba: a*b = z2*B^2m + (z1-z0-z2)*B^m + z0 with three half-size products
-function LMulKara(const a, b: TLimbs): TLimbs;
+function LMulKaraP(pa: PLimb; la: SizeInt; pb: PLimb; lb: SizeInt): TLimbs;
 var
   res: TLimbs;
 begin
-  var la := Length(a);
-  var lb := Length(b);
   var m := (MaxS(la, lb) + 1) shr 1;
-  var a0 := LSlice(a, 0, m);
-  var a1 := LSlice(a, m, la);
-  var b0 := LSlice(b, 0, m);
-  var b1 := LSlice(b, m, lb);
+  var a0 := LSliceP(pa, la, 0, m);
+  var a1 := LSliceP(pa, la, m, la);
+  var b0 := LSliceP(pb, lb, 0, m);
+  var b1 := LSliceP(pb, lb, m, lb);
   var z0 := LMul(a0, b0);
   var z2 := LMul(a1, b1);
   var zm := LMul(LAdd(a0, a1), LAdd(b0, b1));
@@ -2085,14 +2180,13 @@ begin
   result := res;
 end;
 
-function LSqrKara(const a: TLimbs): TLimbs;
+function LSqrKaraP(pa: PLimb; la: SizeInt): TLimbs;
 var
   res: TLimbs;
 begin
-  var la := Length(a);
   var m := (la + 1) shr 1;
-  var a0 := LSlice(a, 0, m);
-  var a1 := LSlice(a, m, la);
+  var a0 := LSliceP(pa, la, 0, m);
+  var a1 := LSliceP(pa, la, m, la);
   var z0 := LSqr(a0);
   var z2 := LSqr(a1);
   var zm := LShl(LMul(a0, a1), 1);
@@ -2114,19 +2208,17 @@ end;
 
 // Toom-3: split into three k-limb parts, evaluate at 0, 1, -1, 2 and
 // infinity, recombine five recursive products instead of nine
-function LMulToom3(const a, b: TLimbs): TLimbs;
+function LMulToom3P(pa: PLimb; la: SizeInt; pb: PLimb; lb: SizeInt): TLimbs;
 var
   res: TLimbs;
 begin
-  var la := Length(a);
-  var lb := Length(b);
   var k := (MaxS(la, lb) + 2) div 3;
-  var a0 := LSlice(a, 0, k);
-  var a1 := LSlice(a, k, k);
-  var a2 := LSlice(a, 2 * k, la);
-  var b0 := LSlice(b, 0, k);
-  var b1 := LSlice(b, k, k);
-  var b2 := LSlice(b, 2 * k, lb);
+  var a0 := LSliceP(pa, la, 0, k);
+  var a1 := LSliceP(pa, la, k, k);
+  var a2 := LSliceP(pa, la, 2 * k, la);
+  var b0 := LSliceP(pb, lb, 0, k);
+  var b1 := LSliceP(pb, lb, k, k);
+  var b2 := LSliceP(pb, lb, 2 * k, lb);
   var a02 := LAdd(a0, a2);
   var b02 := LAdd(b0, b2);
   var v0 := LMul(a0, b0);
@@ -2159,15 +2251,14 @@ begin
   result := res;
 end;
 
-function LSqrToom3(const a: TLimbs): TLimbs;
+function LSqrToom3P(pa: PLimb; la: SizeInt): TLimbs;
 var
   res: TLimbs;
 begin
-  var la := Length(a);
   var k := (la + 2) div 3;
-  var a0 := LSlice(a, 0, k);
-  var a1 := LSlice(a, k, k);
-  var a2 := LSlice(a, 2 * k, la);
+  var a0 := LSliceP(pa, la, 0, k);
+  var a1 := LSliceP(pa, la, k, k);
+  var a2 := LSliceP(pa, la, 2 * k, la);
   var a02 := LAdd(a0, a2);
   var v0 := LSqr(a0);
   var v1 := LSqr(LAdd(a02, a1));
@@ -2193,43 +2284,62 @@ begin
   result := res;
 end;
 
+function LMulP(pa: PLimb; la: SizeInt; pb: PLimb; lb: SizeInt): TLimbs;
+begin
+  var mn := MinS(la, lb);
+  if mn < BigIntKaratsubaThreshold then exit(LMulBasicP(pa, la, pb, lb));
+  if (mn >= BigIntToom3Threshold) and (MaxS(la, lb) < 2 * mn) then exit(LMulToom3P(pa, la, pb, lb));
+  result := LMulKaraP(pa, la, pb, lb);
+end;
+
 function LMul(const a, b: TLimbs): TLimbs;
 begin
-  var mn := MinS(Length(a), Length(b));
-  if mn < BigIntKaratsubaThreshold then exit(LMulBasic(a, b));
-  if (mn >= BigIntToom3Threshold) and (MaxS(Length(a), Length(b)) < 2 * mn) then exit(LMulToom3(a, b));
-  result := LMulKara(a, b);
+  result := LMulP(PLimb(Pointer(a)), Length(a), PLimb(Pointer(b)), Length(b));
+end;
+
+function LSqrP(pa: PLimb; la: SizeInt): TLimbs;
+begin
+  if la < BigIntKaratsubaThreshold then exit(LSqrBasicP(pa, la));
+  if la >= BigIntToom3Threshold then exit(LSqrToom3P(pa, la));
+  result := LSqrKaraP(pa, la);
 end;
 
 function LSqr(const a: TLimbs): TLimbs;
 begin
-  var la := Length(a);
-  if la < BigIntKaratsubaThreshold then exit(LSqrBasic(a));
-  if la >= BigIntToom3Threshold then exit(LSqrToom3(a));
-  result := LSqrKara(a);
+  result := LSqrP(PLimb(Pointer(a)), Length(a));
 end;
 
 // a * w for a single-limb factor
-function LMulW(const a: TLimbs; w: TLimb): TLimbs;
+function LMulWP(pa: PLimb; la: SizeInt; w: TLimb): TLimbs;
 var
   res: TLimbs;
 begin
-  var la := Length(a);
   if (la = 0) or (w = 0) then exit(nil);
   res := LNew(la + 1);
-  res[la] := MpnMul1(@res[0], @a[0], la, w);
+  res[la] := MpnMul1(@res[0], pa, la, w);
   LNorm(res);
   result := res;
 end;
 
-function LMulQ(const a: TLimbs; q: QWord): TLimbs;
+function LMulW(const a: TLimbs; w: TLimb): TLimbs;
+begin
+  result := LMulWP(PLimb(Pointer(a)), Length(a), w);
+end;
+
+function LMulQP(pa: PLimb; la: SizeInt; q: QWord): TLimbs;
 begin
   {$if LIMB_BITS = 64}
-  result := LMulW(a, q);
+  result := LMulWP(pa, la, q);
   {$else}
-  if q <= High(TLimb) then exit(LMulW(a, TLimb(q)));
-  result := LMul(a, LFromQWord(q));
+  if q <= High(TLimb) then exit(LMulWP(pa, la, TLimb(q)));
+  var qq := LFromQWord(q);
+  result := LMulP(pa, la, PLimb(Pointer(qq)), Length(qq));
   {$endif}
+end;
+
+function LMulQ(const a: TLimbs; q: QWord): TLimbs;
+begin
+  result := LMulQP(PLimb(Pointer(a)), Length(a), q);
 end;
 
 // a := a * m + addv (used by the parser), a must not be shared
@@ -2259,49 +2369,52 @@ begin
   result := rem;
 end;
 
-function LDivModW(const a: TLimbs; w: TLimb; out rem: TLimb): TLimbs;
+function LDivModWP(pa: PLimb; la: SizeInt; w: TLimb; out rem: TLimb): TLimbs;
 var
   res: TLimbs;
 begin
-  res := LNew(Length(a));
+  res := LNew(la);
   var r: TLimb := 0;
-  for var i := Length(a) - 1 downto 0 do res[i] := UDivLimb(r, a[i], w, r);
+  for var i := la - 1 downto 0 do res[i] := UDivLimb(r, pa[i], w, r);
   rem := r;
   LNorm(res);
   result := res;
 end;
 
+function LDivModW(const a: TLimbs; w: TLimb; out rem: TLimb): TLimbs;
+begin
+  result := LDivModWP(PLimb(Pointer(a)), Length(a), w, rem);
+end;
+
 // full division, Knuth algorithm D; v <> 0 guaranteed by callers
 // q and r are out params, so callers must pass fresh locals, never anything
 // that may alias u or v (managed out params are finalized on entry)
-procedure LDivMod(const u, v: TLimbs; out q, r: TLimbs);
+procedure LDivModP(pu: PLimb; m: SizeInt; pv: PLimb; n: SizeInt; out q, r: TLimbs);
 var
   un, vn: TLimbs;
   rw: TLimb;
 begin
-  var n := Length(v);
-  if LCmp(u, v) < 0 then begin
+  if LCmpP(pu, m, pv, n) < 0 then begin
     q := nil;
-    r := Copy(u);
+    r := MakeLimbs(pu, m);
     exit;
   end;
   if n = 1 then begin
-    q := LDivModW(u, v[0], rw);
+    q := LDivModWP(pu, m, pv[0], rw);
     r := LFromQWord(rw);
     exit;
   end;
-  var m := Length(u);
   // normalize so the top bit of vn[n-1] is set
-  var s := LIMB_MASK - integer(LimbBsr(v[n - 1]));
+  var s := LIMB_MASK - integer(LimbBsr(pv[n - 1]));
   vn := LNew(n);
   un := LNew(m + 1);
   if s = 0 then begin
-    Move(v[0], vn[0], n * SizeOf(TLimb));
-    Move(u[0], un[0], m * SizeOf(TLimb));
+    Move(pv^, vn[0], n * SizeOf(TLimb));
+    Move(pu^, un[0], m * SizeOf(TLimb));
     un[m] := 0;
   end else begin
-    MpnLshift(@vn[0], @v[0], n, s);
-    un[m] := MpnLshift(@un[0], @u[0], m, s);
+    MpnLshift(@vn[0], pv, n, s);
+    un[m] := MpnLshift(@un[0], pu, m, s);
   end;
   q := LNew(m - n + 1);
   var vTop := vn[n - 1];
@@ -2340,6 +2453,11 @@ begin
   if s = 0 then Move(un[0], r[0], n * SizeOf(TLimb))
   else MpnRshift(@r[0], @un[0], n, s);
   LNorm(r);
+end;
+
+procedure LDivMod(const u, v: TLimbs; out q, r: TLimbs);
+begin
+  LDivModP(PLimb(Pointer(u)), Length(u), PLimb(Pointer(v)), Length(v), q, r);
 end;
 
 // barrett reciprocal mu = floor(B^(2n) / d), n = limb count of d; precomputed
@@ -2385,73 +2503,106 @@ begin
   r := rr;
 end;
 
-function LShl(const a: TLimbs; n: LongWord): TLimbs;
+function LShlP(pa: PLimb; la: SizeInt; n: LongWord): TLimbs;
 var
   res: TLimbs;
 begin
-  var la := Length(a);
   if la = 0 then exit(nil);
-  if n = 0 then exit(Copy(a));
+  if n = 0 then exit(MakeLimbs(pa, la));
   var limbShift := SizeInt(n shr LIMB_SHIFT);
   var bitShift := integer(n and LIMB_MASK);
   res := LNew(la + limbShift + 1);
   if limbShift > 0 then FillChar(res[0], limbShift * SizeOf(TLimb), 0);
   if bitShift = 0 then begin
-    Move(a[0], res[limbShift], la * SizeOf(TLimb));
+    Move(pa^, res[limbShift], la * SizeOf(TLimb));
     res[la + limbShift] := 0;
-  end else res[la + limbShift] := MpnLshift(@res[limbShift], @a[0], la, bitShift);
+  end else res[la + limbShift] := MpnLshift(@res[limbShift], pa, la, bitShift);
   LNorm(res);
   result := res;
 end;
 
-function LShr(const a: TLimbs; n: LongWord): TLimbs;
+function LShl(const a: TLimbs; n: LongWord): TLimbs;
+begin
+  result := LShlP(PLimb(Pointer(a)), Length(a), n);
+end;
+
+function LShrP(pa: PLimb; la: SizeInt; n: LongWord): TLimbs;
 var
   res: TLimbs;
 begin
-  var la := Length(a);
   if la = 0 then exit(nil);
-  if n = 0 then exit(Copy(a));
+  if n = 0 then exit(MakeLimbs(pa, la));
   var limbShift := SizeInt(n shr LIMB_SHIFT);
   if limbShift >= la then exit(nil);
   var bitShift := integer(n and LIMB_MASK);
   var rl := la - limbShift;
   res := LNew(rl);
-  if bitShift = 0 then Move(a[limbShift], res[0], rl * SizeOf(TLimb))
-  else MpnRshift(@res[0], @a[limbShift], rl, bitShift);
+  if bitShift = 0 then Move(pa[limbShift], res[0], rl * SizeOf(TLimb))
+  else MpnRshift(@res[0], @pa[limbShift], rl, bitShift);
   LNorm(res);
+  result := res;
+end;
+
+function LShr(const a: TLimbs; n: LongWord): TLimbs;
+begin
+  result := LShrP(PLimb(Pointer(a)), Length(a), n);
+end;
+
+function LAndP(pa: PLimb; la: SizeInt; pb: PLimb; lb: SizeInt): TLimbs;
+var
+  res: TLimbs;
+begin
+  var n := MinS(la, lb);
+  while (n > 0) and ((pa[n - 1] and pb[n - 1]) = 0) do dec(n);
+  if n = 0 then exit(nil);
+  res := LNew(n);
+  for var i := 0 to n - 1 do res[i] := pa[i] and pb[i];
   result := res;
 end;
 
 function LAnd(const a, b: TLimbs): TLimbs;
+begin
+  result := LAndP(PLimb(Pointer(a)), Length(a), PLimb(Pointer(b)), Length(b));
+end;
+
+function LOrP(pa: PLimb; la: SizeInt; pb: PLimb; lb: SizeInt): TLimbs;
 var
   res: TLimbs;
 begin
-  var n := MinS(Length(a), Length(b));
-  SetLength(res, n);
-  for var i := 0 to n - 1 do res[i] := a[i] and b[i];
-  LNorm(res);
+  if la < lb then exit(LOrP(pb, lb, pa, la));
+  if la = 0 then exit(nil);
+  res := LNew(la);
+  for var i := 0 to lb - 1 do res[i] := pa[i] or pb[i];
+  if la > lb then Move(pa[lb], res[lb], (la - lb) * SizeOf(TLimb));
   result := res;
 end;
 
 function LOr(const a, b: TLimbs): TLimbs;
+begin
+  result := LOrP(PLimb(Pointer(a)), Length(a), PLimb(Pointer(b)), Length(b));
+end;
+
+function LXorP(pa: PLimb; la: SizeInt; pb: PLimb; lb: SizeInt): TLimbs;
 var
   res: TLimbs;
 begin
-  if Length(a) < Length(b) then exit(LOr(b, a));
-  res := Copy(a);
-  for var i := 0 to Length(b) - 1 do res[i] := res[i] or b[i];
+  if la < lb then exit(LXorP(pb, lb, pa, la));
+  // equal lengths: top limbs may cancel, trim before allocating
+  var n := la;
+  if la = lb then begin
+    while (n > 0) and ((pa[n - 1] xor pb[n - 1]) = 0) do dec(n);
+    if n = 0 then exit(nil);
+  end;
+  res := LNew(n);
+  var m := MinS(n, lb);
+  for var i := 0 to m - 1 do res[i] := pa[i] xor pb[i];
+  if n > lb then Move(pa[lb], res[lb], (n - lb) * SizeOf(TLimb));
   result := res;
 end;
 
 function LXor(const a, b: TLimbs): TLimbs;
-var
-  res: TLimbs;
 begin
-  if Length(a) < Length(b) then exit(LXor(b, a));
-  res := Copy(a);
-  for var i := 0 to Length(b) - 1 do res[i] := res[i] xor b[i];
-  LNorm(res);
-  result := res;
+  result := LXorP(PLimb(Pointer(a)), Length(a), PLimb(Pointer(b)), Length(b));
 end;
 
 function LBitLen(const a: TLimbs): LongWord;
@@ -2962,7 +3113,8 @@ begin
     AddInline(@a.fInline[0], a.fLen, @b.fInline[0], b.fLen, @result.fInline[0], result.fArr, result.fLen);
     exit;
   end;
-  result.fLimbs := LAdd(a.fLimbs, b.fLimbs);
+  var t := LAddP(a.dataPtr, a.fLen, b.dataPtr, b.fLen);
+  MoveArr(t, @result.fInline[0], result.fArr, result.fLen);
 end;
 
 class operator UBigInt.+(const a: UBigInt; b: Int64): UBigInt;
@@ -2979,8 +3131,11 @@ begin
     end;
     exit;
   end;
-  if b >= 0 then result.fLimbs := LAdd(a.fLimbs, LFromQWord(QWord(b)))
-  else result.fLimbs := LSubChecked(a.fLimbs, LFromQWord(NegAbs64(b)));
+  // spilled a is at least BIGINT_INLINE_LIMBS + 1 limbs, so |a| > |b| always
+  var bq: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+  var bql := QToInline(if b >= 0 then QWord(b) else NegAbs64(b), @bq[0]);
+  var t := if b >= 0 then LAddP(a.dataPtr, a.fLen, @bq[0], bql) else LSubP(a.dataPtr, a.fLen, @bq[0], bql);
+  MoveArr(t, @result.fInline[0], result.fArr, result.fLen);
 end;
 
 class operator UBigInt.+(a: Int64; const b: UBigInt): UBigInt;
@@ -2997,7 +3152,9 @@ begin
     else SubInline(@a.fInline[0], a.fLen, @b.fInline[0], @result.fInline[0], result.fArr, result.fLen);
     exit;
   end;
-  result.fLimbs := LSubChecked(a.fLimbs, b.fLimbs);
+  if LCmpP(a.dataPtr, a.fLen, b.dataPtr, b.fLen) < 0 then RaiseNegativeUnsigned;
+  var t := LSubP(a.dataPtr, a.fLen, b.dataPtr, b.fLen);
+  MoveArr(t, @result.fInline[0], result.fArr, result.fLen);
 end;
 
 class operator UBigInt.-(const a: UBigInt; b: Int64): UBigInt;
@@ -3014,8 +3171,11 @@ begin
     end;
     exit;
   end;
-  if b >= 0 then result.fLimbs := LSubChecked(a.fLimbs, LFromQWord(QWord(b)))
-  else result.fLimbs := LAdd(a.fLimbs, LFromQWord(NegAbs64(b)));
+  // spilled a is at least BIGINT_INLINE_LIMBS + 1 limbs, so |a| > |b| always
+  var bq: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+  var bql := QToInline(if b >= 0 then QWord(b) else NegAbs64(b), @bq[0]);
+  var t := if b >= 0 then LSubP(a.dataPtr, a.fLen, @bq[0], bql) else LAddP(a.dataPtr, a.fLen, @bq[0], bql);
+  MoveArr(t, @result.fInline[0], result.fArr, result.fLen);
 end;
 
 class operator UBigInt.-(a: Int64; const b: UBigInt): UBigInt;
@@ -3030,7 +3190,8 @@ begin
     MulInline(@a.fInline[0], a.fLen, @b.fInline[0], b.fLen, @result.fInline[0], result.fArr, result.fLen);
     exit;
   end;
-  result.fLimbs := LMul(a.fLimbs, b.fLimbs);
+  var t := LMulP(a.dataPtr, a.fLen, b.dataPtr, b.fLen);
+  MoveArr(t, @result.fInline[0], result.fArr, result.fLen);
 end;
 
 class operator UBigInt.*(const a: UBigInt; b: Int64): UBigInt;
@@ -3045,7 +3206,8 @@ begin
     MulInline(@a.fInline[0], a.fLen, @bb[0], bl, @result.fInline[0], result.fArr, result.fLen);
     exit;
   end;
-  result.fLimbs := LMulQ(a.fLimbs, QWord(b));
+  var t := LMulQP(a.dataPtr, a.fLen, QWord(b));
+  MoveArr(t, @result.fInline[0], result.fArr, result.fLen);
 end;
 
 class operator UBigInt.*(a: Int64; const b: UBigInt): UBigInt;
@@ -3065,8 +3227,8 @@ begin
     PutInline(@qb[0], ql, @result.fInline[0], result.fArr, result.fLen);
     exit;
   end;
-  LDivMod(a.fLimbs, b.fLimbs, q, r);
-  result.fLimbs := q;
+  LDivModP(a.dataPtr, a.fLen, b.dataPtr, b.fLen, q, r);
+  MoveArr(q, @result.fInline[0], result.fArr, result.fLen);
 end;
 
 class operator UBigInt.div(const a: UBigInt; b: Int64): UBigInt;
@@ -3097,10 +3259,13 @@ begin
     exit;
   end;
   {$if LIMB_BITS = 64}
-  result.fLimbs := LDivModW(a.fLimbs, TLimb(b), rw);
+  var t := LDivModWP(a.dataPtr, a.fLen, TLimb(b), rw);
+  MoveArr(t, @result.fInline[0], result.fArr, result.fLen);
   {$else}
-  if QWord(b) <= High(TLimb) then result.fLimbs := LDivModW(a.fLimbs, TLimb(b), rw)
-  else begin
+  if QWord(b) <= High(TLimb) then begin
+    var t := LDivModWP(a.dataPtr, a.fLen, TLimb(b), rw);
+    MoveArr(t, @result.fInline[0], result.fArr, result.fLen);
+  end else begin
     LDivMod(a.fLimbs, LFromQWord(QWord(b)), q, r);
     result.fLimbs := q;
   end;
@@ -3119,8 +3284,8 @@ begin
     PutInline(@rb[0], rl, @result.fInline[0], result.fArr, result.fLen);
     exit;
   end;
-  LDivMod(a.fLimbs, b.fLimbs, q, r);
-  result.fLimbs := r;
+  LDivModP(a.dataPtr, a.fLen, b.dataPtr, b.fLen, q, r);
+  MoveArr(r, @result.fInline[0], result.fArr, result.fLen);
 end;
 
 class operator UBigInt.mod(const a: UBigInt; b: Int64): UBigInt;
@@ -3149,12 +3314,12 @@ begin
     exit;
   end;
   {$if LIMB_BITS = 64}
-  LDivModW(a.fLimbs, TLimb(m), rw);
-  result.fLimbs := LFromQWord(rw);
+  LDivModWP(a.dataPtr, a.fLen, TLimb(m), rw);
+  USetQWord(@result.fInline[0], result.fArr, result.fLen, rw);
   {$else}
   if m <= High(TLimb) then begin
-    LDivModW(a.fLimbs, TLimb(m), rw);
-    result.fLimbs := LFromQWord(rw);
+    LDivModWP(a.dataPtr, a.fLen, TLimb(m), rw);
+    USetQWord(@result.fInline[0], result.fArr, result.fLen, rw);
   end else begin
     LDivMod(a.fLimbs, LFromQWord(m), q, r);
     result.fLimbs := r;
@@ -3220,34 +3385,59 @@ begin
   if n < 0 then raise ERangeError.Create('negative shift count');
   if a.fLen = 0 then exit(default(UBigInt));
   if n > High(LongWord) then raise EBigIntError.Create('shift count out of range');
-  result.fLimbs := LShl(a.fLimbs, LongWord(n));
+  if (a.fArr = nil) and (a.fLen + SizeInt(QWord(n) shr LIMB_SHIFT) <= BIGINT_INLINE_LIMBS) then begin
+    ShlInline(@a.fInline[0], a.fLen, LongWord(n), @result.fInline[0], result.fArr, result.fLen);
+    exit;
+  end;
+  var t := LShlP(a.dataPtr, a.fLen, LongWord(n));
+  MoveArr(t, @result.fInline[0], result.fArr, result.fLen);
 end;
 
 class operator UBigInt.shr(const a: UBigInt; n: Int64): UBigInt;
 begin
   if n < 0 then raise ERangeError.Create('negative shift count');
   if n > High(LongWord) then exit(default(UBigInt));
-  result.fLimbs := LShr(a.fLimbs, LongWord(n));
+  if a.fArr = nil then begin
+    ShrInline(@a.fInline[0], a.fLen, LongWord(n), @result.fInline[0], result.fArr, result.fLen);
+    exit;
+  end;
+  var t := LShrP(a.dataPtr, a.fLen, LongWord(n));
+  MoveArr(t, @result.fInline[0], result.fArr, result.fLen);
 end;
 
 class operator UBigInt.and(const a, b: UBigInt): UBigInt;
 begin
-  result.fLimbs := LAnd(a.fLimbs, b.fLimbs);
+  if (a.fArr = nil) or (b.fArr = nil) then begin
+    AndInline(a.dataPtr, a.fLen, b.dataPtr, b.fLen, @result.fInline[0], result.fArr, result.fLen);
+    exit;
+  end;
+  var t := LAndP(a.dataPtr, a.fLen, b.dataPtr, b.fLen);
+  MoveArr(t, @result.fInline[0], result.fArr, result.fLen);
 end;
 
 class operator UBigInt.or(const a, b: UBigInt): UBigInt;
 begin
-  result.fLimbs := LOr(a.fLimbs, b.fLimbs);
+  if (a.fArr = nil) and (b.fArr = nil) then begin
+    OrInline(@a.fInline[0], @b.fInline[0], MaxS(a.fLen, b.fLen), @result.fInline[0], result.fArr, result.fLen);
+    exit;
+  end;
+  var t := LOrP(a.dataPtr, a.fLen, b.dataPtr, b.fLen);
+  MoveArr(t, @result.fInline[0], result.fArr, result.fLen);
 end;
 
 class operator UBigInt.xor(const a, b: UBigInt): UBigInt;
 begin
-  result.fLimbs := LXor(a.fLimbs, b.fLimbs);
+  if (a.fArr = nil) and (b.fArr = nil) then begin
+    XorInline(@a.fInline[0], @b.fInline[0], MaxS(a.fLen, b.fLen), @result.fInline[0], result.fArr, result.fLen);
+    exit;
+  end;
+  var t := LXorP(a.dataPtr, a.fLen, b.dataPtr, b.fLen);
+  MoveArr(t, @result.fInline[0], result.fArr, result.fLen);
 end;
 
 class operator UBigInt.=(const a, b: UBigInt): boolean;
 begin
-  result := a.compare(b) = 0;
+  result := a.equals(b);
 end;
 
 class operator UBigInt.=(const a: UBigInt; b: Int64): boolean;
@@ -3262,7 +3452,7 @@ end;
 
 class operator UBigInt.<>(const a, b: UBigInt): boolean;
 begin
-  result := a.compare(b) <> 0;
+  result := not a.equals(b);
 end;
 
 class operator UBigInt.<>(const a: UBigInt; b: Int64): boolean;
@@ -3277,7 +3467,7 @@ end;
 
 class operator UBigInt.<(const a, b: UBigInt): boolean;
 begin
-  result := a.compare(b) < 0;
+  result := ULessU(a, b);
 end;
 
 class operator UBigInt.<(const a: UBigInt; b: Int64): boolean;
@@ -3292,7 +3482,7 @@ end;
 
 class operator UBigInt.<=(const a, b: UBigInt): boolean;
 begin
-  result := a.compare(b) <= 0;
+  result := not ULessU(b, a);
 end;
 
 class operator UBigInt.<=(const a: UBigInt; b: Int64): boolean;
@@ -3307,7 +3497,7 @@ end;
 
 class operator UBigInt.>(const a, b: UBigInt): boolean;
 begin
-  result := a.compare(b) > 0;
+  result := ULessU(b, a);
 end;
 
 class operator UBigInt.>(const a: UBigInt; b: Int64): boolean;
@@ -3322,7 +3512,7 @@ end;
 
 class operator UBigInt.>=(const a, b: UBigInt): boolean;
 begin
-  result := a.compare(b) >= 0;
+  result := not ULessU(a, b);
 end;
 
 class operator UBigInt.>=(const a: UBigInt; b: Int64): boolean;
@@ -3608,19 +3798,18 @@ end;
 
 function UBigInt.compare(const other: UBigInt): integer; inline;
 begin
-  // both inline: compare the significant limbs top-down right on the record
-  if (fArr = nil) and (other.fArr = nil) then begin
-    if fLen <> other.fLen then exit(if fLen < other.fLen then -1 else 1);
-    for var i := fLen - 1 downto 0 do
-      if fInline[i] <> other.fInline[i] then exit(if fInline[i] < other.fInline[i] then -1 else 1);
-    exit(0);
-  end;
   result := LCmpP(dataPtr, fLen, other.dataPtr, other.fLen);
 end;
 
-function UBigInt.equals(const other: UBigInt): boolean;
+
+function UBigInt.equals(const other: UBigInt): boolean; inline;
 begin
-  result := (fLen = other.fLen) and (LCmpP(dataPtr, fLen, other.dataPtr, other.fLen) = 0);
+  if fLen <> other.fLen then exit(false);
+  var pa := dataPtr;
+  var pb := other.dataPtr;
+  for var i := 0 to fLen - 1 do
+    if pa[i] <> pb[i] then exit(false);
+  result := true;
 end;
 
 function UBigInt.min(const other: UBigInt): UBigInt;
@@ -3647,9 +3836,9 @@ begin
     exit(qq, rr);
   end;
   var qm, rm: TLimbs;
-  LDivMod(fLimbs, d.fLimbs, qm, rm);
-  qq.fLimbs := qm;
-  rr.fLimbs := rm;
+  LDivModP(dataPtr, fLen, d.dataPtr, d.fLen, qm, rm);
+  MoveArr(qm, @qq.fInline[0], qq.fArr, qq.fLen);
+  MoveArr(rm, @rr.fInline[0], rr.fArr, rr.fLen);
   exit(qq, rr);
 end;
 
@@ -3728,7 +3917,12 @@ end;
 
 function UBigInt.sqr: UBigInt;
 begin
-  result.fLimbs := LSqr(fLimbs);
+  if fArr = nil then begin
+    MulInline(@fInline[0], fLen, @fInline[0], fLen, @result.fInline[0], result.fArr, result.fLen);
+    exit;
+  end;
+  var t := LSqrP(dataPtr, fLen);
+  MoveArr(t, @result.fInline[0], result.fArr, result.fLen);
 end;
 
 function UBigInt.sqrt: UBigInt;
