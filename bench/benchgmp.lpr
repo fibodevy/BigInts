@@ -112,12 +112,11 @@ begin
   until false;
 end;
 
+// always microseconds so a column never mixes units (ns vs ms reads wrong at
+// a glance); 3 decimals keep sub-microsecond ops legible
 function FmtNs(ns: Double): string;
 begin
-  result := if ns < 1e3 then Format('%7.0f ns', [ns])
-    else if ns < 1e6 then Format('%7.2f us', [ns / 1e3])
-    else if ns < 1e9 then Format('%7.2f ms', [ns / 1e6])
-    else Format('%7.3f s ', [ns / 1e9]);
+  result := Format('%11.3f us', [ns / 1e3]);
 end;
 
 procedure Row(const name: string; const ourOp, gmpOp: TOp);
@@ -281,7 +280,8 @@ begin
   writeln('sanity check ok (1000x900-bit product matches)');
   writeln;
 
-  writeln(Format('%-22s %10s %10s %9s', ['operation', 'bigints', 'GMP', 'slowdown']));
+  writeln(Format('%-22s %14s %14s %9s', ['operation', 'BigInts', 'GMP', 'ratio']));
+  writeln('(ratio = BigInts / GMP; >1 slower, <1 faster)');
   RandSeed := 42;
   for var bits in addSizes do BenchAdd(bits);
   for var bits in mulSizes do BenchMul(bits, bits);
