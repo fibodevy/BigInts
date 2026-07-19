@@ -816,9 +816,6 @@ procedure BigIntRandomize;
 
 implementation
 
-uses
-  Math;
-
 const
   DIGIT_CHARS = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
 
@@ -2875,7 +2872,7 @@ begin
     inc(chunkLen);
   end;
   // tight digit count upper bound keeps the recursion splits balanced
-  var cap := SizeInt(Trunc(LBitLen(a) / Log2(base))) + 2;
+  var cap := SizeInt(Trunc(LBitLen(a) / (Ln(base) / Ln(2)))) + 2;
   var buf: string;
   SetLength(buf, cap);
   if cap <= TOSTR_DC_DIGITS then LToBaseLinear(Copy(a), base, chunkBase, chunkLen, PAnsiChar(buf), cap)
@@ -3148,17 +3145,107 @@ begin
   result := UBigInt.parse(s);
 end;
 
+// double bit test: a biased exponent of all ones marks NaN or infinity
+function DblIsNanOrInf(d: Double): boolean;
+begin
+  var bits: QWord;
+  Move(d, bits, 8);
+  result := (bits shr 52) and $7FF = $7FF;
+end;
+
+// integer mantissa and base-2 exponent of a finite |d| >= 1: |d| = m * 2^e
+procedure DblIntParts(d: Double; out m: QWord; out e: integer);
+begin
+  var bits: QWord;
+  Move(d, bits, 8);
+  m := (bits and ((QWord(1) shl 52) - 1)) or (QWord(1) shl 52);
+  e := integer((bits shr 52) and $7FF) - 1075;
+end;
+
+// positive infinity of the native float type
+function FltPosInf: Extended;
+begin
+{$ifdef FPC_HAS_TYPE_EXTENDED}
+  var m: QWord := QWord($8000000000000000);
+  var xe: Word := $7FFF;
+  Move(m, PByte(@result)[0], 8);
+  Move(xe, PByte(@result)[8], 2);
+{$else}
+  var bits: QWord := QWord($7FF0000000000000);
+  Move(bits, result, 8);
+{$endif}
+end;
+
+// x * 2^n for the native float type, correctly rounded including subnormals;
+// steps through in-range powers so an out-of-range 2^n is never formed on its own
+function FltLdexp(x: Extended; n: integer): Extended;
+{$ifdef FPC_HAS_TYPE_EXTENDED}
+  function pow2(k: integer): Extended; // 2^k, k in [-16382, 16383]
+  begin
+    var m: QWord := QWord(1) shl 63;
+    var xe: Word := Word(k + 16383);
+    Move(m, PByte(@result)[0], 8);
+    Move(xe, PByte(@result)[8], 2);
+  end;
+begin
+  result := x;
+  if n > 16383 then begin
+    result := result * pow2(16383);
+    dec(n, 16383);
+    if n > 16383 then begin
+      result := result * pow2(16383);
+      dec(n, 16383);
+      if n > 16383 then n := 16383;
+    end;
+  end else if n < -16382 then begin
+    result := result * pow2(-16318);
+    inc(n, 16318);
+    if n < -16382 then begin
+      result := result * pow2(-16318);
+      inc(n, 16318);
+      if n < -16382 then n := -16382;
+    end;
+  end;
+  result := result * pow2(n);
+end;
+{$else}
+  function pow2(k: integer): Double; // 2^k, k in [-1022, 1023]
+  begin
+    var bits: QWord := QWord(k + 1023) shl 52;
+    Move(bits, result, 8);
+  end;
+begin
+  var y: Double := x;
+  if n > 1023 then begin
+    y := y * pow2(1023);
+    dec(n, 1023);
+    if n > 1023 then begin
+      y := y * pow2(1023);
+      dec(n, 1023);
+      if n > 1023 then n := 1023;
+    end;
+  end else if n < -1022 then begin
+    y := y * pow2(-969);
+    inc(n, 969);
+    if n < -1022 then begin
+      y := y * pow2(-969);
+      inc(n, 969);
+      if n < -1022 then n := -1022;
+    end;
+  end;
+  result := y * pow2(n);
+end;
+{$endif}
+
 class operator UBigInt.explicit(d: Double): UBigInt;
 begin
-  if IsNan(d) or IsInfinite(d) then raise EConvertError.Create('cannot convert NaN or Inf to UBigInt');
+  if DblIsNanOrInf(d) then raise EConvertError.Create('cannot convert NaN or Inf to UBigInt');
   if d <= -1.0 then RaiseNegativeUnsigned;
   if System.Abs(d) < 1.0 then exit(default(UBigInt));
-  var mantissa: Double;
-  var exponent: integer;
-  Frexp(d, mantissa, exponent);
-  // mantissa in [0.5, 1); 53 significant bits, scaled to an integer
-  var q := QWord(Trunc(mantissa * 9007199254740992.0)); // 2^53
-  var e := exponent - 53;
+  // 53-bit integer mantissa scaled by its base-2 exponent
+  var q: QWord;
+  var e: integer;
+  DblIntParts(d, q, e);
   result.fLimbs := LFromQWord(q);
   if e > 0 then result.fLimbs := LShl(result.fLimbs, LongWord(e))
   else if e < 0 then result.fLimbs := LShr(result.fLimbs, LongWord(-e));
@@ -3734,7 +3821,7 @@ begin
     end;
   if (not sticky) and (off > 0) then sticky := fLimbs[limb] and ((TLimb(1) shl off) - 1) <> 0;
   if sticky then q := q or 1;
-  result := ldexp(Double(q), e);
+  result := Double(FltLdexp(Extended(q), e));
 end;
 
 function UBigInt.fitsInInt8: boolean;
@@ -5825,7 +5912,7 @@ class operator BigInt.explicit(d: Double): BigInt;
 var
   u: UBigInt;
 begin
-  if IsNan(d) or IsInfinite(d) then raise EConvertError.Create('cannot convert NaN or Inf to BigInt');
+  if DblIsNanOrInf(d) then raise EConvertError.Create('cannot convert NaN or Inf to BigInt');
   if d < 0 then begin
     u := UBigInt(-d);
     result.fLimbs := u.fLimbs;
@@ -8563,7 +8650,7 @@ begin
   var lo, hi: Int64;
   DecMagBoundsP(a.fMan.dataPtr, a.fMan.fLen, a.fExp, lo, hi);
   // decimal guards keep absurd exponents from materializing huge powers
-  if lo > 4940 then exit(sgn * Infinity);
+  if lo > 4940 then exit(sgn * FltPosInf);
   if hi < -4970 then exit(sgn * 0.0);
   var n, dm: TLimbs;
   if a.fExp >= 0 then begin
@@ -8598,15 +8685,15 @@ begin
   if roundBit and (rest or (keep and 1 = 1)) then begin
     if keep = High(QWord) then begin
       // 64-bit mantissa rolled over to 2^64
-      if vexp + 1 > emax then exit(sgn * Infinity);
-      exit(sgn * ldexp(2.0, integer(vexp)));
+      if vexp + 1 > emax then exit(sgn * FltPosInf);
+      exit(sgn * FltLdexp(2.0, integer(vexp)));
     end;
     inc(keep);
   end;
   if keep = 0 then exit(sgn * 0.0);
   var fe := vexp - targetP + 1;
-  if Int64(BsrQWord(keep)) + fe > emax then exit(sgn * Infinity);
-  result := sgn * ldexp(Extended(keep), integer(fe));
+  if Int64(BsrQWord(keep)) + fe > emax then exit(sgn * FltPosInf);
+  result := sgn * FltLdexp(Extended(keep), integer(fe));
 end;
 
 function BigDecimal.toDouble: Double;
@@ -9066,7 +9153,7 @@ begin
   var yd := y.toDouble;
   if yd < 0 then yd := -yd;
   var zd := yd * (System.Abs(Double(mostSignificantExponent)) + 1.0) * 2.302585092994046;
-  if IsNan(zd) or (zd > 4.6E9) then RaiseDecExpRange;
+  if DblIsNanOrInf(zd) or (zd > 4.6E9) then RaiseDecExpRange;
   var d := System.Trunc(zd * 0.4342944819032518) + 2;
   var dy := y.mostSignificantExponent + 1;
   if dy < 0 then dy := 0;
