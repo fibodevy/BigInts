@@ -5475,49 +5475,68 @@ begin
   end;
 end;
 
-// signed add of two sign/magnitude pairs
-function SAddPair(const am: TLimbs; an: boolean; const bm: TLimbs; bn: boolean): BigInt;
+// signed add of two sign/magnitude (ptr, len, neg) views straight into a
+// destination record's storage fields
+procedure SAddP(pa: PLimb; alen: SizeInt; aneg: boolean; pb: PLimb; blen: SizeInt; bneg: boolean; dst: PLimb; var rarr: TLimbs; var rlen: SizeInt; out rneg: boolean);
 var
   m: TLimbs;
 begin
-  if an = bn then begin
-    m := LAdd(am, bm);
-    result.fLimbs := m;
-    result.fNeg := an and (Length(m) > 0);
+  if aneg = bneg then begin
+    m := LAddP(pa, alen, pb, blen);
+    rneg := aneg and (Length(m) > 0);
+    MoveArr(m, dst, rarr, rlen);
     exit;
   end;
-  var c := LCmp(am, bm);
-  if c = 0 then exit(default(BigInt));
-  if c > 0 then begin
-    m := LSub(am, bm);
-    result.fLimbs := m;
-    result.fNeg := an;
+  var c := LCmpP(pa, alen, pb, blen);
+  if c = 0 then begin
+    PutZero(dst, rarr, rlen);
+    rneg := false;
+  end else if c > 0 then begin
+    m := LSubP(pa, alen, pb, blen);
+    rneg := aneg;
+    MoveArr(m, dst, rarr, rlen);
   end else begin
-    m := LSub(bm, am);
-    result.fLimbs := m;
-    result.fNeg := bn;
+    m := LSubP(pb, blen, pa, alen);
+    rneg := bneg;
+    MoveArr(m, dst, rarr, rlen);
   end;
 end;
 
-function SMulPair(const am: TLimbs; an: boolean; const bm: TLimbs; bn: boolean): BigInt;
+procedure SMulP(pa: PLimb; alen: SizeInt; aneg: boolean; pb: PLimb; blen: SizeInt; bneg: boolean; dst: PLimb; var rarr: TLimbs; var rlen: SizeInt; out rneg: boolean);
 var
   m: TLimbs;
 begin
-  m := LMul(am, bm);
-  result.fLimbs := m;
-  result.fNeg := (an xor bn) and (Length(m) > 0);
+  m := LMulP(pa, alen, pb, blen);
+  rneg := (aneg xor bneg) and (Length(m) > 0);
+  MoveArr(m, dst, rarr, rlen);
 end;
 
 // truncated division: quotient toward zero, remainder takes the dividend sign
-procedure SDivModPair(const am: TLimbs; an: boolean; const bm: TLimbs; bn: boolean; out q, r: BigInt);
+procedure SDivModP(pa: PLimb; alen: SizeInt; aneg: boolean; pb: PLimb; blen: SizeInt; bneg: boolean; out q, r: BigInt);
 var
   qm, rm: TLimbs;
 begin
-  LDivMod(am, bm, qm, rm);
-  q.fLimbs := qm;
-  q.fNeg := (an xor bn) and (Length(qm) > 0);
-  r.fLimbs := rm;
-  r.fNeg := an and (Length(rm) > 0);
+  LDivModP(pa, alen, pb, blen, qm, rm);
+  q.fNeg := (aneg xor bneg) and (Length(qm) > 0);
+  MoveArr(qm, @q.fInline[0], q.fArr, q.fLen);
+  r.fNeg := aneg and (Length(rm) > 0);
+  MoveArr(rm, @r.fInline[0], r.fArr, r.fLen);
+end;
+
+// array-based entry points for the cold callers
+function SAddPair(const am: TLimbs; an: boolean; const bm: TLimbs; bn: boolean): BigInt;
+begin
+  SAddP(PLimb(Pointer(am)), Length(am), an, PLimb(Pointer(bm)), Length(bm), bn, @result.fInline[0], result.fArr, result.fLen, result.fNeg);
+end;
+
+function SMulPair(const am: TLimbs; an: boolean; const bm: TLimbs; bn: boolean): BigInt;
+begin
+  SMulP(PLimb(Pointer(am)), Length(am), an, PLimb(Pointer(bm)), Length(bm), bn, @result.fInline[0], result.fArr, result.fLen, result.fNeg);
+end;
+
+procedure SDivModPair(const am: TLimbs; an: boolean; const bm: TLimbs; bn: boolean; out q, r: BigInt);
+begin
+  SDivModP(PLimb(Pointer(am)), Length(am), an, PLimb(Pointer(bm)), Length(bm), bn, q, r);
 end;
 
 function BCmp(const a, b: BigInt): integer;
@@ -5575,14 +5594,16 @@ var
 begin
   var la := a.fLen;
   var lb := b.fLen;
+  var am := a.fLimbs;
+  var bm := b.fLimbs;
   // one limb above both operands captures the sign extension
   var n := MaxS(la, lb) + 1;
-  var lowA := LLowestNZ(a.fLimbs);
-  var lowB := LLowestNZ(b.fLimbs);
+  var lowA := LLowestNZ(am);
+  var lowB := LLowestNZ(bm);
   SetLength(res, n);
   for var i := 0 to n - 1 do begin
-    var x := TCLimbAt(a.fLimbs, a.fNeg, lowA, i);
-    var y := TCLimbAt(b.fLimbs, b.fNeg, lowB, i);
+    var x := TCLimbAt(am, a.fNeg, lowA, i);
+    var y := TCLimbAt(bm, b.fNeg, lowB, i);
     res[i] := case op of
       boAnd: x and y;
       boOr: x or y;
@@ -5593,8 +5614,8 @@ begin
   var neg := res[n - 1] <> 0;
   if neg then LTCNegateInPlace(res);
   LNorm(res);
-  result.fLimbs := res;
   result.fNeg := neg and (Length(res) > 0);
+  MoveArr(res, @result.fInline[0], result.fArr, result.fLen);
 end;
 
 // any nonzero bit among the n lowest bits (the bits a shr n drops)
@@ -5710,7 +5731,7 @@ end;
 class operator BigInt.+(const a, b: BigInt): BigInt;
 begin
   if BSignedInline(a, b, b.fNeg, @result.fInline[0], result.fArr, result.fLen, result.fNeg) then exit;
-  result := SAddPair(a.fLimbs, a.fNeg, b.fLimbs, b.fNeg);
+  SAddP(a.dataPtr, a.fLen, a.fNeg, b.dataPtr, b.fLen, b.fNeg, @result.fInline[0], result.fArr, result.fLen, result.fNeg);
 end;
 
 class operator BigInt.+(const a: BigInt; b: Int64): BigInt;
@@ -5721,7 +5742,9 @@ begin
     SAddInlineP(@a.fInline[0], a.fLen, a.fNeg, @bb[0], bl, b < 0, @result.fInline[0], result.fArr, result.fLen, result.fNeg);
     exit;
   end;
-  result := SAddPair(a.fLimbs, a.fNeg, LFromQWord(if b >= 0 then QWord(b) else NegAbs64(b)), b < 0);
+  var bq: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+  var bql := QToInline(if b >= 0 then QWord(b) else NegAbs64(b), @bq[0]);
+  SAddP(a.dataPtr, a.fLen, a.fNeg, @bq[0], bql, b < 0, @result.fInline[0], result.fArr, result.fLen, result.fNeg);
 end;
 
 class operator BigInt.+(a: Int64; const b: BigInt): BigInt;
@@ -5732,7 +5755,7 @@ end;
 class operator BigInt.-(const a, b: BigInt): BigInt;
 begin
   if BSignedInline(a, b, not b.fNeg, @result.fInline[0], result.fArr, result.fLen, result.fNeg) then exit;
-  result := SAddPair(a.fLimbs, a.fNeg, b.fLimbs, not b.fNeg);
+  SAddP(a.dataPtr, a.fLen, a.fNeg, b.dataPtr, b.fLen, not b.fNeg, @result.fInline[0], result.fArr, result.fLen, result.fNeg);
 end;
 
 class operator BigInt.-(const a: BigInt; b: Int64): BigInt;
@@ -5743,7 +5766,9 @@ begin
     SAddInlineP(@a.fInline[0], a.fLen, a.fNeg, @bb[0], bl, b >= 0, @result.fInline[0], result.fArr, result.fLen, result.fNeg);
     exit;
   end;
-  result := SAddPair(a.fLimbs, a.fNeg, LFromQWord(if b >= 0 then QWord(b) else NegAbs64(b)), b >= 0);
+  var bq: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+  var bql := QToInline(if b >= 0 then QWord(b) else NegAbs64(b), @bq[0]);
+  SAddP(a.dataPtr, a.fLen, a.fNeg, @bq[0], bql, b >= 0, @result.fInline[0], result.fArr, result.fLen, result.fNeg);
 end;
 
 class operator BigInt.-(a: Int64; const b: BigInt): BigInt;
@@ -5754,7 +5779,9 @@ begin
     SAddInlineP(@ab[0], al, a < 0, @b.fInline[0], b.fLen, not b.fNeg, @result.fInline[0], result.fArr, result.fLen, result.fNeg);
     exit;
   end;
-  result := SAddPair(LFromQWord(if a >= 0 then QWord(a) else NegAbs64(a)), a < 0, b.fLimbs, not b.fNeg);
+  var aq: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+  var aql := QToInline(if a >= 0 then QWord(a) else NegAbs64(a), @aq[0]);
+  SAddP(@aq[0], aql, a < 0, b.dataPtr, b.fLen, not b.fNeg, @result.fInline[0], result.fArr, result.fLen, result.fNeg);
 end;
 
 class operator BigInt.*(const a, b: BigInt): BigInt;
@@ -5764,7 +5791,7 @@ begin
     result.fNeg := (a.fNeg xor b.fNeg) and (result.fLen > 0);
     exit;
   end;
-  result := SMulPair(a.fLimbs, a.fNeg, b.fLimbs, b.fNeg);
+  SMulP(a.dataPtr, a.fLen, a.fNeg, b.dataPtr, b.fLen, b.fNeg, @result.fInline[0], result.fArr, result.fLen, result.fNeg);
 end;
 
 class operator BigInt.*(const a: BigInt; b: Int64): BigInt;
@@ -5776,7 +5803,9 @@ begin
     result.fNeg := (a.fNeg xor (b < 0)) and (result.fLen > 0);
     exit;
   end;
-  result := SMulPair(a.fLimbs, a.fNeg, LFromQWord(if b >= 0 then QWord(b) else NegAbs64(b)), b < 0);
+  var bq: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
+  var bql := QToInline(if b >= 0 then QWord(b) else NegAbs64(b), @bq[0]);
+  SMulP(a.dataPtr, a.fLen, a.fNeg, @bq[0], bql, b < 0, @result.fInline[0], result.fArr, result.fLen, result.fNeg);
 end;
 
 class operator BigInt.*(a: Int64; const b: BigInt): BigInt;
@@ -5797,7 +5826,7 @@ begin
     result.fNeg := (a.fNeg xor b.fNeg) and (result.fLen > 0);
     exit;
   end;
-  SDivModPair(a.fLimbs, a.fNeg, b.fLimbs, b.fNeg, q, r);
+  SDivModP(a.dataPtr, a.fLen, a.fNeg, b.dataPtr, b.fLen, b.fNeg, q, r);
   result := q;
 end;
 
@@ -5819,7 +5848,7 @@ begin
     result.fNeg := a.fNeg and (result.fLen > 0);
     exit;
   end;
-  SDivModPair(a.fLimbs, a.fNeg, b.fLimbs, b.fNeg, q, r);
+  SDivModP(a.dataPtr, a.fLen, a.fNeg, b.dataPtr, b.fLen, b.fNeg, q, r);
   result := r;
 end;
 
@@ -5894,9 +5923,14 @@ begin
   if n < 0 then raise ERangeError.Create('negative shift count');
   if a.fLen = 0 then exit(default(BigInt));
   if n > High(LongWord) then raise EBigIntError.Create('shift count out of range');
-  m := LShl(a.fLimbs, LongWord(n));
-  result.fLimbs := m;
+  if (a.fArr = nil) and (a.fLen + SizeInt(QWord(n) shr LIMB_SHIFT) <= BIGINT_INLINE_LIMBS) then begin
+    ShlInline(@a.fInline[0], a.fLen, LongWord(n), @result.fInline[0], result.fArr, result.fLen);
+    result.fNeg := a.fNeg;
+    exit;
+  end;
+  m := LShlP(a.dataPtr, a.fLen, LongWord(n));
   result.fNeg := a.fNeg;
+  MoveArr(m, @result.fInline[0], result.fArr, result.fLen);
 end;
 
 class operator BigInt.shr(const a: BigInt; n: Int64): BigInt;
@@ -5907,9 +5941,14 @@ begin
   if a.fLen = 0 then exit(default(BigInt));
   if not a.fNeg then begin
     if n > High(LongWord) then exit(default(BigInt));
-    m := LShr(a.fLimbs, LongWord(n));
-    result.fLimbs := m;
+    if a.fArr = nil then begin
+      ShrInline(@a.fInline[0], a.fLen, LongWord(n), @result.fInline[0], result.fArr, result.fLen);
+      result.fNeg := false;
+      exit;
+    end;
+    m := LShrP(a.dataPtr, a.fLen, LongWord(n));
     result.fNeg := false;
+    MoveArr(m, @result.fInline[0], result.fArr, result.fLen);
     exit;
   end;
   // negative: arithmetic shift rounds toward -infinity
@@ -5918,10 +5957,11 @@ begin
     result.fNeg := true;
     exit;
   end;
-  m := LShr(a.fLimbs, LongWord(n));
-  if LAnyDroppedBits(a.fLimbs, LongWord(n)) then m := LAdd(m, LFromQWord(1));
-  result.fLimbs := m;
+  var am := a.fLimbs;
+  m := LShr(am, LongWord(n));
+  if LAnyDroppedBits(am, LongWord(n)) then m := LAdd(m, LFromQWord(1));
   result.fNeg := Length(m) > 0;
+  MoveArr(m, @result.fInline[0], result.fArr, result.fLen);
 end;
 
 class operator BigInt.and(const a, b: BigInt): BigInt;
@@ -5942,18 +5982,29 @@ end;
 class operator BigInt.not(const a: BigInt): BigInt;
 var
   m: TLimbs;
+  ob: array[0..BIGINT_INLINE_LIMBS - 1] of TLimb;
 begin
+  var ol := QToInline(1, @ob[0]);
   if a.fNeg then begin
-    // not(-m) = m - 1
-    m := LSub(a.fLimbs, LFromQWord(1));
-    result.fLimbs := m;
+    // not(-m) = m - 1, m >= 1 here
+    if a.fArr = nil then begin
+      SubInline(@a.fInline[0], a.fLen, @ob[0], @result.fInline[0], result.fArr, result.fLen);
+      result.fNeg := false;
+      exit;
+    end;
+    m := LSubP(a.dataPtr, a.fLen, @ob[0], ol);
     result.fNeg := false;
   end else begin
     // not(m) = -(m + 1)
-    m := LAdd(a.fLimbs, LFromQWord(1));
-    result.fLimbs := m;
+    if a.fArr = nil then begin
+      AddInline(@a.fInline[0], a.fLen, @ob[0], ol, @result.fInline[0], result.fArr, result.fLen);
+      result.fNeg := true;
+      exit;
+    end;
+    m := LAddP(a.dataPtr, a.fLen, @ob[0], ol);
     result.fNeg := true;
   end;
+  MoveArr(m, @result.fInline[0], result.fArr, result.fLen);
 end;
 
 class operator BigInt.=(const a, b: BigInt): boolean;
@@ -6373,7 +6424,7 @@ begin
     rr.fNeg := fNeg and (rr.fLen > 0);
     exit(qq, rr);
   end;
-  SDivModPair(fLimbs, fNeg, d.fLimbs, d.fNeg, qq, rr);
+  SDivModP(dataPtr, fLen, fNeg, d.dataPtr, d.fLen, d.fNeg, qq, rr);
   exit(qq, rr);
 end;
 
@@ -6451,7 +6502,13 @@ end;
 
 function BigInt.sqr: BigInt;
 begin
-  result.fLimbs := LSqr(fLimbs);
+  result.fNeg := false;
+  if fArr = nil then begin
+    MulInline(@fInline[0], fLen, @fInline[0], fLen, @result.fInline[0], result.fArr, result.fLen);
+    exit;
+  end;
+  var t := LSqrP(dataPtr, fLen);
+  MoveArr(t, @result.fInline[0], result.fArr, result.fLen);
   result.fNeg := false;
 end;
 
