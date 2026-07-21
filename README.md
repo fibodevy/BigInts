@@ -24,7 +24,7 @@ Arbitrary precision integers and decimals for Pascal in a single self-contained 
 - randomness: pluggable generators (xoshiro256**, PCG64, splitmix64, `System.Random`, OS entropy), deterministic seeding, uniform `randomBelow`/`randomRange`
 - interop: byte serialization in both endiannesses, `hashCode`, digit-grouped output
 - decimals: exact decimal arithmetic (`0.1 + 0.2 = 0.3`), division and roots at any precision, six rounding modes, shortest and exact float conversions in both directions, and the whole analytic toolbox - `pi`, `exp`, `ln`, `log2`/`log10`/`logBase`, fractional powers, trigonometry, hyperbolics, `gamma`, `erf`, `atan2`, `hypot`, `agm` at any precision (the BigDecimal chapter below)
-- speed: measured 1.3-4.8x of GMP on x64 for the core operations (benchmarks below); assembler inner loops with a pure Pascal fallback behind a `USEASM` define
+- speed: measured 1.3-5.1x of GMP on x64 for the core operations (benchmarks below); assembler inner loops with a pure Pascal fallback behind a `USEASM` define
 
 ## Quick start
 
@@ -357,36 +357,35 @@ Every function maps to the method of the same name at the working precision, so 
 
 ### Benchmarks vs GMP
 
-Measured against GMP 6.2.1 (the 64-bit-limb `libgmp-10.dll` that ships with Git for Windows) on one x64 desktop, both sides `-O3`, time per operation. The GMP side reuses its mpz targets, which is how GMP code is normally written; the BigInts side allocates a fresh value per operation, which is what value semantics cost.
+Measured against GMP 6.3.0 (64-bit limbs) on one x64 desktop, both sides `-O3`, time per operation. The GMP side reuses its mpz targets, which is how GMP code is normally written; the BigInts side allocates a fresh value per operation, which is what value semantics cost.
 
 | operation | BigInts | GMP | ratio |
 |---|---|---|---|
-| add 128b | 0.016 us | 0.005 us | 3.1x |
-| add 1024b | 0.039 us | 0.008 us | 4.8x |
-| add 16384b | 0.155 us | 0.065 us | 2.4x |
-| add 262144b | 1.72 us | 1.27 us | 1.4x |
-| mul 128b | 0.019 us | 0.006 us | 3.1x |
-| mul 1024b | 0.188 us | 0.131 us | 1.4x |
-| mul 8192b | 6.39 us | 4.14 us | 1.5x |
-| mul 65536b | 185 us | 82.0 us | 2.3x |
-| mul 262144b | 1608 us | 563 us | 2.8x |
-| mul 65536x1024b | 6.86 us | 8.60 us | 0.8x |
-| sqr 8192b | 5.49 us | 2.62 us | 2.1x |
-| sqr 65536b | 205 us | 57.6 us | 3.5x |
-| divmod 2048/1024b | 0.491 us | 0.266 us | 1.8x |
-| divmod 8192/4096b | 3.22 us | 2.58 us | 1.3x |
-| divmod 131072/65536b | 715 us | 206 us | 3.5x |
-| toString 4096b | 9.26 us | 4.12 us | 2.2x |
-| toString 65536b | 431 us | 215 us | 2.0x |
-| parse 4096b | 5.95 us | 3.59 us | 1.7x |
-| parse 65536b | 232 us | 135 us | 1.7x |
-| modPow 512b | 81.0 us | 40.0 us | 2.0x |
-| modPow 1024b | 467 us | 268 us | 1.7x |
-| modPow 2048b | 2769 us | 2037 us | 1.4x |
-| gcd 1024b | 10.9 us | 2.72 us | 4.0x |
-| gcd 16384b | 428 us | 124 us | 3.5x |
+| add 128b | 0.016 us | 0.005 us | 2.9x |
+| add 1024b | 0.038 us | 0.008 us | 5.1x |
+| add 16384b | 0.149 us | 0.066 us | 2.3x |
+| add 262144b | 1.65 us | 1.28 us | 1.3x |
+| mul 128b | 0.019 us | 0.006 us | 3.2x |
+| mul 1024b | 0.182 us | 0.131 us | 1.4x |
+| mul 8192b | 6.33 us | 4.18 us | 1.5x |
+| mul 65536b | 189 us | 82.9 us | 2.3x |
+| mul 65536x1024b | 7.48 us | 8.95 us | 0.8x |
+| sqr 8192b | 5.40 us | 2.58 us | 2.1x |
+| sqr 65536b | 168 us | 54.7 us | 3.1x |
+| divmod 2048/1024b | 0.498 us | 0.300 us | 1.7x |
+| divmod 8192/4096b | 3.30 us | 2.61 us | 1.3x |
+| divmod 131072/65536b | 707 us | 207 us | 3.4x |
+| toString 4096b | 9.06 us | 4.20 us | 2.2x |
+| toString 65536b | 422 us | 223 us | 1.9x |
+| parse 4096b | 6.05 us | 4.12 us | 1.5x |
+| parse 65536b | 229 us | 131 us | 1.8x |
+| modPow 512b | 80.9 us | 38.2 us | 2.1x |
+| modPow 1024b | 453 us | 262 us | 1.7x |
+| modPow 2048b | 2715 us | 1959 us | 1.4x |
+| gcd 1024b | 11.9 us | 2.58 us | 4.6x |
+| gcd 16384b | 423 us | 113 us | 3.7x |
 
-Bulk arithmetic lands at 1.3-4.8x of GMP. The remaining gap is GMP's hand-scheduled assembly, its higher Toom orders and FFT on huge operands, and sub-quadratic gcd and division that this unit does not implement. Small values up to 256 bits live inline with no allocation, so a one/two-limb add or multiply runs in ~15-20 ns and stays within ~3x of GMP even at that size, where a fresh-value-per-op library would otherwise be dominated by allocation.
+Bulk arithmetic lands at 1.3-5.1x of GMP. The remaining gap is GMP's hand-scheduled assembly, its higher Toom orders and FFT on huge operands, and sub-quadratic gcd and division that this unit does not implement. Small values up to 256 bits live inline with no allocation, so a one/two-limb add or multiply runs in ~15-20 ns and stays within ~3x of GMP even at that size, where a fresh-value-per-op library would otherwise be dominated by allocation.
 
 ## Examples
 
