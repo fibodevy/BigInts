@@ -20,6 +20,7 @@ unit BigInts;
 {$define USEASM}
 
 {$if defined(CPUX86_64) and defined(USEASM)}{$define BIGINT_ASM}{$endif}
+{$if defined(CPU386) and defined(USEASM)}{$define BIGINT_ASM32}{$endif}
 
 // limb arithmetic relies on modular 32-bit/64-bit wraparound
 {$q-}{$r-}
@@ -868,7 +869,7 @@ end;
 // ---------------------------------------------------------------------------
 
 {$pointermath on}
-{$ifdef BIGINT_ASM}{$asmmode intel}{$endif}
+{$if defined(BIGINT_ASM) or defined(BIGINT_ASM32)}{$asmmode intel}{$endif}
 
 const
 {$ifdef BIGINT_LIMB64}
@@ -1300,6 +1301,19 @@ begin
 end;
 
 // (hi:lo) div d and its remainder, caller guarantees hi < d
+{$ifdef BIGINT_ASM32}
+function UDivLimb(hi, lo, d: TLimb; out rem: TLimb): TLimb; assembler;
+asm
+  // eax = hi, edx = lo, ecx = d, rem pointer on the stack; hi < d makes the
+  // single div safe, skipping the RTL 64/32 helper
+  push ebx
+  mov ebx, rem
+  xchg eax, edx
+  div ecx
+  mov [ebx], edx
+  pop ebx
+end;
+{$else}
 function UDivLimb(hi, lo, d: TLimb; out rem: TLimb): TLimb; inline;
 begin
   var cur := (TWide(hi) shl LIMB_BITS) or lo;
@@ -1307,11 +1321,43 @@ begin
   // remainder fits a limb, so mul-back in limb width beats a second wide mod
   rem := TLimb(cur) - result * d;
 end;
+{$endif}
 
 // mpn-style row primitives: fixed-length limb runs behind raw pointers with
 // the carry/borrow returned to the caller; rp may alias ap (and bp)
 
 // rp := ap + bp over n limbs, returns carry
+{$ifdef BIGINT_ASM32}
+function MpnAddN(rp, ap, bp: PLimb; n: SizeInt): TLimb; assembler;
+asm
+  // register convention: eax = rp, edx = ap, ecx = bp, n on the stack
+  push ebx
+  push esi
+  push edi
+  mov edi, eax
+  mov esi, edx
+  mov ebx, ecx
+  mov ecx, n
+  xor eax, eax       // result 0, CF cleared for the adc chain
+  test ecx, ecx
+  jz @done
+@loop:
+  mov eax, [esi]
+  adc eax, [ebx]
+  mov [edi], eax
+  lea esi, [esi + 4] // lea/dec keep CF alive across the iteration
+  lea ebx, [ebx + 4]
+  lea edi, [edi + 4]
+  dec ecx
+  jnz @loop
+  mov eax, 0
+  adc eax, 0
+@done:
+  pop edi
+  pop esi
+  pop ebx
+end;
+{$else}
 function MpnAddN(rp, ap, bp: PLimb; n: SizeInt): TLimb;
 begin
   var carry: TWide := 0;
@@ -1322,8 +1368,39 @@ begin
   end;
   result := TLimb(carry);
 end;
+{$endif}
 
 // rp := ap - bp over n limbs, returns borrow
+{$ifdef BIGINT_ASM32}
+function MpnSubN(rp, ap, bp: PLimb; n: SizeInt): TLimb; assembler;
+asm
+  push ebx
+  push esi
+  push edi
+  mov edi, eax
+  mov esi, edx
+  mov ebx, ecx
+  mov ecx, n
+  xor eax, eax
+  test ecx, ecx
+  jz @done
+@loop:
+  mov eax, [esi]
+  sbb eax, [ebx]
+  mov [edi], eax
+  lea esi, [esi + 4]
+  lea ebx, [ebx + 4]
+  lea edi, [edi + 4]
+  dec ecx
+  jnz @loop
+  mov eax, 0
+  adc eax, 0
+@done:
+  pop edi
+  pop esi
+  pop ebx
+end;
+{$else}
 function MpnSubN(rp, ap, bp: PLimb; n: SizeInt): TLimb;
 begin
   var borrow: TWide := 0;
@@ -1334,6 +1411,7 @@ begin
   end;
   result := TLimb(borrow);
 end;
+{$endif}
 
 // rp := ap + b with carry propagation, returns the final carry
 function MpnAdd1(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb;
@@ -1366,6 +1444,36 @@ begin
 end;
 
 // rp := ap * b, returns the high limb
+{$ifdef BIGINT_ASM32}
+function MpnMul1(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb; assembler;
+asm
+  // eax = rp, edx = ap, ecx = n, b on the stack; ebx carries between limbs
+  push ebx
+  push esi
+  push edi
+  mov edi, eax
+  mov esi, edx
+  xor ebx, ebx
+  test ecx, ecx
+  jz @done
+@loop:
+  mov eax, [esi]
+  mul b          // edx:eax = ap[i] * b
+  add eax, ebx
+  adc edx, 0
+  mov [edi], eax
+  mov ebx, edx
+  add esi, 4
+  add edi, 4
+  dec ecx
+  jnz @loop
+@done:
+  mov eax, ebx
+  pop edi
+  pop esi
+  pop ebx
+end;
+{$else}
 function MpnMul1(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb;
 begin
   var carry: TWide := 0;
@@ -1376,8 +1484,39 @@ begin
   end;
   result := TLimb(carry);
 end;
+{$endif}
 
 // rp += ap * b, returns the carry limb
+{$ifdef BIGINT_ASM32}
+function MpnAddMul1(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb; assembler;
+asm
+  push ebx
+  push esi
+  push edi
+  mov edi, eax
+  mov esi, edx
+  xor ebx, ebx
+  test ecx, ecx
+  jz @done
+@loop:
+  mov eax, [esi]
+  mul b
+  add eax, ebx
+  adc edx, 0
+  add [edi], eax // rp[i] += low, CF folds into the high half
+  adc edx, 0
+  mov ebx, edx
+  add esi, 4
+  add edi, 4
+  dec ecx
+  jnz @loop
+@done:
+  mov eax, ebx
+  pop edi
+  pop esi
+  pop ebx
+end;
+{$else}
 function MpnAddMul1(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb;
 begin
   var carry: TWide := 0;
@@ -1388,8 +1527,39 @@ begin
   end;
   result := TLimb(carry);
 end;
+{$endif}
 
 // rp -= ap * b, returns the borrow limb
+{$ifdef BIGINT_ASM32}
+function MpnSubMul1(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb; assembler;
+asm
+  push ebx
+  push esi
+  push edi
+  mov edi, eax
+  mov esi, edx
+  xor ebx, ebx
+  test ecx, ecx
+  jz @done
+@loop:
+  mov eax, [esi]
+  mul b
+  add eax, ebx
+  adc edx, 0
+  sub [edi], eax // rp[i] -= low, CF = borrow into the high half
+  adc edx, 0
+  mov ebx, edx
+  add esi, 4
+  add edi, 4
+  dec ecx
+  jnz @loop
+@done:
+  mov eax, ebx
+  pop edi
+  pop esi
+  pop ebx
+end;
+{$else}
 function MpnSubMul1(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb;
 begin
   var carry: TWide := 0;
@@ -1401,6 +1571,7 @@ begin
   end;
   result := TLimb(carry);
 end;
+{$endif}
 
 // rp := ap shl cnt for cnt in 1..LIMB_BITS-1, walks high to low so rp may
 // alias ap; returns the bits shifted out of the top
