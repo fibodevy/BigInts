@@ -7428,6 +7428,9 @@ const
   DEC_CHUNK = TLimb(1000000000);
   DEC_CHUNK_POW = 9;
   {$endif}
+  // stack budget (limbs) for the medium scale-and-add path in DecAddSub;
+  // same byte budget on both limb widths
+  DEC_MED_LIMBS = 6144 div LIMB_BITS;
 
 procedure RaiseDecParseError(const s: string);
 begin
@@ -7458,12 +7461,23 @@ begin
   result := Pow10Sq[k];
 end;
 
+var
+  // one-slot memo of the last composed 10^n; decimal alignment hits the same n
+  // over and over (matching exponent gaps), so rebuilding it each call is waste
+  Pow10MemoN: Int64 = -1;
+  Pow10Memo: TLimbs;
+
 function UPow10(n: LongWord): UBigInt;
 begin
   if n <= 19 then begin
     result.fLimbs := LFromQWord(POW10Q[n]);
     exit;
   end;
+  if Int64(n) = Pow10MemoN then begin
+    result.fLimbs := Pow10Memo;
+    exit;
+  end;
+  var n0 := n;
   // compose 10^n from cached 10^(2^k) for each set bit of n
   var acc: TLimbs := [1];
   var k := 0;
@@ -7472,7 +7486,27 @@ begin
     n := n shr 1;
     inc(k);
   end;
+  Pow10MemoN := n0;
+  Pow10Memo := acc;
   result.fLimbs := acc;
+end;
+
+// borrowed (ptr, len) view of 10^k with no refcount traffic; small k reads the
+// POW10Q table in place (little-endian limb layout), larger k pins the memo
+function Pow10ViewP(k: LongWord; out len: SizeInt): PLimb;
+begin
+  if k <= 19 then begin
+    result := PLimb(@POW10Q[k]);
+    {$if LIMB_BITS = 64}
+    len := 1;
+    {$else}
+    len := if POW10Q[k] <= High(TLimb) then 1 else 2;
+    {$endif}
+    exit;
+  end;
+  if Int64(k) <> Pow10MemoN then UPow10(k);
+  result := PLimb(Pointer(Pow10Memo));
+  len := Length(Pow10Memo);
 end;
 
 var
@@ -7480,6 +7514,16 @@ var
   Pow5Blocks: array of TLimbs;
   Pow5MemoK: Int64 = -1;
   Pow5Memo: TLimbs;
+
+function UPow5(k: LongWord): TLimbs; forward;
+
+// borrowed (ptr, len) view of 5^k pinned in the memo, no refcount traffic
+function Pow5ViewP(k: LongWord; out len: SizeInt): PLimb;
+begin
+  if Int64(k) <> Pow5MemoK then UPow5(k);
+  result := PLimb(Pointer(Pow5Memo));
+  len := Length(Pow5Memo);
+end;
 
 // 5^k built from cached 5^(2^i) blocks, memoized for repeated k
 function UPow5(k: LongWord): TLimbs;
@@ -7547,11 +7591,26 @@ begin
   result := LScale10P(PLimb(Pointer(a)), Length(a), k);
 end;
 
+// divisibility by 5: 2^LIMB_BITS mod 5 = 1, so m mod 5 = (limb sum + carry
+// count) mod 5 - one wraparound pass, no per-limb division
+function LDivisibleBy5P(p: PLimb; len: SizeInt): boolean;
+begin
+  var s: TLimb := 0;
+  var cnt: TLimb := 0;
+  for var i := 0 to len - 1 do begin
+    s := s + p[i];
+    cnt := cnt + TLimb(Ord(s < p[i]));
+  end;
+  result := (s mod 5 + cnt mod 5) mod 5 = 0;
+end;
+
 // strip trailing decimal zeros of a magnitude, bumping the exponent
 procedure LStrip10(var m: TLimbs; var e: Int64);
 begin
   var lm := Length(m);
   if (lm = 0) or (m[0] and 1 = 1) then exit;
+  // cheap gate: an even mantissa still needs a factor of 5 to end in a zero
+  if not LDivisibleBy5P(PLimb(Pointer(m)), lm) then exit;
   // a trailing decimal zero needs a factor of 2 and 5, so their count cannot
   // exceed the 2-adic valuation; the trailing binary zeros bound the work
   var t: Int64 := 0;
@@ -7696,8 +7755,7 @@ begin
       DecFinish(result, Int64(a.fExp), a.fHidden or b.fHidden);
       exit;
     end;
-    if negateB then result.fMan := a.fMan - b.fMan
-    else result.fMan := a.fMan + b.fMan;
+    SAddP(a.fMan.dataPtr, a.fMan.fLen, a.fMan.fNeg, b.fMan.dataPtr, b.fMan.fLen, b.fMan.fNeg xor negateB, @result.fMan.fInline[0], result.fMan.fArr, result.fMan.fLen, result.fMan.fNeg);
     DecFinish(result, Int64(a.fExp), a.fHidden or b.fHidden);
     exit;
   end;
@@ -7730,6 +7788,65 @@ begin
       end;
     end;
   end;
+  // medium operands over a gap up to 128: scale the higher-exponent side into
+  // a stack buffer with one schoolbook pass over the memoized power limbs, so
+  // the only allocation left is the result itself
+  var dm := Int64(a.fExp) - b.fExp;
+  var km := if dm > 0 then dm else -dm;
+  if km <= 4 * DEC_MED_LIMBS * DEC_CHUNK_POW div 5 then begin
+    var hp, lp: PLimb;
+    var hlen, llen: SizeInt;
+    var hneg, lneg: boolean;
+    if dm > 0 then begin
+      hp := a.fMan.dataPtr; hlen := a.fMan.fLen; hneg := a.fMan.fNeg;
+      lp := b.fMan.dataPtr; llen := b.fMan.fLen; lneg := b.fMan.fNeg xor negateB;
+    end else begin
+      hp := b.fMan.dataPtr; hlen := b.fMan.fLen; hneg := b.fMan.fNeg xor negateB;
+      lp := a.fMan.dataPtr; llen := a.fMan.fLen; lneg := a.fMan.fNeg;
+    end;
+    var s: array[0..DEC_MED_LIMBS] of TLimb;
+    var slen: SizeInt := -1;
+    if km <= 64 then begin
+      var fl: SizeInt;
+      var f := Pow10ViewP(LongWord(km), fl);
+      if hlen + fl <= DEC_MED_LIMBS then begin
+        // mul_1 first row then addmul_1 rows: every limb is written before read
+        s[hlen] := MpnMul1(@s[0], hp, hlen, f[0]);
+        for var j := 1 to fl - 1 do s[hlen + j] := MpnAddMul1(@s[j], hp, hlen, f[j]);
+        slen := hlen + fl;
+      end;
+    end else begin
+      // wide gap: multiply by the ~30% narrower 5^km, then shift the 2^km
+      // factor in while placing the product into the add buffer
+      var fl: SizeInt;
+      var f := Pow5ViewP(LongWord(km), fl);
+      var ls := SizeInt(km shr LIMB_SHIFT);
+      var tlen := hlen + fl;
+      if ls + tlen + 1 <= DEC_MED_LIMBS then begin
+        var t: array[0..DEC_MED_LIMBS - 1] of TLimb;
+        t[hlen] := MpnMul1(@t[0], hp, hlen, f[0]);
+        for var j := 1 to fl - 1 do t[hlen + j] := MpnAddMul1(@t[j], hp, hlen, f[j]);
+        while (tlen > 0) and (t[tlen - 1] = 0) do dec(tlen);
+        var bs := integer(km and LIMB_MASK);
+        for var i := 0 to ls - 1 do s[i] := 0;
+        if bs = 0 then begin
+          for var i := 0 to tlen - 1 do s[ls + i] := t[i];
+          slen := ls + tlen;
+        end else begin
+          s[ls + tlen] := MpnLshift(@s[ls], @t[0], tlen, bs);
+          slen := ls + tlen + 1;
+        end;
+      end;
+    end;
+    if slen >= 0 then begin
+      while (slen > 0) and (s[slen - 1] = 0) do dec(slen);
+      if dm > 0 then SAddP(@s[0], slen, hneg, lp, llen, lneg, @result.fMan.fInline[0], result.fMan.fArr, result.fMan.fLen, result.fMan.fNeg)
+      else SAddP(lp, llen, lneg, @s[0], slen, hneg, @result.fMan.fInline[0], result.fMan.fArr, result.fMan.fLen, result.fMan.fNeg);
+      DecFinish(result, if dm > 0 then Int64(b.fExp) else Int64(a.fExp), a.fHidden or b.fHidden);
+      exit;
+    end;
+  end;
+
   // align to the smaller exponent: only the higher-exponent side is scaled,
   // the other one is read in place
   var d2 := Int64(a.fExp) - b.fExp;
