@@ -2467,10 +2467,8 @@ end;
 
 // exact division by 3 for the Toom-3 interpolation
 function DivExact3(const x: TLimbs): TLimbs;
-var
-  rem: TLimb;
 begin
-  result := LDivModW(x, 3, rem);
+  result := LDivModW(x, 3, _);
 end;
 
 // Toom-3: split into three k-limb parts, evaluate at 0, 1, -1, 2 and
@@ -3436,9 +3434,7 @@ begin
   if d <= -1.0 then RaiseNegativeUnsigned;
   if System.Abs(d) < 1.0 then exit(default(UBigInt));
   // 53-bit integer mantissa scaled by its base-2 exponent
-  var q: QWord;
-  var e: integer;
-  DblIntParts(d, q, e);
+  DblIntParts(d, var q, var e);
   result.fLimbs := LFromQWord(q);
   if e > 0 then result.fLimbs := LShl(result.fLimbs, LongWord(e))
   else if e < 0 then result.fLimbs := LShr(result.fLimbs, LongWord(-e));
@@ -3600,8 +3596,7 @@ begin
   if b.fLen = 0 then RaiseDivByZero;
   if (b.fArr = nil) and (a.fLen <= 2 * BIGINT_INLINE_LIMBS) then begin
     var qb, rb: array[0..2 * BIGINT_INLINE_LIMBS - 1] of TLimb;
-    var ql, rl: SizeInt;
-    DivModInline(a.dataPtr, a.fLen, @b.fInline[0], b.fLen, @qb[0], ql, @rb[0], rl);
+    DivModInline(a.dataPtr, a.fLen, @b.fInline[0], b.fLen, @qb[0], var ql, @rb[0], _);
     if ql <= BIGINT_INLINE_LIMBS then PutInline(@qb[0], ql, @result.fInline[0], result.fArr, result.fLen)
     else PutSpill(@qb[0], ql, result.fArr, result.fLen);
     exit;
@@ -3632,8 +3627,7 @@ begin
     var dl: SizeInt := if db[1] <> 0 then 2 else 1;
     {$endif}
     var qb, rb: array[0..2 * BIGINT_INLINE_LIMBS - 1] of TLimb;
-    var ql, rl: SizeInt;
-    DivModInline(a.dataPtr, a.fLen, @db[0], dl, @qb[0], ql, @rb[0], rl);
+    DivModInline(a.dataPtr, a.fLen, @db[0], dl, @qb[0], var ql, @rb[0], _);
     if ql <= BIGINT_INLINE_LIMBS then PutInline(@qb[0], ql, @result.fInline[0], result.fArr, result.fLen)
     else PutSpill(@qb[0], ql, result.fArr, result.fLen);
     exit;
@@ -3659,8 +3653,7 @@ begin
   if b.fLen = 0 then RaiseDivByZero;
   if (b.fArr = nil) and (a.fLen <= 2 * BIGINT_INLINE_LIMBS) then begin
     var qb, rb: array[0..2 * BIGINT_INLINE_LIMBS - 1] of TLimb;
-    var ql, rl: SizeInt;
-    DivModInline(a.dataPtr, a.fLen, @b.fInline[0], b.fLen, @qb[0], ql, @rb[0], rl);
+    DivModInline(a.dataPtr, a.fLen, @b.fInline[0], b.fLen, @qb[0], _, @rb[0], var rl);
     // a < b leaves the whole dividend as the remainder, which can spill
     if rl <= BIGINT_INLINE_LIMBS then PutInline(@rb[0], rl, @result.fInline[0], result.fArr, result.fLen)
     else PutSpill(@rb[0], rl, result.fArr, result.fLen);
@@ -3690,8 +3683,7 @@ begin
     var dl: SizeInt := if db[1] <> 0 then 2 else 1;
     {$endif}
     var qb, rb: array[0..2 * BIGINT_INLINE_LIMBS - 1] of TLimb;
-    var ql, rl: SizeInt;
-    DivModInline(a.dataPtr, a.fLen, @db[0], dl, @qb[0], ql, @rb[0], rl);
+    DivModInline(a.dataPtr, a.fLen, @db[0], dl, @qb[0], _, @rb[0], var rl);
     if rl <= BIGINT_INLINE_LIMBS then PutInline(@rb[0], rl, @result.fInline[0], result.fArr, result.fLen)
     else PutSpill(@rb[0], rl, result.fArr, result.fLen);
     exit;
@@ -4258,8 +4250,7 @@ begin
   if d.fLen = 0 then RaiseDivByZero;
   if (d.fArr = nil) and (fLen <= 2 * BIGINT_INLINE_LIMBS) then begin
     var qb, rb: array[0..2 * BIGINT_INLINE_LIMBS - 1] of TLimb;
-    var ql, rl: SizeInt;
-    DivModInline(dataPtr, fLen, @d.fInline[0], d.fLen, @qb[0], ql, @rb[0], rl);
+    DivModInline(dataPtr, fLen, @d.fInline[0], d.fLen, @qb[0], var ql, @rb[0], var rl);
     if ql <= BIGINT_INLINE_LIMBS then PutInline(@qb[0], ql, @qq.fInline[0], qq.fArr, qq.fLen)
     else PutSpill(@qb[0], ql, qq.fArr, qq.fLen);
     if rl <= BIGINT_INLINE_LIMBS then PutInline(@rb[0], rl, @rr.fInline[0], rr.fArr, rr.fLen)
@@ -5434,8 +5425,7 @@ begin
   pcgHi := QWord(state shr 64);
   pcgLo := QWord(state);
   {$else}
-  var hi, lo: QWord;
-  Mul64x64(oldLo, mLo, hi, lo);
+  Mul64x64(oldLo, mLo, var hi, var lo);
   hi := hi + oldHi * mLo + oldLo * mHi;
   var newLo := lo + aLo;
   if newLo < lo then inc(hi);
@@ -5616,18 +5606,14 @@ begin
 end;
 
 class function UBigInt.fibonacci(n: LongWord): UBigInt;
-var
-  f1: UBigInt;
 begin
-  UFibPair(n, result, f1);
+  UFibPair(n, result, _);
 end;
 
 class function UBigInt.lucas(n: LongWord): UBigInt;
-var
-  fn, fn1: UBigInt;
 begin
   // L(n) = 2F(n+1) - F(n)
-  UFibPair(n, fn, fn1);
+  UFibPair(n, var fn, var fn1);
   result := (fn1 shl 1) - fn;
 end;
 
@@ -6264,8 +6250,7 @@ begin
   if b.fLen = 0 then RaiseDivByZero;
   if (b.fArr = nil) and (a.fLen <= 2 * BIGINT_INLINE_LIMBS) then begin
     var qb, rb: array[0..2 * BIGINT_INLINE_LIMBS - 1] of TLimb;
-    var ql, rl: SizeInt;
-    DivModInline(a.dataPtr, a.fLen, @b.fInline[0], b.fLen, @qb[0], ql, @rb[0], rl);
+    DivModInline(a.dataPtr, a.fLen, @b.fInline[0], b.fLen, @qb[0], var ql, @rb[0], _);
     if ql <= BIGINT_INLINE_LIMBS then PutInline(@qb[0], ql, @result.fInline[0], result.fArr, result.fLen)
     else PutSpill(@qb[0], ql, result.fArr, result.fLen);
     result.fNeg := (a.fNeg xor b.fNeg) and (result.fLen > 0);
@@ -6287,8 +6272,7 @@ begin
   if b.fLen = 0 then RaiseDivByZero;
   if (b.fArr = nil) and (a.fLen <= 2 * BIGINT_INLINE_LIMBS) then begin
     var qb, rb: array[0..2 * BIGINT_INLINE_LIMBS - 1] of TLimb;
-    var ql, rl: SizeInt;
-    DivModInline(a.dataPtr, a.fLen, @b.fInline[0], b.fLen, @qb[0], ql, @rb[0], rl);
+    DivModInline(a.dataPtr, a.fLen, @b.fInline[0], b.fLen, @qb[0], _, @rb[0], var rl);
     if rl <= BIGINT_INLINE_LIMBS then PutInline(@rb[0], rl, @result.fInline[0], result.fArr, result.fLen)
     else PutSpill(@rb[0], rl, result.fArr, result.fLen);
     result.fNeg := a.fNeg and (result.fLen > 0);
@@ -6922,8 +6906,7 @@ begin
   if d.fLen = 0 then RaiseDivByZero;
   if (d.fArr = nil) and (fLen <= 2 * BIGINT_INLINE_LIMBS) then begin
     var qb, rb: array[0..2 * BIGINT_INLINE_LIMBS - 1] of TLimb;
-    var ql, rl: SizeInt;
-    DivModInline(dataPtr, fLen, @d.fInline[0], d.fLen, @qb[0], ql, @rb[0], rl);
+    DivModInline(dataPtr, fLen, @d.fInline[0], d.fLen, @qb[0], var ql, @rb[0], var rl);
     if ql <= BIGINT_INLINE_LIMBS then PutInline(@qb[0], ql, @qq.fInline[0], qq.fArr, qq.fLen)
     else PutSpill(@qb[0], ql, qq.fArr, qq.fLen);
     qq.fNeg := (fNeg xor d.fNeg) and (qq.fLen > 0);
@@ -7978,8 +7961,7 @@ begin
     var s: array[0..DEC_MED_LIMBS] of TLimb;
     var slen: SizeInt := -1;
     if km <= 64 then begin
-      var fl: SizeInt;
-      var f := Pow10ViewP(LongWord(km), fl);
+      var f := Pow10ViewP(LongWord(km), var fl);
       if hlen + fl <= DEC_MED_LIMBS then begin
         // mul_1 first row then addmul_1 rows: every limb is written before read
         s[hlen] := MpnMul1(@s[0], hp, hlen, f[0]);
@@ -7989,8 +7971,7 @@ begin
     end else begin
       // wide gap: multiply by the ~30% narrower 5^km, then shift the 2^km
       // factor in while placing the product into the add buffer
-      var fl: SizeInt;
-      var f := Pow5ViewP(LongWord(km), fl);
+      var f := Pow5ViewP(LongWord(km), var fl);
       var ls := SizeInt(km shr LIMB_SHIFT);
       var tlen := hlen + fl;
       if ls + tlen + 1 <= DEC_MED_LIMBS then begin
@@ -8370,42 +8351,30 @@ begin
 end;
 
 function BigDecimal.isOne: boolean;
-var
-  m: TLimbs;
-  e: Int64;
 begin
   if fMan.fNeg then exit(false);
-  DecCanon(self, m, e);
+  DecCanon(self, var m, var e);
   result := (e = 0) and (Length(m) = 1) and (m[0] = 1);
 end;
 
 function BigDecimal.isIntegral: boolean;
-var
-  m: TLimbs;
-  e: Int64;
 begin
   if fExp >= 0 then exit(true);
-  DecCanon(self, m, e);
+  DecCanon(self, var m, var e);
   result := (Length(m) = 0) or (e >= 0);
 end;
 
 function BigDecimal.isEven: boolean;
-var
-  m: TLimbs;
-  e: Int64;
 begin
-  DecCanon(self, m, e);
+  DecCanon(self, var m, var e);
   if e > 0 then exit(true);
   if e < 0 then exit(false);
   result := (Length(m) = 0) or (m[0] and 1 = 0);
 end;
 
 function BigDecimal.isOdd: boolean;
-var
-  m: TLimbs;
-  e: Int64;
 begin
-  DecCanon(self, m, e);
+  DecCanon(self, var m, var e);
   result := (e = 0) and (Length(m) > 0) and (m[0] and 1 = 1);
 end;
 
@@ -8441,8 +8410,7 @@ begin
     result.fLimbs := LScale10(fMan.fLimbs, fExp);
     result.fNeg := fMan.fNeg;
   end else begin
-    var q, r, p5: TLimbs;
-    LDivPow10(fMan.fLimbs, LongWord(-Int64(fExp)), q, r, p5);
+    LDivPow10(fMan.fLimbs, LongWord(-Int64(fExp)), var q, _, _);
     result.fLimbs := q;
     result.fNeg := fMan.fNeg and (Length(q) > 0);
   end;
@@ -8468,8 +8436,7 @@ end;
 function BigDecimal.frac: BigDecimal;
 begin
   if fExp >= 0 then exit(default(BigDecimal));
-  var q, r, p5: TLimbs;
-  LDivPow10(fMan.fLimbs, LongWord(-Int64(fExp)), q, r, p5);
+  LDivPow10(fMan.fLimbs, LongWord(-Int64(fExp)), _, var r, _);
   var m: BigInt;
   m.fLimbs := r;
   m.fNeg := fMan.fNeg and (Length(r) > 0);
@@ -8477,21 +8444,15 @@ begin
 end;
 
 function BigDecimal.precision: integer;
-var
-  m: TLimbs;
-  e: Int64;
 begin
-  DecCanon(self, m, e);
+  DecCanon(self, var m, var e);
   if Length(m) = 0 then exit(0);
   result := integer(Length(LToBase(m, 10)));
 end;
 
 function BigDecimal.mostSignificantExponent: integer;
-var
-  m: TLimbs;
-  e: Int64;
 begin
-  DecCanon(self, m, e);
+  DecCanon(self, var m, var e);
   if Length(m) = 0 then exit(0);
   result := DecExp(e + Length(LToBase(m, 10)) - 1);
 end;
@@ -8533,8 +8494,7 @@ begin
     qm := nil;
     rm := fMan.fLimbs;
   end else begin
-    var p5: TLimbs;
-    LDivPow10(fMan.fLimbs, LongWord(delta), qm, rm, p5);
+    LDivPow10(fMan.fLimbs, LongWord(delta), qm, rm, var p5);
     p10 := LShl(p5, LongWord(delta));
   end;
   var up := false;
@@ -9080,11 +9040,8 @@ end;
 {$endif}
 
 function BigDecimal.hashCode: DWord;
-var
-  m: TLimbs;
-  e: Int64;
 begin
-  DecCanon(self, m, e);
+  DecCanon(self, var m, var e);
   var b: BigInt;
   b.fLimbs := m;
   b.fNeg := fMan.fNeg and (Length(m) > 0);
@@ -9347,9 +9304,7 @@ begin
   var w := Int64(p) + 28;
   var p10 := UPow10(LongWord(w));
   // mantissa scaled into [1, 10) at w digits; f is the leading-digit exponent
-  var m: TLimbs;
-  var e: Int64;
-  DecCanon(self, m, e);
+  DecCanon(self, var m, var e);
   var dc := Int64(Length(LToBase(m, 10)));
   var f := e + dc - 1;
   var t := w - (dc - 1);
@@ -9395,9 +9350,7 @@ begin
   var p := precision;
   if p < 0 then p := 0;
   if fMan.fNeg or fMan.isZero then raise EBigIntError.Create('logarithm of a non-positive value');
-  var m: TLimbs;
-  var e: Int64;
-  DecCanon(self, m, e);
+  DecCanon(self, var m, var e);
   // exact powers of two: man * 10^e = 2^k needs man = 2^(k-e) * 5^(-e)
   if (e <= 0) and ((-e) * 699 div 1000 + 1 <= Int64(LBitLen(m)) * 1233 div 4096 + 1) then begin
     var u: UBigInt;
@@ -9424,9 +9377,7 @@ begin
   var p := precision;
   if p < 0 then p := 0;
   if fMan.fNeg or fMan.isZero then raise EBigIntError.Create('logarithm of a non-positive value');
-  var m: TLimbs;
-  var e: Int64;
-  DecCanon(self, m, e);
+  DecCanon(self, var m, var e);
   // exact powers of ten
   if (Length(m) = 1) and (m[0] = 1) then begin
     result := BFromI64(e);
@@ -9871,11 +9822,9 @@ end;
 
 function BigDecimal.toFraction: (num, den: BigInt);
 var
-  m: TLimbs;
-  e: Int64;
   nn, dd: BigInt;
 begin
-  DecCanon(self, m, e);
+  DecCanon(self, var m, var e);
   if e >= 0 then begin
     nn.fLimbs := LScale10(m, e);
     nn.fNeg := fMan.fNeg and (nn.fLen > 0);
