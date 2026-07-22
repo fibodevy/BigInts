@@ -2226,6 +2226,38 @@ begin
     if m.isOne then continue;
     check(b.modPowSec(e, m) = b.modPow(e, m), 'modPowSec matches modPow');
   end;
+  // constant-time compare/equals agree with the plain ones
+  for var i := 1 to 300 do begin
+    var a := randU(1 + Random(300));
+    var b := randU(1 + Random(300));
+    check(a.equalsCT(b) = (a = b), 'equalsCT oracle');
+    check(a.compareCT(b) = a.compare(b), 'compareCT oracle');
+    check(a.equalsCT(a) and (a.compareCT(a) = 0), 'CT self');
+    var sa := a.toBigInt;
+    var sb := b.toBigInt;
+    if Random(2) = 1 then sa.negate;
+    if Random(2) = 1 then sb.negate;
+    check(sa.equalsCT(sb) = (sa = sb), 'signed equalsCT oracle');
+    check(sa.compareCT(sb) = sa.compare(sb), 'signed compareCT oracle');
+  end;
+  check(UBigInt(0).equalsCT(UBigInt(0)), 'equalsCT zero');
+  check(UBigInt(0).compareCT(UBigInt(5)) = -1, 'compareCT zero lt');
+  check(BigInt(-3).compareCT(BigInt(2)) = -1, 'compareCT mixed signs');
+  check(BigInt(-3).compareCT(BigInt(-2)) = -1, 'compareCT both negative');
+  // secureClear leaves a live zero and does not disturb shared copies
+  var sec := UBigInt.random(1000);
+  var keep := sec; // shares the spilled buffer
+  var want := keep.toString;
+  sec.secureClear;
+  check(sec.isZero, 'secureClear zeroes the value');
+  checkEq(keep.toString, want, 'secureClear leaves shared copies alone');
+  keep.secureClear; // now exclusively owned: the buffer gets wiped
+  check(keep.isZero, 'secureClear owned buffer');
+  var ssec: BigInt := -12345;
+  ssec.secureClear;
+  check(ssec.isZero and not ssec.isNegative, 'signed secureClear');
+  sec := 42; // a cleared value stays usable
+  check(sec = 42, 'secureClear value reusable');
   // sqrtModN: every returned root squares back, and a residue is found
   for var i := 1 to 100 do begin
     var n := randU(40) or UBigInt.one;

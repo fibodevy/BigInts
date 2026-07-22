@@ -216,6 +216,13 @@ type
     // comparison helpers
     function compare(const other: UBigInt): integer;
     function equals(const other: UBigInt): boolean;
+    // constant-time variants: no data-dependent branches or early exits, the
+    // running time depends only on the limb counts (for secret comparisons)
+    function equalsCT(const other: UBigInt): boolean;
+    function compareCT(const other: UBigInt): integer;
+    // zero the limb storage before releasing it (skips buffers shared with
+    // other values), then set the value to 0
+    procedure secureClear;
     function min(const other: UBigInt): UBigInt;
     function max(const other: UBigInt): UBigInt;
     // division helpers
@@ -473,6 +480,10 @@ type
     // comparison helpers
     function compare(const other: BigInt): integer;
     function equals(const other: BigInt): boolean;
+    // constant-time variants, see UBigInt
+    function equalsCT(const other: BigInt): boolean;
+    function compareCT(const other: BigInt): integer;
+    procedure secureClear;
     function min(const other: BigInt): BigInt;
     function max(const other: BigInt): BigInt;
     // division helpers: divMod truncates (like div/mod), floor variants round
@@ -4359,6 +4370,50 @@ begin
   result := true;
 end;
 
+function UBigInt.equalsCT(const other: UBigInt): boolean;
+begin
+  var pa := dataPtr;
+  var pb := other.dataPtr;
+  var la := fLen;
+  var lb := other.fLen;
+  // every limb folds into one accumulator; the index tests branch on limb
+  // counts only, never on limb contents
+  var diff := TLimb(la) xor TLimb(lb);
+  for var i := 0 to MaxS(la, lb) - 1 do begin
+    var a := if i < la then pa[i] else 0;
+    var b := if i < lb then pb[i] else 0;
+    diff := diff or (a xor b);
+  end;
+  result := diff = 0;
+end;
+
+function UBigInt.compareCT(const other: UBigInt): integer;
+begin
+  var pa := dataPtr;
+  var pb := other.dataPtr;
+  var la := fLen;
+  var lb := other.fLen;
+  // top-down scan keeping the first decided direction, no early exit
+  var gt: LongWord := 0;
+  var lt: LongWord := 0;
+  for var i := MaxS(la, lb) - 1 downto 0 do begin
+    var a := if i < la then pa[i] else 0;
+    var b := if i < lb then pb[i] else 0;
+    var undecided := LongWord(1) - (gt or lt);
+    gt := gt or (LongWord(ord(a > b)) and undecided);
+    lt := lt or (LongWord(ord(a < b)) and undecided);
+  end;
+  result := integer(gt) - integer(lt);
+end;
+
+procedure UBigInt.secureClear;
+begin
+  FillChar(fInline, SizeOf(fInline), 0);
+  if (fArr <> nil) and ArrUnshared(fArr) then FillChar(fArr[0], Length(fArr) * SizeOf(TLimb), 0);
+  fArr := nil;
+  fLen := 0;
+end;
+
 function UBigInt.min(const other: UBigInt): UBigInt;
 begin
   result := if LCmpP(dataPtr, fLen, other.dataPtr, other.fLen) <= 0 then self else other;
@@ -7191,6 +7246,32 @@ end;
 function BigInt.equals(const other: BigInt): boolean;
 begin
   result := BCmp(self, other) = 0;
+end;
+
+function BigInt.equalsCT(const other: BigInt): boolean;
+begin
+  // both operands evaluate before the combine, so the sign check cannot
+  // short-circuit past the magnitude scan
+  var eqMag := magnitude.equalsCT(other.magnitude);
+  result := eqMag and (fNeg = other.fNeg);
+end;
+
+function BigInt.compareCT(const other: BigInt): integer;
+begin
+  var c := magnitude.compareCT(other.magnitude);
+  // equal signs use the magnitude order (flipped when both negative), mixed
+  // signs decide on the sign alone; branch-free select
+  var same := integer(ord(fNeg = other.fNeg));
+  result := same * c * (1 - 2 * ord(fNeg)) + (1 - same) * (ord(other.fNeg) - ord(fNeg));
+end;
+
+procedure BigInt.secureClear;
+begin
+  FillChar(fInline, SizeOf(fInline), 0);
+  if (fArr <> nil) and ArrUnshared(fArr) then FillChar(fArr[0], Length(fArr) * SizeOf(TLimb), 0);
+  fArr := nil;
+  fLen := 0;
+  fNeg := false;
 end;
 
 function BigInt.min(const other: BigInt): BigInt;
