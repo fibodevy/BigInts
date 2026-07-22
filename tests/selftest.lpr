@@ -1105,6 +1105,16 @@ begin
     check(a * x + b * y = g, 'Bezout identity');
     check(g = a.gcd(b), 'gcdExt matches gcd');
   end;
+  // unsigned gcdExt agrees with the signed one
+  for var i := 1 to 50 do begin
+    var ua := UBigInt.random(1 + Random(300));
+    var ub := UBigInt.random(1 + Random(300));
+    var (g, x, y) := ua.gcdExt(ub);
+    check(ua.toBigInt * x + ub.toBigInt * y = g.toBigInt, 'unsigned Bezout identity');
+    check(g = ua.gcd(ub), 'unsigned gcdExt matches gcd');
+  end;
+  var (g0, x0, y0) := UBigInt(0).gcdExt(UBigInt(0));
+  check(g0.isZero and (x0*0 + y0*0 = 0), 'unsigned gcdExt(0,0)');
   // jacobi against the Euler criterion for a prime modulus
   var p: BigInt := 1000000007;
   for var i := 1 to 100 do begin

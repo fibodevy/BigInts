@@ -795,6 +795,8 @@ type
   TUBigIntBridge = record helper for UBigInt
     function toBigInt: BigInt;
     function toDecimal: BigDecimal;
+    // extended Euclid: g = self*x + other*y (the coefficients can be negative)
+    function gcdExt(const other: UBigInt): (g: UBigInt; x, y: BigInt);
   end;
 
   TBigIntBridge = record helper for BigInt
@@ -7077,6 +7079,12 @@ end;
 function TUBigIntBridge.toDecimal: BigDecimal;
 begin
   result := self;
+end;
+
+function TUBigIntBridge.gcdExt(const other: UBigInt): (g: UBigInt; x, y: BigInt);
+begin
+  var (g, x, y) := toBigInt.gcdExt(other.toBigInt);
+  exit(g.toUBigInt, x, y);
 end;
 
 function TBigIntBridge.toDecimal: BigDecimal;
