@@ -543,6 +543,8 @@ type
     class function randomPrime(bits: LongWord; rounds: integer = 24): BigInt; static;
     // Chinese remainder theorem for pairwise coprime positive moduli
     class function crt(const remainders, moduli: array of BigInt): BigInt; static;
+    // Lucas sequences U_n(P,Q), V_n(P,Q) modulo an odd m, by index doubling
+    class function lucasSequence(const p, q, n, m: BigInt): (u, v: BigInt); static;
     class function factorial(n: LongWord): BigInt; static;
     class function fibonacci(n: LongWord): BigInt; static;
     class function lucas(n: LongWord): BigInt; static;
@@ -7573,6 +7575,37 @@ begin
     m := m * moduli[i];
   end;
   result := x;
+end;
+
+class function BigInt.lucasSequence(const p, q, n, m: BigInt): (u, v: BigInt);
+begin
+  if m.sign <= 0 then raise EBigIntError.Create('modulus must be positive');
+  if not m.isOdd then raise EBigIntError.Create('lucasSequence needs an odd modulus');
+  if n.isNegative then raise EBigIntError.Create('lucasSequence needs a nonnegative index');
+  if m.isOne then exit(BigInt.zero, BigInt.zero);
+  var pm := p.floorMod(m);
+  var qm := q.floorMod(m);
+  var d := (p * p - 4 * q).floorMod(m);
+  // (U_k, V_k, Q^k) from the top exponent bit down: square the index each
+  // step, add one when the bit is set; halving mod odd m bumps odd values by m
+  var u := BigInt.zero;
+  var v := BigInt(2).floorMod(m);
+  var qk := BigInt.one;
+  for var i := Int64(n.bitLength) - 1 downto 0 do begin
+    u := (u * v).floorMod(m);
+    v := (v * v - 2 * qk).floorMod(m);
+    qk := (qk * qk).floorMod(m);
+    if n.testBit(LongWord(i)) then begin
+      var t1 := (pm * u + v).floorMod(m);
+      if t1.isOdd then t1 := t1 + m;
+      var t2 := (d * u + pm * v).floorMod(m);
+      if t2.isOdd then t2 := t2 + m;
+      u := t1 shr 1;
+      v := t2 shr 1;
+      qk := (qk * qm).floorMod(m);
+    end;
+  end;
+  exit(u, v);
 end;
 
 class function BigInt.factorial(n: LongWord): BigInt;

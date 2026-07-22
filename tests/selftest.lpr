@@ -1187,6 +1187,42 @@ begin
   check(BigInt(-4).multiplicativeOrder(BigInt(7)) = 6, 'signed ord(-4 mod 7)');
   check(BigInt(7).primitiveRoot = 3, 'signed primitiveRoot');
   check(BigInt(-1).isPrimitiveRoot(BigInt(3)), 'signed isPrimitiveRoot(-1 mod 3)');
+  // lucasSequence: P=1, Q=-1 gives Fibonacci and Lucas numbers
+  var lm: BigInt := 1000000007;
+  for var i := 1 to 20 do begin
+    var n := LongWord(Random(500));
+    var (u, v) := BigInt.lucasSequence(1, -1, BigInt(Int64(n)), lm);
+    check(u = BigInt.fibonacci(n) mod lm, $'lucasSequence U = fib({n})');
+    check(v = BigInt.lucas(n) mod lm, $'lucasSequence V = lucas({n})');
+  end;
+  // random parameters against the recurrence oracle
+  for var i := 1 to 30 do begin
+    var lp := BigInt(Int64(Random(19)) - 9);
+    var lq := BigInt(Int64(Random(19)) - 9);
+    var lmm := BigInt(Int64(3 + 2 * Random(500)));
+    var n := Random(80);
+    var u0 := BigInt.zero;
+    var u1 := BigInt.one;
+    var v0 := BigInt(2).floorMod(lmm);
+    var v1 := lp.floorMod(lmm);
+    for var j := 2 to n do begin
+      (u0, u1) := (u1, (lp * u1 - lq * u0).floorMod(lmm));
+      (v0, v1) := (v1, (lp * v1 - lq * v0).floorMod(lmm));
+    end;
+    var (u, v) := BigInt.lucasSequence(lp, lq, BigInt(Int64(n)), lmm);
+    var wantU := u1;
+    var wantV := v1;
+    if n = 0 then begin
+      wantU := u0;
+      wantV := v0;
+    end;
+    check(u = wantU, $'lucasSequence U oracle n={n}');
+    check(v = wantV, $'lucasSequence V oracle n={n}');
+  end;
+  var (lsU, lsV) := BigInt.lucasSequence(3, 2, BigInt.zero, BigInt(101));
+  check(lsU.isZero and (lsV = 2), 'lucasSequence n=0');
+  checkRaises(procedure begin BigInt.lucasSequence(1, -1, BigInt(5), BigInt(10)); end, EBigIntError, 'lucasSequence even modulus');
+  checkRaises(procedure begin BigInt.lucasSequence(1, -1, BigInt(-1), BigInt(7)); end, EBigIntError, 'lucasSequence negative index');
 end;
 
 procedure testExtrasCombinatorics;
