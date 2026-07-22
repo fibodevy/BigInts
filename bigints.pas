@@ -767,9 +767,10 @@ type
     // calculator: evaluate a textual expression at the given precision, e.g.
     // calc('2^100 / sqrt(2)'). Operators + - * / div mod(%) ^(**) !, the
     // usual precedence with a right-associative power; functions sqrt cbrt
-    // root pow sqr abs exp ln log log2 log10 logb sin cos tan asin acos atan
-    // sinh cosh tanh floor ceil round trunc gamma lngamma erf erfc factorial
-    // min max gcd lcm atan2 hypot agm; constants pi e tau phi. Stateless:
+    // root pow sqr abs sign frac exp ln log log2 log10 logb sin cos tan asin
+    // acos atan sinh cosh tanh asinh acosh atanh floor ceil round trunc gamma
+    // lngamma erf erfc factorial min max gcd lcm atan2 hypot agm; constants pi
+    // e tau phi. Stateless:
     // no variables, syntax errors raise EConvertError with the position
     class function calc(const s: string; precision: integer = 18): BigDecimal; static;
     class function tryCalc(const s: string; out v: BigDecimal; precision: integer = 18): boolean; static;
@@ -806,6 +807,10 @@ type
     function sinh(precision: integer = 18): BigDecimal;
     function cosh(precision: integer = 18): BigDecimal;
     function tanh(precision: integer = 18): BigDecimal;
+    // inverse hyperbolics; arccosh needs x >= 1, arctanh needs -1 < x < 1
+    function arcsinh(precision: integer = 18): BigDecimal;
+    function arccosh(precision: integer = 18): BigDecimal;
+    function arctanh(precision: integer = 18): BigDecimal;
     // special functions: the gamma function and its logarithm (positive
     // argument for lnGamma, reflection covers negatives for gamma), the real
     // factorial x! = gamma(x+1), the error function and its complement
@@ -10565,6 +10570,42 @@ begin
   result := DecFromScaled(v, w, p);
 end;
 
+function BigDecimal.arcsinh(precision: integer): BigDecimal;
+begin
+  var p := precision;
+  if p < 0 then p := 0;
+  if fMan.isZero then exit(default(BigDecimal));
+  // arcsinh(x) = ln(x + sqrt(x^2 + 1)); the odd symmetry keeps the large
+  // negative argument off the cancelling branch
+  var w := p + 16;
+  var ax := abs;
+  result := DecGuardCut(((ax * ax + BigDecimal.one).sqrt(w) + ax).ln(w), p);
+  if fMan.fNeg then result.negate;
+end;
+
+function BigDecimal.arccosh(precision: integer): BigDecimal;
+begin
+  var p := precision;
+  if p < 0 then p := 0;
+  if compare(BigDecimal.one) < 0 then raise EBigIntError.Create('inverse hyperbolic cosine argument below 1');
+  if isOne then exit(default(BigDecimal));
+  // arccosh(x) = ln(x + sqrt(x^2 - 1))
+  var w := p + 16;
+  result := DecGuardCut(((self * self - BigDecimal.one).sqrt(w) + self).ln(w), p);
+end;
+
+function BigDecimal.arctanh(precision: integer): BigDecimal;
+begin
+  var p := precision;
+  if p < 0 then p := 0;
+  if fMan.isZero then exit(default(BigDecimal));
+  if abs.compare(BigDecimal.one) >= 0 then raise EBigIntError.Create('inverse hyperbolic tangent argument outside -1..1');
+  // arctanh(x) = ln((1 + x) / (1 - x)) / 2
+  var w := p + 16;
+  var t := (BigDecimal.one + self).divide(BigDecimal.one - self, w);
+  result := DecGuardCut(t.ln(w) * BigDecimal('0.5'), p);
+end;
+
 function BigDecimal.toEngineering: string;
 var
   m: TLimbs;
@@ -11053,6 +11094,26 @@ begin
     'tanh': begin
       needArgs(1);
       result := a[0].tanh(st.wp);
+    end;
+    'asinh', 'arcsinh': begin
+      needArgs(1);
+      result := a[0].arcsinh(st.wp);
+    end;
+    'acosh', 'arccosh': begin
+      needArgs(1);
+      result := a[0].arccosh(st.wp);
+    end;
+    'atanh', 'arctanh': begin
+      needArgs(1);
+      result := a[0].arctanh(st.wp);
+    end;
+    'sign': begin
+      needArgs(1);
+      result := a[0].sign;
+    end;
+    'frac': begin
+      needArgs(1);
+      result := a[0].frac;
     end;
     'floor': begin
       needArgs(1);

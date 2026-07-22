@@ -23,6 +23,10 @@ begin
   writeln($'{BigDecimal.calc('log(1000)')}');           // 3 (log is base 10, like a spreadsheet)
   writeln($'{BigDecimal.calc('5!')}');                  // 120
   writeln($'{BigDecimal.calc('gcd(0.25, 0.15)')}');     // 0.05
+  writeln($'{BigDecimal.calc('asinh(1)', 30)}');        // 0.881373587...
+  writeln($'{BigDecimal.calc('atanh(0.5)', 30)}');      // 0.549306144...
+  writeln($'{BigDecimal.calc('sign(-7)')}');            // -1
+  writeln($'{BigDecimal.calc('frac(3.25)')}');          // 0.25
 
   // the whole thing at 50 digits
   writeln($'{BigDecimal.calc('(1 + sqrt(5)) / 2', 50)}'); // the golden ratio
