@@ -844,6 +844,83 @@ type
     class function agm(const a, b: BigDecimal; precision: integer = 18): BigDecimal; static;
   end;
 
+  { BigRational - exact arbitrary precision fraction }
+
+  // always normalized: den > 0, gcd(num, den) = 1, zero is 0/1; a
+  // default-initialized value reads as 0
+  BigRational = record
+  private
+    fNum, fDen: BigInt;
+    // fDen = 0 only in a default() blob, semantically 1
+    function getDen: BigInt; inline;
+    procedure normalize;
+  public
+    class operator Initialize(var x: BigRational);
+    class operator :=(x: Int64): BigRational;
+    class operator :=(const s: string): BigRational;
+    class operator :=(const a: BigInt): BigRational;
+    class operator :=(const a: UBigInt): BigRational;
+    // exact value of the double (5.1 parses as the fraction 51/10, but a
+    // Double cast converts the actual binary value)
+    class operator explicit(d: Double): BigRational;
+    class operator explicit(const a: BigRational): Double;
+    class operator explicit(const a: BigRational): string;
+    // truncates toward zero
+    class operator explicit(const a: BigRational): BigInt;
+    class operator +(const a, b: BigRational): BigRational;
+    class operator -(const a, b: BigRational): BigRational;
+    class operator *(const a, b: BigRational): BigRational;
+    class operator /(const a, b: BigRational): BigRational;
+    class operator **(const a: BigRational; e: Int64): BigRational;
+    class operator -(const a: BigRational): BigRational;
+    class operator +(const a: BigRational): BigRational;
+    class operator =(const a, b: BigRational): boolean;
+    class operator <>(const a, b: BigRational): boolean;
+    class operator <(const a, b: BigRational): boolean;
+    class operator <=(const a, b: BigRational): boolean;
+    class operator >(const a, b: BigRational): boolean;
+    class operator >=(const a, b: BigRational): boolean;
+    // components (den is always positive)
+    function num: BigInt;
+    function den: BigInt;
+    class function create(const num, den: BigInt): BigRational; static;
+    // accepts 'a/b', integers, decimals and exponents ('1.25', '2e10')
+    class function parse(const s: string): BigRational; static;
+    class function tryParse(const s: string; out v: BigRational): boolean; static;
+    // 'num/den', or just 'num' for integral values
+    function toString: string;
+    function toDecimal(precision: integer = 18): BigDecimal;
+    function toDouble: Double;
+    function isZero: boolean;
+    function isOne: boolean;
+    function isInteger: boolean;
+    function isNegative: boolean;
+    function isPositive: boolean;
+    function sign: integer;
+    function abs: BigRational;
+    procedure negate;
+    function reciprocal: BigRational;
+    function trunc: BigInt;
+    function floor: BigInt;
+    function ceil: BigInt;
+    function round: BigInt;
+    function frac: BigRational;
+    function pow(e: Int64): BigRational;
+    function compare(const other: BigRational): integer;
+    function equals(const other: BigRational): boolean;
+    function min(const other: BigRational): BigRational;
+    function max(const other: BigRational): BigRational;
+    function hashCode: DWord;
+    procedure swap(var other: BigRational);
+    // continued fraction expansion and the tightest fraction with a bounded
+    // denominator (best rational approximation via convergents)
+    function continuedFraction: array of BigInt;
+    class function fromContinuedFraction(const cf: array of BigInt): BigRational; static;
+    function limitDenominator(const maxDen: BigInt): BigRational;
+    class function zero: BigRational; static;
+    class function one: BigRational; static;
+  end;
+
   { TModRing - Montgomery multiplication context over a fixed odd modulus }
 
   // precomputes the Montgomery constants once, then repeated modular products
@@ -11202,6 +11279,383 @@ begin
     v := default(BigDecimal);
     result := false;
   end;
+end;
+
+// ---------------------------------------------------------------------------
+// BigRational
+// ---------------------------------------------------------------------------
+
+function BigRational.getDen: BigInt;
+begin
+  result := if fDen.isZero then BigInt.one else fDen;
+end;
+
+procedure BigRational.normalize;
+begin
+  if fDen.isNegative then begin
+    fNum.negate;
+    fDen.negate;
+  end;
+  if fNum.isZero then begin
+    fDen := BigInt.one;
+    exit;
+  end;
+  var g := fNum.gcd(fDen);
+  if not g.isOne then begin
+    fNum := fNum div g;
+    fDen := fDen div g;
+  end;
+end;
+
+class operator BigRational.Initialize(var x: BigRational);
+begin
+  x.fDen := BigInt.one;
+end;
+
+class operator BigRational.:=(x: Int64): BigRational;
+begin
+  result.fNum := x;
+  result.fDen := BigInt.one;
+end;
+
+class operator BigRational.:=(const s: string): BigRational;
+begin
+  result := parse(s);
+end;
+
+class operator BigRational.:=(const a: BigInt): BigRational;
+begin
+  result.fNum := a;
+  result.fDen := BigInt.one;
+end;
+
+class operator BigRational.:=(const a: UBigInt): BigRational;
+begin
+  result.fNum := a.toBigInt;
+  result.fDen := BigInt.one;
+end;
+
+class operator BigRational.explicit(d: Double): BigRational;
+begin
+  var (n, dd) := BigDecimal.fromDoubleExact(d).toFraction;
+  result := create(n, dd);
+end;
+
+class operator BigRational.explicit(const a: BigRational): Double;
+begin
+  result := a.toDouble;
+end;
+
+class operator BigRational.explicit(const a: BigRational): string;
+begin
+  result := a.toString;
+end;
+
+class operator BigRational.explicit(const a: BigRational): BigInt;
+begin
+  result := a.trunc;
+end;
+
+class operator BigRational.+(const a, b: BigRational): BigRational;
+begin
+  var ad := a.getDen;
+  var bd := b.getDen;
+  result.fNum := a.fNum * bd + b.fNum * ad;
+  result.fDen := ad * bd;
+  result.normalize;
+end;
+
+class operator BigRational.-(const a, b: BigRational): BigRational;
+begin
+  var ad := a.getDen;
+  var bd := b.getDen;
+  result.fNum := a.fNum * bd - b.fNum * ad;
+  result.fDen := ad * bd;
+  result.normalize;
+end;
+
+class operator BigRational.*(const a, b: BigRational): BigRational;
+begin
+  result.fNum := a.fNum * b.fNum;
+  result.fDen := a.getDen * b.getDen;
+  result.normalize;
+end;
+
+class operator BigRational./(const a, b: BigRational): BigRational;
+begin
+  if b.fNum.isZero then RaiseDivByZero;
+  result.fNum := a.fNum * b.getDen;
+  result.fDen := a.getDen * b.fNum;
+  result.normalize;
+end;
+
+class operator BigRational.**(const a: BigRational; e: Int64): BigRational;
+begin
+  result := a.pow(e);
+end;
+
+class operator BigRational.-(const a: BigRational): BigRational;
+begin
+  result := a;
+  result.fNum.negate;
+end;
+
+class operator BigRational.+(const a: BigRational): BigRational;
+begin
+  result := a;
+end;
+
+class operator BigRational.=(const a, b: BigRational): boolean;
+begin
+  result := (a.fNum = b.fNum) and (a.getDen = b.getDen);
+end;
+
+class operator BigRational.<>(const a, b: BigRational): boolean;
+begin
+  result := not (a = b);
+end;
+
+class operator BigRational.<(const a, b: BigRational): boolean;
+begin
+  result := a.compare(b) < 0;
+end;
+
+class operator BigRational.<=(const a, b: BigRational): boolean;
+begin
+  result := a.compare(b) <= 0;
+end;
+
+class operator BigRational.>(const a, b: BigRational): boolean;
+begin
+  result := a.compare(b) > 0;
+end;
+
+class operator BigRational.>=(const a, b: BigRational): boolean;
+begin
+  result := a.compare(b) >= 0;
+end;
+
+function BigRational.num: BigInt;
+begin
+  result := fNum;
+end;
+
+function BigRational.den: BigInt;
+begin
+  result := getDen;
+end;
+
+class function BigRational.create(const num, den: BigInt): BigRational;
+begin
+  if den.isZero then RaiseDivByZero;
+  result.fNum := num;
+  result.fDen := den;
+  result.normalize;
+end;
+
+class function BigRational.parse(const s: string): BigRational;
+begin
+  var slash := Pos('/', s);
+  if slash > 0 then exit(create(BigInt.parse(Copy(s, 1, slash - 1)), BigInt.parse(Copy(s, slash + 1, MaxInt))));
+  var (n, d) := BigDecimal.parse(s).toFraction;
+  result := create(n, d);
+end;
+
+class function BigRational.tryParse(const s: string; out v: BigRational): boolean;
+begin
+  try
+    v := parse(s);
+    result := true;
+  except
+    v := BigRational.zero;
+    result := false;
+  end;
+end;
+
+function BigRational.toString: string;
+begin
+  result := fNum.toString;
+  if not getDen.isOne then result := result+'/'+fDen.toString;
+end;
+
+function BigRational.toDecimal(precision: integer): BigDecimal;
+begin
+  result := fNum.toDecimal.divide(getDen.toDecimal, precision);
+end;
+
+function BigRational.toDouble: Double;
+begin
+  result := Double(toDecimal(25));
+end;
+
+function BigRational.isZero: boolean;
+begin
+  result := fNum.isZero;
+end;
+
+function BigRational.isOne: boolean;
+begin
+  result := fNum.isOne and getDen.isOne;
+end;
+
+function BigRational.isInteger: boolean;
+begin
+  result := getDen.isOne;
+end;
+
+function BigRational.isNegative: boolean;
+begin
+  result := fNum.isNegative;
+end;
+
+function BigRational.isPositive: boolean;
+begin
+  result := fNum.isPositive;
+end;
+
+function BigRational.sign: integer;
+begin
+  result := fNum.sign;
+end;
+
+function BigRational.abs: BigRational;
+begin
+  result := self;
+  if result.fNum.isNegative then result.fNum.negate;
+end;
+
+procedure BigRational.negate;
+begin
+  fNum.negate;
+end;
+
+function BigRational.reciprocal: BigRational;
+begin
+  if fNum.isZero then RaiseDivByZero;
+  result := create(getDen, fNum);
+end;
+
+function BigRational.trunc: BigInt;
+begin
+  result := fNum div getDen;
+end;
+
+function BigRational.floor: BigInt;
+begin
+  result := fNum.floorDiv(getDen);
+end;
+
+function BigRational.ceil: BigInt;
+begin
+  result := fNum.ceilDiv(getDen);
+end;
+
+// nearest integer, ties to even (same convention as BigDecimal.round)
+function BigRational.round: BigInt;
+begin
+  var d := getDen;
+  result := fNum.floorDiv(d);
+  var twice := (fNum - result * d) * 2;
+  if (twice > d) or ((twice = d) and result.isOdd) then result := result + 1;
+end;
+
+function BigRational.frac: BigRational;
+begin
+  result.fNum := fNum mod getDen;
+  result.fDen := getDen;
+  result.normalize;
+end;
+
+function BigRational.pow(e: Int64): BigRational;
+begin
+  if e < 0 then begin
+    if e = Low(Int64) then raise EBigIntError.Create('pow exponent out of range');
+    exit(reciprocal.pow(-e));
+  end;
+  if e > High(LongWord) then raise EBigIntError.Create('pow exponent out of range');
+  // coprime num/den stay coprime under powers, no normalize needed
+  result.fNum := fNum.pow(LongWord(e));
+  result.fDen := getDen.pow(LongWord(e));
+end;
+
+function BigRational.compare(const other: BigRational): integer;
+begin
+  result := (fNum * other.getDen).compare(other.fNum * getDen);
+end;
+
+function BigRational.equals(const other: BigRational): boolean;
+begin
+  result := self = other;
+end;
+
+function BigRational.min(const other: BigRational): BigRational;
+begin
+  result := if compare(other) <= 0 then self else other;
+end;
+
+function BigRational.max(const other: BigRational): BigRational;
+begin
+  result := if compare(other) >= 0 then self else other;
+end;
+
+function BigRational.hashCode: DWord;
+begin
+  result := (fNum.hashCode * 16777619) xor getDen.hashCode;
+end;
+
+procedure BigRational.swap(var other: BigRational);
+begin
+  var t := self;
+  self := other;
+  other := t;
+end;
+
+function BigRational.continuedFraction: array of BigInt;
+begin
+  result := BigInt.continuedFraction(fNum, getDen);
+end;
+
+class function BigRational.fromContinuedFraction(const cf: array of BigInt): BigRational;
+begin
+  var (n, d) := BigInt.fromContinuedFraction(cf);
+  result := create(n, d);
+end;
+
+function BigRational.limitDenominator(const maxDen: BigInt): BigRational;
+begin
+  if maxDen.sign <= 0 then raise EBigIntError.Create('limitDenominator needs a positive bound');
+  if getDen <= maxDen then exit(self);
+  // walk the continued fraction convergents p/q until the denominator cap
+  var p0 := BigInt.zero;
+  var q0 := BigInt.one;
+  var p1 := BigInt.one;
+  var q1 := BigInt.zero;
+  var n := fNum;
+  var d := fDen;
+  repeat
+    var a := n.floorDiv(d);
+    var q2 := q0 + a * q1;
+    if q2 > maxDen then break;
+    (p0, q0, p1, q1) := (p1, q1, p0 + a * p1, q2);
+    (n, d) := (d, n - a * d);
+  until false; // d cannot reach zero: the exact fraction has den > maxDen, so q2 breaks first
+  // best approximation is the last convergent or the tightest semiconvergent
+  var k := (maxDen - q0) div q1;
+  var c1 := BigRational.create(p0 + k * p1, q0 + k * q1);
+  var c2 := BigRational.create(p1, q1);
+  if (c2 - self).abs <= (c1 - self).abs then result := c2 else result := c1;
+end;
+
+class function BigRational.zero: BigRational;
+begin
+  result.fNum := BigInt.zero;
+  result.fDen := BigInt.one;
+end;
+
+class function BigRational.one: BigRational;
+begin
+  result.fNum := BigInt.one;
+  result.fDen := BigInt.one;
 end;
 
 {$ifdef BIGINT_ASM}

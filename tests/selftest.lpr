@@ -2592,6 +2592,112 @@ begin
   checkRaises(procedure begin BigDecimal.calc(deep); end, EConvertError, 'calc 300 parens rejected');
 end;
 
+procedure testRational;
+begin
+  section('BigRational');
+  // construction and normalization
+  checkEq(BigRational.create(2, 4).toString, '1/2', 'create 2/4');
+  checkEq(BigRational.create(-2, 4).toString, '-1/2', 'create -2/4');
+  checkEq(BigRational.create(2, -4).toString, '-1/2', 'create 2/-4');
+  checkEq(BigRational.create(-2, -4).toString, '1/2', 'create -2/-4');
+  checkEq(BigRational.create(0, 5).toString, '0', 'create 0/5');
+  checkEq(BigRational.create(6, 3).toString, '2', 'create 6/3 integral');
+  checkRaises(procedure begin BigRational.create(1, 0); end, EDivByZero, 'create zero den');
+  var r: BigRational;
+  checkEq(r.toString, '0', 'default is zero');
+  check((r + BigRational.one).isOne, 'default arithmetic');
+  r := 7;
+  check(r.isInteger and (r.num = 7) and (r.den = 1), 'int64 assign');
+  r := '355/113';
+  check((r.num = 355) and (r.den = 113), 'string assign a/b');
+  r := '1.25';
+  checkEq(r.toString, '5/4', 'decimal parse');
+  checkEq(BigRational.parse('2e3').toString, '2000', 'exponent parse');
+  checkEq(BigRational.parse('-0.5').toString, '-1/2', 'negative decimal parse');
+  var pv: BigRational;
+  check(not BigRational.tryParse('1/0', pv), 'tryParse zero den');
+  check(not BigRational.tryParse('abc', pv), 'tryParse garbage');
+  check(BigRational.tryParse('-7/21', pv) and (pv.toString = '-1/3'), 'tryParse ok');
+
+  // arithmetic identities on random fractions
+  for var i := 1 to 200 do begin
+    var a := BigRational.create(BigInt.random(60) - BigInt.pow2(59), BigInt.random(50) + 1);
+    var b := BigRational.create(BigInt.random(60) - BigInt.pow2(59), BigInt.random(50) + 1);
+    var c := BigRational.create(BigInt.random(40) - BigInt.pow2(39), BigInt.random(30) + 1);
+    check((a + b) - b = a, 'add/sub roundtrip');
+    if not b.isZero then check((a * b) / b = a, 'mul/div roundtrip');
+    check(a + (-a) = BigRational.zero, 'additive inverse');
+    check((a + b) * c = a * c + b * c, 'distributive');
+    check(a + b = b + a, 'commutative');
+    check((a.compare(b) < 0) = (b.compare(a) > 0), 'compare antisymmetry');
+    check(a.den.isPositive, 'den positive invariant');
+    check(a.num.gcd(a.den).isOne or a.num.isZero, 'reduced invariant');
+  end;
+  check(BigRational.create(1, 3) < BigRational.create(1, 2), '1/3 < 1/2');
+  check(BigRational.create(-1, 2) < BigRational.create(1, 3), '-1/2 < 1/3');
+  check(BigRational.create(2, 6) = BigRational.create(1, 3), 'equality after reduce');
+  check(BigRational.create(1, 3) <> BigRational.create(1, 4), 'inequality');
+  check(BigRational.create(1, 3).min(BigRational.create(1, 2)) = BigRational.create(1, 3), 'min');
+  check(BigRational.create(1, 3).max(BigRational.create(1, 2)) = BigRational.create(1, 2), 'max');
+  check(BigRational.create(2, 6).hashCode = BigRational.create(1, 3).hashCode, 'hashCode equal values');
+
+  // rounding family
+  var h := BigRational.create(7, 2);
+  check((h.trunc = 3) and (h.floor = 3) and (h.ceil = 4) and (h.round = 4), '7/2 rounding');
+  h := BigRational.create(5, 2);
+  check(h.round = 2, '5/2 rounds to even');
+  h := BigRational.create(-7, 2);
+  check((h.trunc = -3) and (h.floor = -4) and (h.ceil = -3) and (h.round = -4), '-7/2 rounding');
+  checkEq(BigRational.create(7, 2).frac.toString, '1/2', 'frac positive');
+  checkEq(BigRational.create(-7, 2).frac.toString, '-1/2', 'frac negative');
+  check(BigInt(BigRational.create(-7, 2)) = -3, 'explicit BigInt cast truncates');
+
+  // pow / reciprocal / abs
+  checkEq(BigRational.create(2, 3).pow(3).toString, '8/27', 'pow 3');
+  checkEq(BigRational.create(2, 3).pow(-2).toString, '9/4', 'pow -2');
+  check(BigRational.create(2, 3).pow(0).isOne, 'pow 0');
+  checkEq((BigRational.create(2, 3) ** 2).toString, '4/9', '** operator');
+  checkRaises(procedure begin BigRational.zero.pow(-1); end, EDivByZero, 'pow -1 of zero');
+  checkEq(BigRational.create(-2, 3).reciprocal.toString, '-3/2', 'reciprocal');
+  checkEq(BigRational.create(-2, 3).abs.toString, '2/3', 'abs');
+  var ng := BigRational.create(2, 3);
+  ng.negate;
+  checkEq(ng.toString, '-2/3', 'negate');
+
+  // conversions
+  checkEq(BigRational.create(1, 3).toDecimal(10).toString, '0.3333333333', 'toDecimal 1/3');
+  check(BigRational.create(1, 2).toDouble = 0.5, 'toDouble 1/2');
+  check(BigRational(Double(0.5)) = BigRational.create(1, 2), 'exact double 0.5');
+  check(BigRational(Double(0.1)) <> BigRational.create(1, 10), 'exact double 0.1 is binary');
+  checkEq(string(BigRational.create(3, 4)), '3/4', 'explicit string cast');
+
+  // continued fractions and best approximation
+  var cf := BigRational.create(355, 113).continuedFraction;
+  check((Length(cf) = 3) and (cf[0] = 3) and (cf[1] = 7) and (cf[2] = 16), 'cf of 355/113');
+  check(BigRational.fromContinuedFraction(cf) = BigRational.create(355, 113), 'cf roundtrip');
+  for var i := 1 to 50 do begin
+    var a := BigRational.create(BigInt.random(50) - BigInt.pow2(49), BigInt.random(40) + 1);
+    check(BigRational.fromContinuedFraction(a.continuedFraction) = a, 'cf random roundtrip');
+  end;
+  var approxPi := BigRational.create(BigInt('314159265358979'), BigInt('100000000000000'));
+  checkEq(approxPi.limitDenominator(BigInt(1000)).toString, '355/113', 'limitDenominator 1000');
+  checkEq(approxPi.limitDenominator(BigInt(10)).toString, '22/7', 'limitDenominator 10');
+  check(BigRational.create(1, 3).limitDenominator(BigInt(100)) = BigRational.create(1, 3), 'limitDenominator exact');
+  for var i := 1 to 50 do begin
+    var a := BigRational.create(BigInt.random(60) - BigInt.pow2(59), BigInt.random(50) + 1);
+    var cap := BigInt.random(20) + 1;
+    var lim := a.limitDenominator(cap);
+    check(lim.den <= cap, 'limitDenominator cap holds');
+    // no fraction with the same cap sits strictly closer (spot check nearby dens)
+    var best := (lim - a).abs;
+    for var dd := 1 to 40 do begin
+      if BigInt(dd) > cap then break;
+      var cand := BigRational.create((a * BigRational(BigInt(dd))).round, BigInt(dd));
+      check((cand - a).abs >= best, 'limitDenominator optimal vs spot checks');
+    end;
+  end;
+end;
+
 begin
   RandSeed := 20260706;
   // the native RNG now auto-seeds from OS entropy per thread; seed it explicitly
@@ -2640,6 +2746,8 @@ begin
   testExtrasCrypto;
   testExtrasComb2;
   testExtrasFormat;
+
+  testRational;
 
   testDecBasics;
   testDecArithmetic;
