@@ -207,6 +207,39 @@ begin
   mpz_clear(za); mpz_clear(zb);
 end;
 
+// in-place addTo/subTo against the same mpz calls, which are in-place on the
+// GMP side already; r persists across iterations so its buffer gets reused
+procedure BenchAddTo(bits: LongWord);
+var
+  za, zb: mpz_t;
+  r: UBigInt;
+begin
+  var a := RandExact(bits);
+  var b := RandExact(bits);
+  mpz_init(za); mpz_init(zb);
+  mpzFromU(za, a); mpzFromU(zb, b);
+  Row($'addTo {bits}b',
+    procedure(n: Int64) begin for var i: Int64 := 1 to n do begin addTo(r, a, b); sink := sink xor r.bitLength; end; end,
+    procedure(n: Int64) begin for var i: Int64 := 1 to n do mpz_add(gr, za, zb); end);
+  mpz_clear(za); mpz_clear(zb);
+end;
+
+procedure BenchSubTo(bits: LongWord);
+var
+  za, zb: mpz_t;
+  r: UBigInt;
+begin
+  var a := RandExact(bits);
+  var b := RandExact(bits);
+  if a < b then begin var t := a; a := b; b := t; end;
+  mpz_init(za); mpz_init(zb);
+  mpzFromU(za, a); mpzFromU(zb, b);
+  Row($'subTo {bits}b',
+    procedure(n: Int64) begin for var i: Int64 := 1 to n do begin subTo(r, a, b); sink := sink xor r.bitLength; end; end,
+    procedure(n: Int64) begin for var i: Int64 := 1 to n do mpz_sub(gr, za, zb); end);
+  mpz_clear(za); mpz_clear(zb);
+end;
+
 procedure BenchMul(abits, bbits: LongWord);
 var
   za, zb: mpz_t;
@@ -345,7 +378,9 @@ begin
   Sep;
   RandSeed := 42;
   for var bits in addSizes do BenchAdd(bits);
+  for var bits in addSizes do BenchAddTo(bits);
   for var bits in addSizes do BenchSub(bits);
+  for var bits in addSizes do BenchSubTo(bits);
   for var bits in mulSizes do BenchMul(bits, bits);
   BenchMul(65536, 1024);
   BenchDivQ(2048, 1024);
