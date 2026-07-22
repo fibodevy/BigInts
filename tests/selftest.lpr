@@ -1259,6 +1259,34 @@ begin
     var k := LongWord(1 + Random(integer(n) - 1));
     check(UBigInt.binomial(n, k) = UBigInt.binomial(n - 1, k - 1) + UBigInt.binomial(n - 1, k), 'Pascal rule');
   end;
+  // binomialMod vs the exact binomial
+  var bmprimes: array of Int64 := [2, 3, 7, 13, 65537, 1000000007];
+  for var pi := 0 to High(bmprimes) do begin
+    var pp := UBigInt(QWord(bmprimes[pi]));
+    for var i := 1 to 30 do begin
+      var n := LongWord(Random(300));
+      var k := LongWord(Random(320));
+      check(UBigInt.binomialMod(UBigInt(QWord(n)), UBigInt(QWord(k)), pp) = UBigInt.binomial(n, k) mod pp, $'binomialMod n={n} k={k} p={bmprimes[pi]}');
+    end;
+  end;
+  // huge arguments, p=2: C(n,k) is odd iff k and (n-k) share no set bit
+  for var i := 1 to 30 do begin
+    var n := UBigInt.random(200);
+    var k := UBigInt.randomBelow(n + 1);
+    var wantOdd := ((k.toBigInt and (n - k).toBigInt) = 0);
+    check(UBigInt.binomialMod(n, k, UBigInt.two).isOne = wantOdd, 'binomialMod p=2 Kummer');
+  end;
+  // Pascal rule mod p on huge arguments
+  var bp: UBigInt := 1000003;
+  for var i := 1 to 20 do begin
+    var n := UBigInt.random(120) + 2;
+    var k := UBigInt.randomBelow(n - 1) + 1;
+    check(UBigInt.binomialMod(n, k, bp) = (UBigInt.binomialMod(n - 1, k - 1, bp) + UBigInt.binomialMod(n - 1, k, bp)) mod bp, 'binomialMod Pascal rule');
+  end;
+  check(UBigInt.binomialMod(UBigInt(10), UBigInt(11), UBigInt(7)).isZero, 'binomialMod k>n');
+  check(UBigInt.binomialMod(UBigInt(10), UBigInt(0), UBigInt(7)).isOne, 'binomialMod k=0');
+  check(BigInt.binomialMod(BigInt(100), BigInt(50), BigInt(13)) = BigInt.binomial(100, 50) mod 13, 'signed binomialMod');
+  checkRaises(procedure begin BigInt.binomialMod(BigInt(-1), BigInt(2), BigInt(7)); end, EBigIntError, 'binomialMod negative n');
   check(UBigInt.catalan(0) = 1, 'catalan 0');
   check(UBigInt.catalan(10) = 16796, 'catalan 10');
   check(UBigInt.lucas(0) = 2, 'L(0)');

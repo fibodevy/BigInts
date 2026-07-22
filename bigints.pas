@@ -309,6 +309,9 @@ type
     class function fibonacci(n: LongWord): UBigInt; static;
     class function lucas(n: LongWord): UBigInt; static;
     class function binomial(n, k: LongWord): UBigInt; static;
+    // C(n, k) mod prime p for arbitrarily large n, k via the Lucas theorem;
+    // cost grows with min(k, n-k) taken per base-p digit
+    class function binomialMod(const n, k, p: UBigInt): UBigInt; static;
     class function multinomial(const ks: array of LongWord): UBigInt; static;
     class function risingFactorial(const x: UBigInt; n: LongWord): UBigInt; static;
     class function fallingFactorial(const x: UBigInt; n: LongWord): UBigInt; static;
@@ -555,6 +558,8 @@ type
     class function fibonacci(n: LongWord): BigInt; static;
     class function lucas(n: LongWord): BigInt; static;
     class function binomial(n, k: LongWord): BigInt; static;
+    // C(n, k) mod prime p for arbitrarily large n, k via the Lucas theorem
+    class function binomialMod(const n, k, p: BigInt): BigInt; static;
     class function multinomial(const ks: array of LongWord): BigInt; static;
     class function risingFactorial(const x: BigInt; n: LongWord): BigInt; static;
     class function fallingFactorial(const x: BigInt; n: LongWord): BigInt; static;
@@ -5871,6 +5876,42 @@ begin
   end;
 end;
 
+// C(nd, kd) mod prime p for digits nd, kd < p: multiplicative form with one
+// batched inverse at the end
+function ULucasDigit(const nd, kd, p: UBigInt): UBigInt;
+begin
+  if kd > nd then exit(default(UBigInt));
+  var k2 := kd.min(nd - kd);
+  var num := UBigInt.one;
+  var den := UBigInt.one;
+  var i := UBigInt.one;
+  while i <= k2 do begin
+    num := (num * ((nd - k2 + i) mod p)) mod p;
+    den := (den * i) mod p;
+    i := i + 1;
+  end;
+  result := (num * den.modInverse(p)) mod p;
+end;
+
+class function UBigInt.binomialMod(const n, k, p: UBigInt): UBigInt;
+begin
+  if p.isZero then RaiseDivByZero;
+  if p.isOne then exit(default(UBigInt));
+  if k > n then exit(default(UBigInt));
+  // Lucas: multiply the digit binomials in base p
+  result := UBigInt.one;
+  var nn := n;
+  var kk := k;
+  while not kk.isZero do begin
+    var (nq, nd) := nn.divMod(p);
+    var (kq, kd) := kk.divMod(p);
+    result := (result * ULucasDigit(nd, kd, p)) mod p;
+    if result.isZero then exit;
+    nn := nq;
+    kk := kq;
+  end;
+end;
+
 class function UBigInt.catalan(n: LongWord): UBigInt;
 begin
   if n > High(LongWord) div 2 then raise EBigIntError.Create('catalan argument out of range');
@@ -7719,6 +7760,13 @@ end;
 class function BigInt.binomial(n, k: LongWord): BigInt;
 begin
   result := UBigInt.binomial(n, k).toBigInt;
+end;
+
+class function BigInt.binomialMod(const n, k, p: BigInt): BigInt;
+begin
+  if p.sign <= 0 then raise EBigIntError.Create('modulus must be positive');
+  if n.isNegative or k.isNegative then raise EBigIntError.Create('binomialMod needs nonnegative n and k');
+  result := UBigInt.binomialMod(n.toUBigInt, k.toUBigInt, p.toUBigInt).toBigInt;
 end;
 
 class function BigInt.catalan(n: LongWord): BigInt;
