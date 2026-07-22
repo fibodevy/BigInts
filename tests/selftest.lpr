@@ -3,10 +3,24 @@ program selftest;
 {$mode unleashed}
 
 uses
-  SysUtils, bigints;
+  {$ifdef WINDOWS}Windows,{$endif} SysUtils, bigints;
 
 type
   TTestProc = reference to procedure;
+
+{$ifdef WINDOWS}
+// make ANSI color escapes render when the exe is launched outside a VT-capable shell
+procedure enableVTColors;
+const
+  ENABLE_VT = $0004;
+var
+  h: THandle;
+  mode: DWord;
+begin
+  h := GetStdHandle(STD_OUTPUT_HANDLE);
+  if GetConsoleMode(h, mode) then SetConsoleMode(h, mode or ENABLE_VT);
+end;
+{$endif}
 
 var
   passCount: integer = 0;
@@ -2699,6 +2713,7 @@ begin
 end;
 
 begin
+  {$ifdef WINDOWS}enableVTColors;{$endif}
   RandSeed := 20260706;
   // the native RNG now auto-seeds from OS entropy per thread; seed it explicitly
   // so the whole run is reproducible

@@ -3,10 +3,24 @@ program addto_demo;
 {$mode unleashed}
 
 uses
-  SysUtils, BigInts;
+  {$ifdef WINDOWS}Windows,{$endif} SysUtils, BigInts;
 
 var
   fails: integer = 0;
+
+{$ifdef WINDOWS}
+// make ANSI color escapes render when the exe is launched outside a VT-capable shell
+procedure enableVTColors;
+const
+  ENABLE_VT = $0004;
+var
+  h: THandle;
+  mode: DWord;
+begin
+  h := GetStdHandle(STD_OUTPUT_HANDLE);
+  if GetConsoleMode(h, mode) then SetConsoleMode(h, mode or ENABLE_VT);
+end;
+{$endif}
 
 procedure check(const what: string; ok: boolean);
 begin
@@ -27,6 +41,7 @@ begin
 end;
 
 begin
+  {$ifdef WINDOWS}enableVTColors;{$endif}
   BigIntRandomSeed(42);
 
   // random pairs across the inline/spill boundary and beyond
