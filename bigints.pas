@@ -251,6 +251,11 @@ type
     // baby-step giant-step discrete log: least x with self^x = target (mod m),
     // or -1 when none exists below the modulus order
     function discreteLog(const target, m: UBigInt): Int64;
+    // least k > 0 with self^k = 1 (mod m); self must be coprime to m
+    function multiplicativeOrder(const m: UBigInt): UBigInt;
+    function isPrimitiveRoot(const m: UBigInt): boolean;
+    // smallest primitive root modulo self (exists for 1, 2, 4, p^k, 2*p^k)
+    function primitiveRoot: UBigInt;
     function isPerfectSquare: boolean;
     function sqrtRem: (root, rem: UBigInt);
     function factorize: array of (p: UBigInt; e: LongWord);
@@ -489,6 +494,11 @@ type
     function jacobi(const n: BigInt): integer;
     function kronecker(const n: BigInt): integer;
     function modSqrt(const p: BigInt): BigInt;
+    // least k > 0 with self^k = 1 (mod m); self must be coprime to m
+    function multiplicativeOrder(const m: BigInt): BigInt;
+    function isPrimitiveRoot(const m: BigInt): boolean;
+    // smallest primitive root modulo self (exists for 1, 2, 4, p^k, 2*p^k)
+    function primitiveRoot: BigInt;
     function isPerfectSquare: boolean;
     function sqrtRem: (root, rem: BigInt);
     function factorize: array of (p: BigInt; e: LongWord);
@@ -4948,6 +4958,54 @@ begin
   end;
 end;
 
+function UBigInt.multiplicativeOrder(const m: UBigInt): UBigInt;
+begin
+  if m.isZero then RaiseDivByZero;
+  if m.isOne then exit(UBigInt.one);
+  var a := self mod m;
+  if not a.gcd(m).isOne then raise EBigIntError.Create('multiplicativeOrder needs gcd(value, modulus) = 1');
+  // start from lambda(m) (every order divides it), then strip primes while the
+  // power still fixes 1
+  result := m.carmichaelLambda;
+  for var (p, e) in result.factorize do
+    while (result mod p).isZero and a.modPow(result div p, m).isOne do result := result div p;
+end;
+
+function UBigInt.isPrimitiveRoot(const m: UBigInt): boolean;
+begin
+  if m.isZero then RaiseDivByZero;
+  if m.isOne then exit(true);
+  var a := self mod m;
+  if not a.gcd(m).isOne then exit(false);
+  result := multiplicativeOrder(m) = m.eulerPhi;
+end;
+
+function UBigInt.primitiveRoot: UBigInt;
+begin
+  if isZero then RaiseDivByZero;
+  if self <= 4 then exit(if isOne then default(UBigInt) else self - 1); // 1 -> 0, 2 -> 1, 3 -> 2, 4 -> 3
+  // a primitive root exists only for p^k and 2*p^k with p an odd prime
+  var fac := factorize;
+  var ok := ((Length(fac) = 1) and (fac[0].p.isOdd)) or ((Length(fac) = 2) and (fac[0].p = 2) and (fac[0].e = 1));
+  if not ok then raise EBigIntError.Create('modulus has no primitive root');
+  var phi := eulerPhi;
+  var phiFac := phi.factorize;
+  var g := UBigInt.two;
+  repeat
+    if g.gcd(self).isOne then begin
+      var isGen := true;
+      for var (q, e) in phiFac do
+        if g.modPow(phi div q, self).isOne then begin
+          isGen := false;
+          break;
+        end;
+      if isGen then exit(g);
+    end;
+    g := g + 1;
+  until g = self;
+  raise EBigIntError.Create('modulus has no primitive root'); // unreachable for valid moduli
+end;
+
 function UBigInt.moebius: integer;
 begin
   if isZero then exit(0);
@@ -7209,6 +7267,24 @@ function BigInt.modSqrt(const p: BigInt): BigInt;
 begin
   if p.sign <= 0 then raise EBigIntError.Create('modulus must be positive');
   result := floorMod(p).toUBigInt.modSqrt(p.toUBigInt).toBigInt;
+end;
+
+function BigInt.multiplicativeOrder(const m: BigInt): BigInt;
+begin
+  if m.sign <= 0 then raise EBigIntError.Create('modulus must be positive');
+  result := floorMod(m).toUBigInt.multiplicativeOrder(m.toUBigInt).toBigInt;
+end;
+
+function BigInt.isPrimitiveRoot(const m: BigInt): boolean;
+begin
+  if m.sign <= 0 then raise EBigIntError.Create('modulus must be positive');
+  result := floorMod(m).toUBigInt.isPrimitiveRoot(m.toUBigInt);
+end;
+
+function BigInt.primitiveRoot: BigInt;
+begin
+  if sign <= 0 then raise EBigIntError.Create('modulus must be positive');
+  result := toUBigInt.primitiveRoot.toBigInt;
 end;
 
 function BigInt.sqrtRem: (root, rem: BigInt);

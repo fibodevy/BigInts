@@ -1150,6 +1150,43 @@ begin
     var x := BigInt.random(90);
     check(BigInt.crt([x mod m1, x mod m2, x mod m3], [m1, m2, m3]) = x mod (m1 * m2 * m3), 'crt roundtrip');
   end;
+  // multiplicative order
+  check(UBigInt(2).multiplicativeOrder(UBigInt(7)) = 3, 'ord(2 mod 7) = 3');
+  check(UBigInt(3).multiplicativeOrder(UBigInt(7)) = 6, 'ord(3 mod 7) = 6');
+  check(UBigInt(10).multiplicativeOrder(UBigInt(17)) = 16, 'ord(10 mod 17) = 16');
+  check(UBigInt(3).multiplicativeOrder(UBigInt(100)) = 20, 'ord(3 mod 100) = 20');
+  checkRaises(procedure begin UBigInt(6).multiplicativeOrder(UBigInt(15)); end, EBigIntError, 'ord needs coprime');
+  var p17: UBigInt := 65537;
+  for var i := 1 to 30 do begin
+    var a := UBigInt.random(200) mod p17;
+    if a.isZero then a := 3;
+    var ord := a.multiplicativeOrder(p17);
+    check(a.modPow(ord, p17).isOne, 'a^ord = 1');
+    check((UBigInt(65536) mod ord).isZero, 'ord divides p-1');
+    if ord.isEven then check(not a.modPow(ord shr 1, p17).isOne, 'ord is minimal');
+  end;
+  // primitive roots
+  check(UBigInt(2).primitiveRoot = 1, 'primitiveRoot(2)');
+  check(UBigInt(4).primitiveRoot = 3, 'primitiveRoot(4)');
+  check(UBigInt(7).primitiveRoot = 3, 'primitiveRoot(7)');
+  check(UBigInt(9).primitiveRoot = 2, 'primitiveRoot(9)');
+  check(UBigInt(18).primitiveRoot = 5, 'primitiveRoot(18)');
+  check(UBigInt(998244353).primitiveRoot = 3, 'primitiveRoot(998244353)');
+  check(UBigInt(1000000007).primitiveRoot = 5, 'primitiveRoot(1000000007)');
+  checkRaises(procedure begin UBigInt(8).primitiveRoot; end, EBigIntError, 'no primitive root mod 8');
+  checkRaises(procedure begin UBigInt(15).primitiveRoot; end, EBigIntError, 'no primitive root mod 15');
+  check(UBigInt(3).isPrimitiveRoot(UBigInt(998244353)), '3 generates mod 998244353');
+  check(not UBigInt(2).isPrimitiveRoot(UBigInt(7)), '2 does not generate mod 7');
+  check(not UBigInt(6).isPrimitiveRoot(UBigInt(15)), 'non-coprime is no generator');
+  for var i := 0 to High(sprimes) do begin
+    var pp := UBigInt(QWord(sprimes[i]));
+    var g := pp.primitiveRoot;
+    check(g.multiplicativeOrder(pp) = pp - 1, $'primitiveRoot order p={sprimes[i]}');
+  end;
+  // signed wrappers
+  check(BigInt(-4).multiplicativeOrder(BigInt(7)) = 6, 'signed ord(-4 mod 7)');
+  check(BigInt(7).primitiveRoot = 3, 'signed primitiveRoot');
+  check(BigInt(-1).isPrimitiveRoot(BigInt(3)), 'signed isPrimitiveRoot(-1 mod 3)');
 end;
 
 procedure testExtrasCombinatorics;
