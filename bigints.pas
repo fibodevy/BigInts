@@ -1,9 +1,11 @@
 { BigInts - arbitrary precision integers for Unleashed Pascal
 
- Three value types with full operator coverage and no size limit:
-   UBigInt - unsigned big integer (raises ERangeError on negative results)
-   BigInt  - signed big integer, two's complement semantics for bitwise ops
-   BigDecimal - decimal float over the same core: BigInt mantissa * 10^exp }
+ Four value types with full operator coverage and no size limit:
+   UBigInt     - unsigned big integer (raises ERangeError on negative results)
+   BigInt      - signed big integer, two's complement semantics for bitwise ops
+   BigDecimal  - decimal float over the same core: BigInt mantissa * 10^exp
+   BigRational - exact fraction: normalized BigInt num/den pair
+                 plus TModRing, a reusable Montgomery context for modular arithmetic }
 
 { Copyright (c) 2026 @fibodevy / https://github.com/fibodevy
   This Source Code Form is subject to the terms of the Mozilla Public

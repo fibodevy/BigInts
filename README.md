@@ -1,6 +1,6 @@
 # BigInts
 
-Arbitrary precision integers and decimals for Pascal in a single self-contained unit, `BigInts` ([bigints.pas](bigints.pas)). Three value types, every operator a plain number has, no size limits beyond available memory, no dependencies beyond the RTL.
+Arbitrary precision integers, decimals and rationals for Pascal in a single self-contained unit, `BigInts` ([bigints.pas](bigints.pas)). Four value types, every operator a plain number has, no size limits beyond available memory, no dependencies beyond the RTL.
 
 > **Requires a compiler that understands `{$mode unleashed}`.** The unit and the examples below lean on inline variables, tuples, statement expressions and interpolated strings, so a stock compiler will not build them.
 
@@ -9,6 +9,7 @@ Arbitrary precision integers and decimals for Pascal in a single self-contained 
 | `BigInt` | signed; bitwise operators use two's complement semantics with infinite sign extension, like Python ints |
 | `UBigInt` | unsigned; anything that would drop below zero raises `ERangeError` |
 | `BigDecimal` | decimal float: a `BigInt` mantissa times a power of ten; exact `+ - *`, division at a chosen precision |
+| `BigRational` | exact fraction: a normalized `num`/`den` pair of `BigInt`s (`den > 0`, `gcd = 1`); `1/3` stays `1/3` and never rounds |
 
 ## Capabilities
 
@@ -17,14 +18,15 @@ Arbitrary precision integers and decimals for Pascal in a single self-contained 
 - literals of any size with `_` separators and `$ 0x % 0b & 0o` prefixes; parsing and formatting in every base 2..36
 - multiplication: schoolbook, Karatsuba and Toom-3, picked by tunable thresholds, with dedicated squaring paths
 - division: Knuth algorithm D, plus divide-and-conquer base conversion for long numbers
-- modular arithmetic: Montgomery `modPow` (plus a constant-time `modPowSec`), `modInverse`, `modSqrt` (Tonelli-Shanks), `sqrtModN`, `crt`, `discreteLog`
+- modular arithmetic: Montgomery `modPow` (plus a constant-time `modPowSec` and a reusable `TModRing` context), `modInverse`, `modSqrt` (Tonelli-Shanks), `sqrtModN`, `nthRootMod`, `crt`, `discreteLog`, `multiplicativeOrder`, `primitiveRoot`/`isPrimitiveRoot`, `binomialMod`, `lucasSequence`
 - primes: Miller-Rabin `isProbablePrime` (deterministic below 3.3e24), Baillie-PSW `isPrime`, `nextPrime`/`prevPrime`, `randomPrime`/`randomSafePrime`/`randomStrongPrime`, exact `primePi`/`primeCount`
 - factorization: trial division plus Pollard-Brent rho, exponents grouped into `(p, e)` tuples; the multiplicative functions `eulerPhi`, `carmichaelLambda`, `moebius`, `sigma`, `tau`, `divisors`, `radical` follow from it
 - number theory and combinatorics: Lehmer `gcd`, `gcdExt`, `jacobi`, `kronecker`, `continuedFraction`, and `factorial`, `fibonacci`, `lucas`, `binomial`, `multinomial`, `catalan`, `bell`, `stirling1`/`stirling2`, `bernoulli`, `partitions`, `subfactorial`, `primorial`
 - randomness: pluggable generators (xoshiro256**, PCG64, splitmix64, `System.Random`, OS entropy), deterministic seeding, uniform `randomBelow`/`randomRange`
+- constant-time and secure: side-channel-resistant `equalsCT`/`compareCT`, `secureClear` to wipe a value, and `randomSecure`/`randomSecureBelow`/`randomSecureRange`/`randomSecurePrime` drawing straight from OS entropy with no seedable generator in between
 - interop: byte serialization in both endiannesses, `hashCode`, digit-grouped output
 - decimals: exact decimal arithmetic (`0.1 + 0.2 = 0.3`), division and roots at any precision, six rounding modes, shortest and exact float conversions in both directions, and the whole analytic toolbox - `pi`, `exp`, `ln`, `log2`/`log10`/`logBase`, fractional powers, trigonometry, hyperbolics, `gamma`, `erf`, `atan2`, `hypot`, `agm` at any precision (the BigDecimal chapter below)
-- speed: measured 1.3-5.1x of GMP on x64 for the core operations (benchmarks below); assembler inner loops with a pure Pascal fallback behind a `USEASM` define
+- speed: measured 1.3-4.9x of GMP on x64 for the core operations (benchmarks below); assembler inner loops with a pure Pascal fallback behind a `USEASM` define
 
 ## Quick start
 
@@ -136,6 +138,8 @@ The optional math layer on top of the core arithmetic.
 | `randomPrime(bits, rounds = 24)` | exact bit length: top bit set, odd, Miller-Rabin tested |
 | `randomSafePrime(bits)` | a safe prime `p` where `(p-1)/2` is also prime |
 | `randomStrongPrime(bits)` | Gordon's algorithm: `p-1` and `p+1` each carry a large prime factor |
+| `randomSecure(bits)`, `randomSecureBelow(bound)`, `randomSecureRange(lo, hi)` | uniform draws taken straight from OS entropy, no seedable generator in between |
+| `randomSecurePrime(bits, rounds = 24)` | like `randomPrime`, but from OS entropy |
 
 The backend behind `random` and friends is selected with the `BigIntRngAlgo` variable:
 
@@ -159,6 +163,11 @@ The generator state is per-thread (`threadvar`): the first random draw in a thre
 | `modSqrt(p)` | square root modulo a prime (Tonelli-Shanks); raises `EBigIntError` for a non-residue |
 | `sqrtModN(n)` | every square root modulo a composite `n` (factor, lift, CRT); needs `gcd(self, n) = 1`, empty array for a non-residue |
 | `discreteLog(target, m)` | baby-step giant-step: least `x` with `self^x = target (mod m)`, or -1; `Int64`, for small instances |
+| `nthRootMod(k, p)` | a `k`-th root modulo an odd prime `p` (Adleman-Manders-Miller) |
+| `multiplicativeOrder(m)` | least `k > 0` with `self^k = 1 (mod m)`; needs `gcd(self, m) = 1` |
+| `primitiveRoot`, `isPrimitiveRoot(m)` | a generator of the group modulo self / whether `self` generates modulo `m` |
+| `binomialMod(n, k, p)` | class function; `C(n, k) mod p` for prime `p` via the Lucas theorem |
+| `lucasSequence(p, q, n, m)` | class function; Lucas sequences `U_n`, `V_n` mod `m` by index doubling, returns a `(u, v)` tuple |
 | `crt(remainders, moduli)` | `BigInt` class function; Chinese remainder theorem for pairwise coprime positive moduli |
 | `isPerfectSquare` | quick mod-16 filter, then an exact root check |
 | `sqrtRem` | returns the `(root, rem)` tuple with `self = root^2 + rem` |
@@ -292,7 +301,7 @@ end.
 | `pow(y, precision = 18)`, `**` | fractional exponents through `exp(y * ln x)` |
 | `exp`, `ln`, `log2`, `log10`, `logBase(b)` | all take `(precision = 18)`; `log10` is exact for powers of ten, `log2` for powers of two |
 | `sin`, `cos`, `tan`, `arcsin`, `arccos`, `arctan` | radians; big arguments reduce modulo pi/2 at a matching precision |
-| `sinh`, `cosh`, `tanh` | hyperbolics over the same exponential core |
+| `sinh`, `cosh`, `tanh`, `arcsinh`, `arccosh`, `arctanh` | hyperbolics over the same exponential core; the inverses compose `ln` and `sqrt` (`arccosh` needs `x >= 1`, `arctanh` needs `-1 < x < 1`) |
 | `gamma`, `lnGamma` | the gamma function (reflection covers negatives) and its logarithm (positive argument) |
 | `factorial` | the real factorial `x! = gamma(x+1)`, exact for small non-negative integers |
 | `erf`, `erfc` | the error function and its complement; `erfc` uses a continued fraction for large arguments |
@@ -333,13 +342,49 @@ Functions (names are case-insensitive):
 |---|---|
 | roots and powers | `sqrt(x)` `cbrt(x)` `root(x, n)` `pow(x, y)` `sqr(x)` |
 | exp and logs | `exp(x)` `ln(x)` `log(x)`=log10, `log(x, b)`=base b, `log2(x)` `log10(x)` `logb(x, b)` |
-| trigonometry | `sin cos tan (x)`, `asin acos atan (x)` (also `arcsin`/`arccos`/`arctan`), `sinh cosh tanh (x)` |
-| rounding | `floor(x)` `ceil(x)` `round(x)` `trunc(x)` |
+| trigonometry | `sin cos tan (x)`, `asin acos atan (x)` (also `arcsin`/`arccos`/`arctan`), `sinh cosh tanh (x)`, `asinh acosh atanh (x)` (also `arcsinh`/`arccosh`/`arctanh`) |
+| rounding and parts | `floor(x)` `ceil(x)` `round(x)` `trunc(x)` `frac(x)` `abs(x)` `sign(x)` |
 | special | `gamma(x)` `lngamma(x)` `erf(x)` `erfc(x)` `factorial(x)` |
 | two-argument | `min max gcd lcm atan2 hypot agm (a, b)` |
 | constants | `pi` `e` `tau` `phi` |
 
 Every function maps to the method of the same name at the working precision, so `calc('sin(1)', 40)` equals `BigDecimal(1).sin(40)`. Only functions that take numbers and return one number are exposed; the integer number-theory and the tuple-returning methods stay on the API.
+
+## BigRational
+
+Exact fractions on the same integer core: a `BigInt` numerator over a `BigInt` denominator, always normalized (`den > 0`, `gcd(num, den) = 1`). Nothing ever rounds - `1/3 + 1/3 + 1/3` is exactly `1`.
+
+```pascal
+program rationals;
+
+{$mode unleashed}
+
+uses BigInts;
+
+begin
+  var a: BigRational := '1/3';
+  var b := BigRational.create(1, 6);
+  writeln($'{a + b}');                          // 1/2
+  writeln($'{a} + {a} + {a} = {a + a + a}');    // 1/3 + 1/3 + 1/3 = 1
+  writeln($'{a.reciprocal}');                   // 3
+  var pi := BigRational.parse('3.14159265');
+  writeln($'{pi.limitDenominator(113)}');       // 355/113 - best fraction with denominator <= 113
+  {$ifdef WINDOWS}readln;{$endif}
+end.
+```
+
+| method | notes |
+|---|---|
+| `create(num, den)`, `parse(s)`, `tryParse(s, out v)`, `:=` from `Int64`/string/`BigInt`/`UBigInt` | `parse` accepts `'a/b'`, integers, decimals and exponents (`'1.25'`, `'2e10'`) |
+| `num`, `den` | the two components; `den` is always positive |
+| `+ - * / **`, all comparisons, unary `-` | full operator set; `**` takes an `Int64` exponent |
+| `abs`, `negate`, `reciprocal`, `sign`, `frac` | `frac` is the fractional part, so `self = trunc + frac` |
+| `trunc`, `floor`, `ceil`, `round` | to `BigInt`: toward zero / down / up / nearest |
+| `isZero`, `isOne`, `isInteger`, `isNegative`, `isPositive` | predicates |
+| `toString`, `toDouble`, `toDecimal(precision = 18)` | `'num/den'` (or just `num` when integral); exact widen to `BigDecimal` |
+| `compare`, `equals`, `min`, `max`, `hashCode`, `swap` | |
+| `continuedFraction`, `fromContinuedFraction(cf)`, `limitDenominator(maxDen)` | continued-fraction view and the tightest fraction within a denominator bound (best rational approximation via convergents) |
+| `zero`, `one` | class constants |
 
 ## Semantics worth knowing
 
@@ -362,30 +407,37 @@ Measured against GMP 6.3.0 (64-bit limbs) on one x64 desktop, both sides `-O3`, 
 | operation | BigInts | GMP | ratio |
 |---|---|---|---|
 | add 128b | 0.016 us | 0.005 us | 2.9x |
-| add 1024b | 0.038 us | 0.008 us | 5.1x |
-| add 16384b | 0.149 us | 0.066 us | 2.3x |
-| add 262144b | 1.65 us | 1.28 us | 1.3x |
-| mul 128b | 0.019 us | 0.006 us | 3.2x |
-| mul 1024b | 0.182 us | 0.131 us | 1.4x |
-| mul 8192b | 6.33 us | 4.18 us | 1.5x |
-| mul 65536b | 189 us | 82.9 us | 2.3x |
-| mul 65536x1024b | 7.48 us | 8.95 us | 0.8x |
-| sqr 8192b | 5.40 us | 2.58 us | 2.1x |
-| sqr 65536b | 168 us | 54.7 us | 3.1x |
-| divmod 2048/1024b | 0.498 us | 0.300 us | 1.7x |
-| divmod 8192/4096b | 3.30 us | 2.61 us | 1.3x |
-| divmod 131072/65536b | 707 us | 207 us | 3.4x |
-| toString 4096b | 9.06 us | 4.20 us | 2.2x |
-| toString 65536b | 422 us | 223 us | 1.9x |
-| parse 4096b | 6.05 us | 4.12 us | 1.5x |
-| parse 65536b | 229 us | 131 us | 1.8x |
-| modPow 512b | 80.9 us | 38.2 us | 2.1x |
-| modPow 1024b | 453 us | 262 us | 1.7x |
-| modPow 2048b | 2715 us | 1959 us | 1.4x |
-| gcd 1024b | 11.9 us | 2.58 us | 4.6x |
-| gcd 16384b | 423 us | 113 us | 3.7x |
+| add 1024b | 0.037 us | 0.008 us | 4.9x |
+| add 16384b | 0.153 us | 0.067 us | 2.3x |
+| add 262144b | 1.72 us | 1.26 us | 1.4x |
+| sub 128b | 0.018 us | 0.006 us | 3.0x |
+| sub 1024b | 0.038 us | 0.008 us | 4.5x |
+| sub 16384b | 0.151 us | 0.062 us | 2.4x |
+| sub 262144b | 1.65 us | 1.30 us | 1.3x |
+| mul 128b | 0.020 us | 0.006 us | 3.2x |
+| mul 1024b | 0.187 us | 0.132 us | 1.4x |
+| mul 8192b | 6.28 us | 4.18 us | 1.5x |
+| mul 65536b | 184 us | 84.2 us | 2.2x |
+| mul 65536x1024b | 7.06 us | 8.66 us | 0.8x |
+| div 2048/1024b | 0.370 us | 0.207 us | 1.8x |
+| div 8192/4096b | 3.49 us | 1.69 us | 2.1x |
+| div 131072/65536b | 717 us | 176 us | 4.1x |
+| sqr 8192b | 5.52 us | 2.59 us | 2.1x |
+| sqr 65536b | 169 us | 56.1 us | 3.0x |
+| divmod 2048/1024b | 0.492 us | 0.298 us | 1.7x |
+| divmod 8192/4096b | 3.57 us | 2.74 us | 1.3x |
+| divmod 131072/65536b | 715 us | 207 us | 3.5x |
+| toString 4096b | 9.11 us | 4.26 us | 2.1x |
+| toString 65536b | 423 us | 225 us | 1.9x |
+| parse 4096b | 5.91 us | 3.63 us | 1.6x |
+| parse 65536b | 245 us | 138 us | 1.8x |
+| modPow 512b | 80.8 us | 38.4 us | 2.1x |
+| modPow 1024b | 435 us | 258 us | 1.7x |
+| modPow 2048b | 2784 us | 1969 us | 1.4x |
+| gcd 1024b | 11.0 us | 2.69 us | 4.1x |
+| gcd 16384b | 421 us | 115 us | 3.7x |
 
-Bulk arithmetic lands at 1.3-5.1x of GMP. The remaining gap is GMP's hand-scheduled assembly, its higher Toom orders and FFT on huge operands, and sub-quadratic gcd and division that this unit does not implement. Small values up to 256 bits live inline with no allocation, so a one/two-limb add or multiply runs in ~15-20 ns and stays within ~3x of GMP even at that size, where a fresh-value-per-op library would otherwise be dominated by allocation.
+`div` is quotient-only; `divmod` returns quotient and remainder. Bulk arithmetic lands at 1.3-4.9x of GMP. The remaining gap is GMP's hand-scheduled assembly, its higher Toom orders and FFT on huge operands, and sub-quadratic gcd and division that this unit does not implement. Small values up to 256 bits live inline with no allocation, so a one/two-limb add or multiply runs in ~15-20 ns and stays within ~3x of GMP even at that size, where a fresh-value-per-op library would otherwise be dominated by allocation.
 
 ## Examples
 
