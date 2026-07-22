@@ -1219,6 +1219,28 @@ begin
     check(u = wantU, $'lucasSequence U oracle n={n}');
     check(v = wantV, $'lucasSequence V oracle n={n}');
   end;
+  // nthRootMod: roundtrip x^k -> root -> ^k over primes with rich p-1 torsion
+  var rprimes: array of Int64 := [1000000007, 998244353, 65537, 104729, 786433]; // 786433 = 3*2^18+1, 998244353 = 119*2^23+1
+  for var pi := 0 to High(rprimes) do begin
+    var pp := UBigInt(QWord(rprimes[pi]));
+    for var i := 1 to 25 do begin
+      var k := LongWord(1 + Random(24));
+      var x := UBigInt.random(80) mod pp;
+      var a := x.modPow(UBigInt(QWord(k)), pp);
+      var r := a.nthRootMod(k, pp);
+      check(r.modPow(UBigInt(QWord(k)), pp) = a, $'nthRootMod roundtrip k={k} p={rprimes[pi]}');
+    end;
+  end;
+  check(UBigInt(0).nthRootMod(5, UBigInt(97)).isZero, 'nthRootMod of 0');
+  check(UBigInt(27).nthRootMod(3, UBigInt(2)).isOne, 'nthRootMod p=2');
+  check(UBigInt(10).nthRootMod(1, UBigInt(97)) = 10, 'nthRootMod k=1');
+  // 2 is not a cube mod 7 (cubes mod 7 are 1 and 6)
+  checkRaises(procedure begin UBigInt(2).nthRootMod(3, UBigInt(7)); end, EBigIntError, 'no cube root of 2 mod 7');
+  checkRaises(procedure begin UBigInt(5).nthRootMod(0, UBigInt(7)); end, EBigIntError, 'nthRootMod k=0');
+  // k a multiple of p-1: only 1 has a root
+  check(UBigInt(1).nthRootMod(6, UBigInt(7)).isOne, 'nthRootMod k=p-1 of 1');
+  checkRaises(procedure begin UBigInt(2).nthRootMod(6, UBigInt(7)); end, EBigIntError, 'nthRootMod k=p-1 of 2');
+  check(BigInt(-1).nthRootMod(3, BigInt(7)).modPow(BigInt(3), BigInt(7)) = 6, 'signed nthRootMod');
   var (lsU, lsV) := BigInt.lucasSequence(3, 2, BigInt.zero, BigInt(101));
   check(lsU.isZero and (lsV = 2), 'lucasSequence n=0');
   checkRaises(procedure begin BigInt.lucasSequence(1, -1, BigInt(5), BigInt(10)); end, EBigIntError, 'lucasSequence even modulus');

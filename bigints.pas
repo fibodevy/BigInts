@@ -246,6 +246,9 @@ type
     function jacobi(const n: UBigInt): integer;
     function kronecker(const n: UBigInt): integer;
     function modSqrt(const p: UBigInt): UBigInt;
+    // one k-th root modulo an odd prime (Adleman-Manders-Miller); raises when
+    // none exists
+    function nthRootMod(k: LongWord; const p: UBigInt): UBigInt;
     // square roots modulo a composite: every solution, via factor+lift+CRT
     function sqrtModN(const n: UBigInt): array of UBigInt;
     // baby-step giant-step discrete log: least x with self^x = target (mod m),
@@ -494,6 +497,9 @@ type
     function jacobi(const n: BigInt): integer;
     function kronecker(const n: BigInt): integer;
     function modSqrt(const p: BigInt): BigInt;
+    // one k-th root modulo an odd prime (Adleman-Manders-Miller); raises when
+    // none exists
+    function nthRootMod(k: LongWord; const p: BigInt): BigInt;
     // least k > 0 with self^k = 1 (mod m); self must be coprime to m
     function multiplicativeOrder(const m: BigInt): BigInt;
     function isPrimitiveRoot(const m: BigInt): boolean;
@@ -4814,6 +4820,87 @@ begin
   end;
 end;
 
+// q-th root of c modulo an odd prime p, for prime q dividing p-1 and c a
+// nonzero q-th power: peel the exponent onto c, then fix the q^t-torsion part
+// via Pohlig-Hellman with brute-force digits (O(q) per digit, so cheap for
+// the small prime factors nthRootMod feeds in)
+function UAMMRoot(const c: UBigInt; q: QWord; const p: UBigInt): UBigInt;
+begin
+  var n1 := p - 1;
+  var qq := UBigInt(q);
+  var s := n1;
+  var t := 0;
+  while (s mod qq).isZero do begin
+    s := s div qq;
+    inc(t);
+  end;
+  // x := c^(q^-1 mod s) is the root up to torsion; err lands in the q^t group
+  var x := c.modPow(qq.modInverse(s), p);
+  var err := (x.modPow(qq, p) * c.modInverse(p)) mod p;
+  if err.isOne then exit(x);
+  // any q-nonresidue gives a generator of the torsion subgroup
+  var z := UBigInt.two;
+  var tries := 0;
+  while z.modPow(n1 div qq, p).isOne do begin
+    z := z + 1;
+    inc(tries);
+    if tries = 256 then raise EBigIntError.Create('nthRootMod needs a prime modulus');
+  end;
+  var b := z.modPow(s, p);
+  var omega := b.modPow(qq.pow(LongWord(t - 1)), p);
+  // discrete log of err base b, base-q digit by digit
+  var dl := UBigInt.zero;
+  var qi := UBigInt.one;
+  for var i := 0 to t - 1 do begin
+    var g := ((err * b.modPow(dl, p).modInverse(p)) mod p).modPow(qq.pow(LongWord(t - 1 - i)), p);
+    var cur := UBigInt.one;
+    var digit: QWord := 0;
+    while cur <> g do begin
+      cur := (cur * omega) mod p;
+      inc(digit);
+      if digit = q then raise EBigIntError.Create('nthRootMod needs a prime modulus');
+    end;
+    dl := dl + UBigInt(digit) * qi;
+    qi := qi * qq;
+  end;
+  // err = b^dl with q | dl, so b^(-dl/q) cancels the torsion in x
+  if not (dl mod qq).isZero then raise EBigIntError.Create('nthRootMod needs a prime modulus');
+  result := (x * b.modPow(dl div qq, p).modInverse(p)) mod p;
+end;
+
+function UBigInt.nthRootMod(k: LongWord; const p: UBigInt): UBigInt;
+begin
+  if k = 0 then raise EBigIntError.Create('nthRootMod needs k >= 1');
+  if p.isZero then RaiseDivByZero;
+  if p = 2 then exit(self mod p);
+  if not p.isOdd then raise EBigIntError.Create('nthRootMod needs an odd prime modulus');
+  var a := self mod p;
+  if a.isZero then exit(default(UBigInt));
+  var n1 := p - 1;
+  var r := UBigInt(QWord(k)) mod n1;
+  if r.isZero then begin
+    // x^k = 1 for every unit, so only a = 1 has roots
+    if a.isOne then exit(UBigInt.one);
+    raise EBigIntError.Create('value has no k-th root for this modulus');
+  end;
+  var d := r.gcd(n1);
+  if not a.modPow(n1 div d, p).isOne then raise EBigIntError.Create('value has no k-th root for this modulus');
+  // shift the invertible exponent part onto a: x^d = a^e solves x^r = a, and
+  // d | p-1 keeps every AMM peel below solvable regardless of root choice
+  var c := a.modPow((r div d).modInverse(n1 div d), p);
+  var dd := d.toUInt64;
+  var q: QWord := 2;
+  while dd > 1 do begin
+    if q * q > dd then q := dd;
+    while dd mod q = 0 do begin
+      c := UAMMRoot(c, q, p);
+      dd := dd div q;
+    end;
+    q := q + (if q = 2 then 1 else 2);
+  end;
+  result := c;
+end;
+
 function UBigInt.sqrtRem: (root, rem: UBigInt);
 begin
   var r := sqrt;
@@ -7269,6 +7356,12 @@ function BigInt.modSqrt(const p: BigInt): BigInt;
 begin
   if p.sign <= 0 then raise EBigIntError.Create('modulus must be positive');
   result := floorMod(p).toUBigInt.modSqrt(p.toUBigInt).toBigInt;
+end;
+
+function BigInt.nthRootMod(k: LongWord; const p: BigInt): BigInt;
+begin
+  if p.sign <= 0 then raise EBigIntError.Create('modulus must be positive');
+  result := floorMod(p).toUBigInt.nthRootMod(k, p.toUBigInt).toBigInt;
 end;
 
 function BigInt.multiplicativeOrder(const m: BigInt): BigInt;
