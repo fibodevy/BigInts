@@ -27,6 +27,7 @@ var
   mpz_add: procedure(var r: mpz_t; constref a, b: mpz_t); cdecl;
   mpz_sub: procedure(var r: mpz_t; constref a, b: mpz_t); cdecl;
   mpz_mul: procedure(var r: mpz_t; constref a, b: mpz_t); cdecl;
+  mpz_tdiv_q: procedure(var q: mpz_t; constref n, d: mpz_t); cdecl;
   mpz_tdiv_qr: procedure(var q, r: mpz_t; constref n, d: mpz_t); cdecl;
   mpz_powm: procedure(var r: mpz_t; constref b, e, m: mpz_t); cdecl;
   mpz_gcd: procedure(var r: mpz_t; constref a, b: mpz_t); cdecl;
@@ -60,6 +61,7 @@ begin
   Pointer(mpz_add) := Bind('__gmpz_add');
   Pointer(mpz_sub) := Bind('__gmpz_sub');
   Pointer(mpz_mul) := Bind('__gmpz_mul');
+  Pointer(mpz_tdiv_q) := Bind('__gmpz_tdiv_q');
   Pointer(mpz_tdiv_qr) := Bind('__gmpz_tdiv_qr');
   Pointer(mpz_powm) := Bind('__gmpz_powm');
   Pointer(mpz_gcd) := Bind('__gmpz_gcd');
@@ -190,6 +192,21 @@ begin
   mpz_clear(za); mpz_clear(zb);
 end;
 
+procedure BenchSub(bits: LongWord);
+var
+  za, zb: mpz_t;
+begin
+  var a := RandExact(bits);
+  var b := RandExact(bits);
+  if a < b then begin var t := a; a := b; b := t; end;
+  mpz_init(za); mpz_init(zb);
+  mpzFromU(za, a); mpzFromU(zb, b);
+  Row($'sub {bits}b',
+    procedure(n: Int64) begin for var i: Int64 := 1 to n do sink := sink xor (a - b).bitLength; end,
+    procedure(n: Int64) begin for var i: Int64 := 1 to n do mpz_sub(gr, za, zb); end);
+  mpz_clear(za); mpz_clear(zb);
+end;
+
 procedure BenchMul(abits, bbits: LongWord);
 var
   za, zb: mpz_t;
@@ -215,6 +232,20 @@ begin
     procedure(n: Int64) begin for var i: Int64 := 1 to n do sink := sink xor a.sqr.bitLength; end,
     procedure(n: Int64) begin for var i: Int64 := 1 to n do mpz_mul(gr, za, za); end);
   mpz_clear(za);
+end;
+
+procedure BenchDivQ(nbits, dbits: LongWord);
+var
+  zn, zd: mpz_t;
+begin
+  var nv := RandExact(nbits);
+  var dv := RandExact(dbits);
+  mpz_init(zn); mpz_init(zd);
+  mpzFromU(zn, nv); mpzFromU(zd, dv);
+  Row($'div {nbits}/{dbits}b',
+    procedure(n: Int64) begin for var i: Int64 := 1 to n do sink := sink xor (nv div dv).bitLength; end,
+    procedure(n: Int64) begin for var i: Int64 := 1 to n do mpz_tdiv_q(gq, zn, zd); end);
+  mpz_clear(zn); mpz_clear(zd);
 end;
 
 procedure BenchDiv(nbits, dbits: LongWord);
@@ -314,8 +345,12 @@ begin
   Sep;
   RandSeed := 42;
   for var bits in addSizes do BenchAdd(bits);
+  for var bits in addSizes do BenchSub(bits);
   for var bits in mulSizes do BenchMul(bits, bits);
   BenchMul(65536, 1024);
+  BenchDivQ(2048, 1024);
+  BenchDivQ(8192, 4096);
+  BenchDivQ(131072, 65536);
   for var bits in sqrSizes do BenchSqr(bits);
   BenchDiv(2048, 1024);
   BenchDiv(8192, 4096);
