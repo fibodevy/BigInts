@@ -112,18 +112,46 @@ begin
   until false;
 end;
 
+const
+  W_NAME = 20;
+  W_TIME = 13;
+  W_RATIO = 8;
+
+function PadL(const s: string; w: integer): string;
+begin
+  result := s;
+  while Length(result) < w do result := ' ' + result;
+end;
+
+function PadR(const s: string; w: integer): string;
+begin
+  result := s;
+  while Length(result) < w do result := result + ' ';
+end;
+
+procedure Sep;
+begin
+  writeln('+', StringOfChar('-', W_NAME + 2), '+', StringOfChar('-', W_TIME + 2), '+',
+          StringOfChar('-', W_TIME + 2), '+', StringOfChar('-', W_RATIO + 2), '+');
+end;
+
+procedure Cells(const name, c1, c2, c3: string);
+begin
+  writeln('| ', PadR(name, W_NAME), ' | ', PadL(c1, W_TIME), ' | ', PadL(c2, W_TIME), ' | ', PadL(c3, W_RATIO), ' |');
+end;
+
 // always microseconds so a column never mixes units (ns vs ms reads wrong at
 // a glance); 3 decimals keep sub-microsecond ops legible
 function FmtNs(ns: Double): string;
 begin
-  result := Format('%11.3f us', [ns / 1e3]);
+  result := Format('%.3f us', [ns / 1e3]);
 end;
 
 procedure Row(const name: string; const ourOp, gmpOp: TOp);
 begin
   var ours := BenchNs(ourOp);
   var g := BenchNs(gmpOp);
-  writeln(Format('%-22s %s %s %8.1fx', [name, FmtNs(ours), FmtNs(g), ours / g]));
+  Cells(name, FmtNs(ours), FmtNs(g), Format('%.1fx', [ours / g]));
 end;
 
 // random value with exactly the requested bit length
@@ -280,8 +308,10 @@ begin
   writeln('sanity check ok (1000x900-bit product matches)');
   writeln;
 
-  writeln(Format('%-22s %14s %14s %9s', ['operation', 'BigInts', 'GMP', 'ratio']));
   writeln('(ratio = BigInts / GMP; >1 slower, <1 faster)');
+  Sep;
+  Cells('operation', 'BigInts', 'GMP', 'ratio');
+  Sep;
   RandSeed := 42;
   for var bits in addSizes do BenchAdd(bits);
   for var bits in mulSizes do BenchMul(bits, bits);
@@ -294,6 +324,7 @@ begin
   for var bits in strSizes do BenchParse(bits);
   for var bits in powSizes do BenchModPow(bits);
   for var bits in gcdSizes do BenchGcd(bits);
+  Sep;
 
   writeln;
   writeln($'(sink = {sink})');
