@@ -815,10 +815,21 @@ var
   // generator used by random/randomBelow/randomRange/randomPrime
   BigIntRngAlgo: TBigIntRngAlgo = rngXoshiro256ss;
 
+  // spare limbs allocated past the needed size when addTo/subTo must grow the
+  // destination, so repeated accumulation into one value reallocates rarely
+  BigIntGrowLimbs: integer = 32;
+
 // deterministic seeding of every generator (also sets RandSeed for rngSystem)
 procedure BigIntRandomSeed(seed: QWord);
 // seed all generators from OS entropy
 procedure BigIntRandomize;
+
+// in-place arithmetic: dst := a + b / a - b writing into dst's existing
+// buffer when it is exclusively owned and big enough (mpz_add-style, no
+// allocation per call); dst may alias a or b
+procedure addTo(var dst: UBigInt; const a, b: UBigInt);
+// dst := a - b, raises ERangeError when a < b
+procedure subTo(var dst: UBigInt; const a, b: UBigInt);
 
 implementation
 
@@ -3556,6 +3567,88 @@ class operator UBigInt.-(a: Int64; const b: UBigInt): UBigInt;
 begin
   if a < 0 then RaiseNegativeUnsigned;
   result.fLimbs := LSubChecked(LFromQWord(QWord(a)), b.fLimbs);
+end;
+
+// dst := a + b in place: the row kernels tolerate rp = ap/bp overlap, so the
+// sum lands straight in dst's buffer; a shared or too-small buffer is replaced
+// by a fresh one carrying BigIntGrowLimbs limbs of headroom
+procedure addTo(var dst: UBigInt; const a, b: UBigInt);
+begin
+  var pa := a.dataPtr;
+  var la := a.fLen;
+  var pb := b.dataPtr;
+  var lb := b.fLen;
+  if lb = 0 then begin
+    if @dst <> @a then dst := a;
+    exit;
+  end;
+  if la = 0 then begin
+    if @dst <> @b then dst := b;
+    exit;
+  end;
+  if la < lb then begin var tp := pa; pa := pb; pb := tp; var tl := la; la := lb; lb := tl; end;
+  if la < BIGINT_INLINE_LIMBS then begin
+    // both operands live inline (zero-padded), the stack-buffered helper is alias-safe
+    AddInline(pa, la, pb, lb, @dst.fInline[0], dst.fArr, dst.fLen);
+    exit;
+  end;
+  var need := la + 1;
+  var fresh: TLimbs := nil;
+  var rp: PLimb;
+  if (dst.fArr <> nil) and (Length(dst.fArr) >= need) and ArrUnshared(dst.fArr) then rp := PLimb(Pointer(dst.fArr))
+  else begin
+    fresh := LNew(need + BigIntGrowLimbs);
+    rp := PLimb(Pointer(fresh));
+  end;
+  var carry := MpnAddN(rp, pa, pb, lb);
+  var top := MpnAdd1(@rp[lb], @pa[lb], la - lb, carry);
+  if top <> 0 then begin
+    rp[la] := top;
+    inc(la);
+  end;
+  if fresh <> nil then dst.fArr := fresh;
+  dst.fLen := la;
+end;
+
+// dst := a - b in place; a >= b is required, equality zeroes dst
+procedure subTo(var dst: UBigInt; const a, b: UBigInt);
+begin
+  var pa := a.dataPtr;
+  var la := a.fLen;
+  var pb := b.dataPtr;
+  var lb := b.fLen;
+  var c := LCmpP(pa, la, pb, lb);
+  if c < 0 then RaiseNegativeUnsigned;
+  if c = 0 then begin
+    PutZero(@dst.fInline[0], dst.fArr, dst.fLen);
+    exit;
+  end;
+  if lb = 0 then begin
+    if @dst <> @a then dst := a;
+    exit;
+  end;
+  if la <= BIGINT_INLINE_LIMBS then begin
+    SubInline(pa, la, pb, @dst.fInline[0], dst.fArr, dst.fLen);
+    exit;
+  end;
+  var fresh: TLimbs := nil;
+  var rp: PLimb;
+  if (dst.fArr <> nil) and (Length(dst.fArr) >= la) and ArrUnshared(dst.fArr) then rp := PLimb(Pointer(dst.fArr))
+  else begin
+    fresh := LNew(la + BigIntGrowLimbs);
+    rp := PLimb(Pointer(fresh));
+  end;
+  var borrow := MpnSubN(rp, pa, pb, lb);
+  MpnSub1(@rp[lb], @pa[lb], la - lb, borrow);
+  var rl := la;
+  while rp[rl - 1] = 0 do dec(rl);
+  if rl <= BIGINT_INLINE_LIMBS then begin
+    // spilled storage keeps fLen above the inline capacity, shrink back inline
+    PutInline(rp, rl, @dst.fInline[0], dst.fArr, dst.fLen);
+    exit;
+  end;
+  if fresh <> nil then dst.fArr := fresh;
+  dst.fLen := rl;
 end;
 
 class operator UBigInt.*(const a, b: UBigInt): UBigInt;
