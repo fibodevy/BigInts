@@ -245,8 +245,10 @@ type
     function isKthPower(k: LongWord): boolean;
     function pow(e: LongWord): UBigInt;
     function modPow(const e, m: UBigInt): UBigInt;
-    // constant-time square-and-multiply: the running time does not depend on
-    // the exponent bits (side-channel resistant), for secret exponents
+    // Montgomery ladder: the sequence of big-integer operations does not depend
+    // on the exponent bits, hiding the classic square-and-multiply pattern. the
+    // underlying mul/mod are still variable-time, so this is not a constant-time
+    // bignum, only exponent-schedule hardening for secret exponents
     function modPowSec(const e, m: UBigInt): UBigInt;
     function modInverse(const m: UBigInt): UBigInt;
     function gcd(const other: UBigInt): UBigInt;
