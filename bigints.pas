@@ -309,6 +309,13 @@ type
     class function randomBelow(const bound: UBigInt): UBigInt; static;
     class function randomRange(const lo, hi: UBigInt): UBigInt; static;
     class function randomPrime(bits: LongWord; rounds: integer = 24): UBigInt; static;
+    // CSPRNG variants: bytes come straight from the OS entropy source with no
+    // seedable generator in between (key material); raise EBigIntError when
+    // the OS source is unavailable
+    class function randomSecure(bits: LongWord): UBigInt; static;
+    class function randomSecureBelow(const bound: UBigInt): UBigInt; static;
+    class function randomSecureRange(const lo, hi: UBigInt): UBigInt; static;
+    class function randomSecurePrime(bits: LongWord; rounds: integer = 24): UBigInt; static;
     // safe prime: p and (p-1)/2 both prime; strong prime: p-1 and p+1 each have
     // a large prime factor (RSA/DH key generation)
     class function randomSafePrime(bits: LongWord): UBigInt; static;
@@ -569,6 +576,11 @@ type
     class function randomBelow(const bound: BigInt): BigInt; static;
     class function randomRange(const lo, hi: BigInt): BigInt; static;
     class function randomPrime(bits: LongWord; rounds: integer = 24): BigInt; static;
+    // CSPRNG variants, see UBigInt
+    class function randomSecure(bits: LongWord): BigInt; static;
+    class function randomSecureBelow(const bound: BigInt): BigInt; static;
+    class function randomSecureRange(const lo, hi: BigInt): BigInt; static;
+    class function randomSecurePrime(bits: LongWord; rounds: integer = 24): BigInt; static;
     // Chinese remainder theorem for pairwise coprime positive moduli
     class function crt(const remainders, moduli: array of BigInt): BigInt; static;
     // Lucas sequences U_n(P,Q), V_n(P,Q) modulo an odd m, by index doubling
@@ -5766,18 +5778,24 @@ end;
 function SystemFunction036(buffer: Pointer; len: LongWord): ByteBool; stdcall; external 'advapi32' name 'SystemFunction036';
 {$endif}
 
-procedure OsEntropy(buf: PByte; len: SizeInt);
+function TryOsEntropy(buf: PByte; len: SizeInt): boolean;
 begin
   {$ifdef windows}
-  if SystemFunction036(buf, LongWord(len)) then exit;
+  result := SystemFunction036(buf, LongWord(len));
   {$else}
+  result := false;
   var h := FileOpen('/dev/urandom', fmOpenRead);
   if h <> THandle(-1) then begin
     var got := FileRead(h, buf^, len);
     FileClose(h);
-    if got = len then exit;
+    result := got = len;
   end;
   {$endif}
+end;
+
+procedure OsEntropy(buf: PByte; len: SizeInt);
+begin
+  if TryOsEntropy(buf, len) then exit;
   // last-resort fallback: time-mixed splitmix stream
   var s := QWord(GetTickCount64) xor (QWord(PtrUInt(buf)) shl 24);
   for var i := 0 to len - 1 do buf[i] := byte(SplitMix64(s) shr 13);
@@ -5884,6 +5902,46 @@ begin
   repeat
     // exact bit count: top bit set, odd
     result := random(bits);
+    result.setBit(bits - 1);
+    result.setBit(0);
+  until result.isProbablePrime(rounds);
+end;
+
+class function UBigInt.randomSecure(bits: LongWord): UBigInt;
+var
+  res: TLimbs;
+begin
+  if bits = 0 then exit(default(UBigInt));
+  var n := SizeInt((QWord(bits) + LIMB_MASK) shr LIMB_SHIFT);
+  SetLength(res, n);
+  if not TryOsEntropy(PByte(@res[0]), n * SizeOf(TLimb)) then raise EBigIntError.Create('no OS entropy source available');
+  var top := bits and LIMB_MASK;
+  if top <> 0 then res[n - 1] := res[n - 1] and (High(TLimb) shr (LIMB_BITS - top));
+  LNorm(res);
+  result.fLimbs := res;
+end;
+
+class function UBigInt.randomSecureBelow(const bound: UBigInt): UBigInt;
+begin
+  if bound.isZero then raise EBigIntError.Create('randomSecureBelow needs a positive bound');
+  var bits := bound.bitLength;
+  repeat
+    result := randomSecure(bits);
+  until result < bound;
+end;
+
+class function UBigInt.randomSecureRange(const lo, hi: UBigInt): UBigInt;
+begin
+  if lo > hi then raise EBigIntError.Create('randomSecureRange needs lo <= hi');
+  result := lo + randomSecureBelow(hi - lo + 1);
+end;
+
+class function UBigInt.randomSecurePrime(bits: LongWord; rounds: integer): UBigInt;
+begin
+  if bits < 2 then raise EBigIntError.Create('randomSecurePrime needs at least 2 bits');
+  if bits = 2 then exit(UBigInt(2) + randomSecureBelow(UBigInt(2)));
+  repeat
+    result := randomSecure(bits);
     result.setBit(bits - 1);
     result.setBit(0);
   until result.isProbablePrime(rounds);
@@ -7812,6 +7870,28 @@ end;
 class function BigInt.randomPrime(bits: LongWord; rounds: integer): BigInt;
 begin
   result := UBigInt.randomPrime(bits, rounds).toBigInt;
+end;
+
+class function BigInt.randomSecure(bits: LongWord): BigInt;
+begin
+  result := UBigInt.randomSecure(bits).toBigInt;
+end;
+
+class function BigInt.randomSecureBelow(const bound: BigInt): BigInt;
+begin
+  if bound.sign <= 0 then raise EBigIntError.Create('randomSecureBelow needs a positive bound');
+  result := UBigInt.randomSecureBelow(bound.toUBigInt).toBigInt;
+end;
+
+class function BigInt.randomSecureRange(const lo, hi: BigInt): BigInt;
+begin
+  if lo > hi then raise EBigIntError.Create('randomSecureRange needs lo <= hi');
+  result := lo + UBigInt.randomSecureBelow((hi - lo + 1).toUBigInt).toBigInt;
+end;
+
+class function BigInt.randomSecurePrime(bits: LongWord; rounds: integer): BigInt;
+begin
+  result := UBigInt.randomSecurePrime(bits, rounds).toBigInt;
 end;
 
 class function BigInt.crt(const remainders, moduli: array of BigInt): BigInt;

@@ -1121,6 +1121,28 @@ begin
   check(UBigInt.random(256) <> UBigInt.random(256), 'rngOS varies');
   BigIntRngAlgo := rngXoshiro256ss;
   checkRaises(procedure begin UBigInt.randomBelow(UBigInt.zero); end, EBigIntError, 'randomBelow zero bound');
+  // CSPRNG draws: independent of the seeded generators, bounds hold
+  check(UBigInt.randomSecure(256) <> UBigInt.randomSecure(256), 'randomSecure varies');
+  check(UBigInt.randomSecure(0).isZero, 'randomSecure 0 bits');
+  for var i := 1 to 100 do begin
+    check(UBigInt.randomSecure(80).bitLength <= 80, 'randomSecure bit bound');
+    var n := UBigInt.random(60) + 1;
+    check(UBigInt.randomSecureBelow(n) < n, 'randomSecureBelow bound');
+  end;
+  for var i := 1 to 50 do begin
+    var lo := BigInt.random(60) - BigInt.pow2(59);
+    var hi := lo + BigInt.random(50);
+    var r := BigInt.randomSecureRange(lo, hi);
+    check((r >= lo) and (r <= hi), 'randomSecureRange bounds');
+  end;
+  var sp := UBigInt.randomSecurePrime(96);
+  check((sp.bitLength = 96) and sp.isProbablePrime, 'randomSecurePrime');
+  BigIntRandomSeed(4242);
+  var seeded := UBigInt.random(128);
+  BigIntRandomSeed(4242);
+  var dummy := UBigInt.randomSecure(128);
+  check(UBigInt.random(128) = seeded, 'randomSecure leaves the seeded stream alone');
+  checkRaises(procedure begin UBigInt.randomSecureBelow(UBigInt.zero); end, EBigIntError, 'randomSecureBelow zero bound');
 end;
 
 procedure testExtrasNumberTheory;
