@@ -2280,6 +2280,37 @@ begin
   check(ssec.isZero and not ssec.isNegative, 'signed secureClear');
   sec := 42; // a cleared value stays usable
   check(sec = 42, 'secureClear value reusable');
+  // Montgomery ring context vs plain modular arithmetic
+  for var i := 1 to 40 do begin
+    var m := randU(30 + Random(500)) or UBigInt.one;
+    if m.isOne then continue;
+    var ring := TModRing.create(m);
+    check(ring.modulus = m, 'ring modulus');
+    var a := UBigInt.randomBelow(m);
+    var b := UBigInt.randomBelow(m);
+    check(ring.fromMont(ring.toMont(a)) = a, 'ring toMont/fromMont roundtrip');
+    check(ring.fromMont(ring.mul(ring.toMont(a), ring.toMont(b))) = (a * b) mod m, 'ring mul');
+    check(ring.fromMont(ring.sqr(ring.toMont(a))) = a.sqr mod m, 'ring sqr');
+    check(ring.add(a, b) = (a + b) mod m, 'ring add');
+    check(ring.sub(a, b) = (a.toBigInt - b.toBigInt).floorMod(m.toBigInt).toUBigInt, 'ring sub');
+    var e := randU(60);
+    check(ring.pow(a, e) = a.modPow(e, m), 'ring pow matches modPow');
+    if a.gcd(m).isOne and not a.isZero then check((a * ring.inv(a)) mod m = 1, 'ring inv');
+    check(ring.reduce(a + m * 3) = a, 'ring reduce');
+  end;
+  // a long multiply chain stays consistent
+  var cm := UBigInt.randomPrime(256);
+  var cring := TModRing.create(cm);
+  var cx := UBigInt.randomBelow(cm);
+  var mx := cring.toMont(cx);
+  var want1 := UBigInt.one;
+  for var i := 1 to 50 do begin
+    mx := cring.mul(mx, cring.toMont(cx));
+    want1 := cx.modPow(UBigInt(QWord(i + 1)), cm);
+  end;
+  check(cring.fromMont(mx) = want1, 'ring 50-step chain = x^51');
+  checkRaises(procedure begin TModRing.create(UBigInt(10)); end, EBigIntError, 'ring even modulus');
+  checkRaises(procedure begin TModRing.create(UBigInt.one); end, EBigIntError, 'ring modulus 1');
   // sqrtModN: every returned root squares back, and a residue is found
   for var i := 1 to 100 do begin
     var n := randU(40) or UBigInt.one;

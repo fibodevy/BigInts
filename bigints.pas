@@ -844,6 +844,41 @@ type
     class function agm(const a, b: BigDecimal; precision: integer = 18): BigDecimal; static;
   end;
 
+  { TModRing - Montgomery multiplication context over a fixed odd modulus }
+
+  // precomputes the Montgomery constants once, then repeated modular products
+  // cost a single REDC pass each instead of a full division (RSA/ECC-style
+  // workloads: many multiplications against one modulus). values in the
+  // Montgomery domain are ordinary UBigInts below m carrying a*R mod m; the
+  // context keeps a scratch buffer, so share one ring per thread, not across
+  TModRing = record
+  private
+    fM: TBigIntLimbs;
+    fMU: UBigInt;
+    fN: SizeInt;
+    fMInv: TBigIntLimb;
+    fRR: TBigIntLimbs;
+    fOne: TBigIntLimbs;
+    fT: TBigIntLimbs;
+    function mulLimbs(const a, b: TBigIntLimbs): UBigInt;
+  public
+    class function create(const m: UBigInt): TModRing; static;
+    function modulus: UBigInt;
+    // Montgomery domain conversions
+    function toMont(const a: UBigInt): UBigInt;
+    function fromMont(const a: UBigInt): UBigInt;
+    // product/square of Montgomery-domain values
+    function mul(const a, b: UBigInt): UBigInt;
+    function sqr(const a: UBigInt): UBigInt;
+    // plain-domain helpers on the fixed modulus; add/sub expect reduced
+    // operands (below m) and work in either domain
+    function add(const a, b: UBigInt): UBigInt;
+    function sub(const a, b: UBigInt): UBigInt;
+    function pow(const a, e: UBigInt): UBigInt;
+    function inv(const a: UBigInt): UBigInt;
+    function reduce(const a: UBigInt): UBigInt;
+  end;
+
   // bridges declared after BigDecimal so the integer types can return the
   // wider types (BigInt for UBigInt, BigDecimal for both)
   TUBigIntBridge = record helper for UBigInt
@@ -4640,6 +4675,107 @@ begin
   MontMul(@acc[0], @acc[0], @oneVec[0], mLimbs, mInv, n, t);
   LNorm(acc);
   result.fLimbs := acc;
+end;
+
+// -- TModRing ----------------------
+
+class function TModRing.create(const m: UBigInt): TModRing;
+var
+  q, r: TLimbs;
+begin
+  if m.isZero then RaiseDivByZero;
+  if (not m.isOdd) or m.isOne then raise EBigIntError.Create('TModRing needs an odd modulus above 1');
+  result := default(TModRing);
+  result.fMU := m;
+  result.fM := Copy(m.fLimbs);
+  result.fN := Length(result.fM);
+  result.fMInv := MontInv(result.fM[0]);
+  // R mod m and R^2 mod m, R = B^n
+  LDivMod(LShl(LFromQWord(1), LongWord(result.fN) * LIMB_BITS), result.fM, q, r);
+  result.fOne := r;
+  SetLength(result.fOne, result.fN);
+  LDivMod(LShl(LFromQWord(1), LongWord(result.fN) * 2 * LIMB_BITS), result.fM, q, r);
+  result.fRR := r;
+  SetLength(result.fRR, result.fN);
+  SetLength(result.fT, 2 * result.fN + 1);
+end;
+
+// one MontMul over zero-padded n-limb copies of a and b
+function TModRing.mulLimbs(const a, b: TBigIntLimbs): UBigInt;
+var
+  av, bv, r: TLimbs;
+begin
+  av := Copy(a);
+  SetLength(av, fN);
+  bv := Copy(b);
+  SetLength(bv, fN);
+  SetLength(r, fN);
+  MontMul(@r[0], @av[0], @bv[0], fM, fMInv, fN, fT);
+  LNorm(r);
+  result.fLimbs := r;
+end;
+
+function TModRing.modulus: UBigInt;
+begin
+  result := fMU;
+end;
+
+function TModRing.reduce(const a: UBigInt): UBigInt;
+begin
+  result := if a < fMU then a else a mod fMU;
+end;
+
+function TModRing.toMont(const a: UBigInt): UBigInt;
+begin
+  result := mulLimbs(reduce(a).fLimbs, fRR);
+end;
+
+function TModRing.fromMont(const a: UBigInt): UBigInt;
+begin
+  result := mulLimbs(reduce(a).fLimbs, LFromQWord(1));
+end;
+
+function TModRing.mul(const a, b: UBigInt): UBigInt;
+begin
+  result := mulLimbs(reduce(a).fLimbs, reduce(b).fLimbs);
+end;
+
+function TModRing.sqr(const a: UBigInt): UBigInt;
+begin
+  var r := reduce(a);
+  result := mulLimbs(r.fLimbs, r.fLimbs);
+end;
+
+function TModRing.add(const a, b: UBigInt): UBigInt;
+begin
+  result := a + b;
+  if result >= fMU then result := result - fMU;
+end;
+
+function TModRing.sub(const a, b: UBigInt): UBigInt;
+begin
+  result := if a >= b then a - b else a + (fMU - b);
+end;
+
+function TModRing.pow(const a, e: UBigInt): UBigInt;
+var
+  o: TLimbs;
+begin
+  var x := toMont(a);
+  o := Copy(fOne);
+  LNorm(o);
+  var acc: UBigInt;
+  acc.fLimbs := o;
+  for var i := Int64(e.bitLength) - 1 downto 0 do begin
+    acc := mulLimbs(acc.fLimbs, acc.fLimbs);
+    if e.testBit(LongWord(i)) then acc := mulLimbs(acc.fLimbs, x.fLimbs);
+  end;
+  result := fromMont(acc);
+end;
+
+function TModRing.inv(const a: UBigInt): UBigInt;
+begin
+  result := a.modInverse(fMU);
 end;
 
 function UBigInt.modPow(const e, m: UBigInt): UBigInt;
