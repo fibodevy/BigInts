@@ -282,6 +282,10 @@ type
     // bytes, little/big endian magnitude; zero gives an empty array
     function toBytesLE: TBytes;
     function toBytesBE: TBytes;
+    // fixed width: zero-padded to len bytes (ERangeError when the value does
+    // not fit), for protocols with fixed-size fields
+    function toBytesLE(len: SizeInt): TBytes;
+    function toBytesBE(len: SizeInt): TBytes;
     class function fromBytesLE(const bytes: TBytes): UBigInt; static;
     class function fromBytesBE(const bytes: TBytes): UBigInt; static;
     // misc
@@ -530,6 +534,10 @@ type
     // bytes: minimal two's complement with sign bit, like Java toByteArray
     function toBytesLE: TBytes;
     function toBytesBE: TBytes;
+    // fixed width: sign-extended two's complement over len bytes (ERangeError
+    // when the value does not fit)
+    function toBytesLE(len: SizeInt): TBytes;
+    function toBytesBE(len: SizeInt): TBytes;
     class function fromBytesLE(const bytes: TBytes): BigInt; static;
     class function fromBytesBE(const bytes: TBytes): BigInt; static;
     // misc
@@ -5530,6 +5538,19 @@ begin
   result := res;
 end;
 
+function UBigInt.toBytesLE(len: SizeInt): TBytes;
+begin
+  if SizeInt((QWord(bitLength) + 7) shr 3) > len then raise ERangeError.Create($'UBigInt value does not fit in {len} bytes');
+  result := toBytesLE();
+  SetLength(result, len); // the grown tail is zero-filled
+end;
+
+function UBigInt.toBytesBE(len: SizeInt): TBytes;
+begin
+  result := toBytesLE(len);
+  for var i := 0 to (len shr 1) - 1 do SwapValues(result[i], result[len - 1 - i]);
+end;
+
 class function UBigInt.fromBytesLE(const bytes: TBytes): UBigInt;
 var
   res: TLimbs;
@@ -7525,6 +7546,24 @@ function BigInt.toBytesBE: TBytes;
 begin
   result := toBytesLE;
   for var i := 0 to (Length(result) shr 1) - 1 do SwapValues(result[i], result[High(result) - i]);
+end;
+
+function BigInt.toBytesLE(len: SizeInt): TBytes;
+begin
+  // bitLength is already minimal-two's-complement aware, so the sign bit fits
+  // exactly when it is below 8*len
+  if Int64(bitLength) > Int64(len) * 8 - 1 then raise ERangeError.Create($'BigInt value does not fit in {len} bytes');
+  result := toBytesLE();
+  var n := Length(result);
+  SetLength(result, len);
+  if fNeg then
+    for var i := n to len - 1 do result[i] := $FF;
+end;
+
+function BigInt.toBytesBE(len: SizeInt): TBytes;
+begin
+  result := toBytesLE(len);
+  for var i := 0 to (len shr 1) - 1 do SwapValues(result[i], result[len - 1 - i]);
 end;
 
 class function BigInt.fromBytesLE(const bytes: TBytes): BigInt;

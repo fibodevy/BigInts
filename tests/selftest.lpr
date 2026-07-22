@@ -894,6 +894,36 @@ begin
     check(UBigInt.fromBytesBE(x.toBytesBE) = x, 'U bytes BE roundtrip');
   end;
 
+  // fixed-width unsigned bytes
+  var f := UBigInt(258).toBytesLE(4);
+  check((Length(f) = 4) and (f[0] = 2) and (f[1] = 1) and (f[2] = 0) and (f[3] = 0), '258 fixed LE 4');
+  f := UBigInt(258).toBytesBE(4);
+  check((Length(f) = 4) and (f[0] = 0) and (f[1] = 0) and (f[2] = 1) and (f[3] = 2), '258 fixed BE 4');
+  check(Length(UBigInt(0).toBytesBE(32)) = 32, 'zero fixed BE 32');
+  check(UBigInt(0).toBytesBE(32)[31] = 0, 'zero fixed all zero');
+  for var i := 1 to 50 do begin
+    var x := randU(10 + Random(240));
+    check(UBigInt.fromBytesLE(x.toBytesLE(32)) = x, 'U fixed LE roundtrip');
+    check(UBigInt.fromBytesBE(x.toBytesBE(32)) = x, 'U fixed BE roundtrip');
+  end;
+  check(UBigInt(255).toBytesLE(1)[0] = 255, 'fixed exact fit');
+  checkRaises(procedure begin UBigInt(256).toBytesLE(1); end, ERangeError, 'fixed too small');
+
+  // fixed-width two's complement bytes
+  var fs := BigInt(-1).toBytesBE(4);
+  check((fs[0] = $FF) and (fs[1] = $FF) and (fs[2] = $FF) and (fs[3] = $FF), '-1 fixed BE 4');
+  fs := BigInt(-128).toBytesLE(2);
+  check((fs[0] = $80) and (fs[1] = $FF), '-128 fixed LE 2');
+  check(BigInt(-128).toBytesLE(1)[0] = $80, '-128 fixed exact fit');
+  check(BigInt(127).toBytesLE(1)[0] = 127, '127 fixed exact fit');
+  checkRaises(procedure begin BigInt(128).toBytesLE(1); end, ERangeError, '128 does not fit signed byte');
+  checkRaises(procedure begin BigInt(-129).toBytesLE(1); end, ERangeError, '-129 does not fit signed byte');
+  for var i := 1 to 50 do begin
+    var x := randB(10 + Random(240));
+    check(BigInt.fromBytesLE(x.toBytesLE(33)) = x, 'B fixed LE roundtrip');
+    check(BigInt.fromBytesBE(x.toBytesBE(33)) = x, 'B fixed BE roundtrip');
+  end;
+
   // two's complement bytes, Java toByteArray convention
   var tc := BigInt(0).toBytesLE;
   check((Length(tc) = 1) and (tc[0] = 0), 'tc bytes of 0');
