@@ -5390,17 +5390,38 @@ begin
   result := (self div gcd(other)) * other;
 end;
 
+// smallest odd trial prime (3..47) dividing (p, len), 0 when none: one
+// single-limb remainder pass per packed product instead of a full mod per prime
+function SmallOddFactor(p: PLimb; len: SizeInt): integer;
+const
+  {$if LIMB_BITS = 64}
+  PRODS: array[0..0] of TLimb = (TLimb(307444891294245705)); // 3*5*...*47
+  {$else}
+  PRODS: array[0..1] of TLimb = (3234846615, 95041567); // 3*5*...*29, 31*37*41*43*47
+  {$endif}
+  ODD_TRIAL: array[0..13] of byte = (3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47);
+begin
+  result := 0;
+  var idx := 0;
+  for var b := 0 to High(PRODS) do begin
+    var r := LModWP(p, len, PRODS[b]);
+    while (idx <= High(ODD_TRIAL)) and (PRODS[b] mod ODD_TRIAL[idx] = 0) do begin
+      if r mod ODD_TRIAL[idx] = 0 then exit(ODD_TRIAL[idx]);
+      inc(idx);
+    end;
+  end;
+end;
+
 function UBigInt.isProbablePrime(rounds: integer): boolean;
 const
-  // enough trial primes that every composite below 47*47 gets caught,
-  // and the first 12 double as deterministic Miller-Rabin witnesses to 3.3e24
+  // trial primes catch every composite below 47*47, and the first 12 double
+  // as deterministic Miller-Rabin witnesses to 3.3e24
   smallPrimes: array[0..14] of byte = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47);
 begin
   if self < 2 then exit(false);
-  for var i := 0 to High(smallPrimes) do begin
-    if self = smallPrimes[i] then exit(true);
-    if (self mod smallPrimes[i]).isZero then exit(false);
-  end;
+  if isEven then exit(self = 2);
+  var f := SmallOddFactor(dataPtr, fLen);
+  if f <> 0 then exit(self = f);
   if self < 47 * 47 then exit(true);
   // n-1 = d * 2^s with d odd
   var nm1 := self - 1;
@@ -5992,6 +6013,8 @@ begin
   if isEven then exit(self = 2);
   // deterministic Miller-Rabin already settles everything below 3.3e24
   if bitLength <= 81 then exit(isProbablePrime);
+  // cheap trial reject before the modPow-priced tests (self > 47 here)
+  if SmallOddFactor(dataPtr, fLen) <> 0 then exit(false);
   // Baillie-PSW above: strong base-2 Miller-Rabin plus a strong Lucas test
   if not MillerRabin2(self) then exit(false);
   if isPerfectSquare then exit(false);
