@@ -1196,42 +1196,93 @@ end;
 // offsets, so kernel timing does not drift with the binary's code layout
 {$codealign proc=64}
 
-// rp := ap + bp over n limbs, returns carry
+// rp := ap + bp over n limbs, returns carry; 4x unrolled adc chain (dec
+// leaves CF alone), tail peeled after the quads with the carry live
 function MpnAddN(rp, ap, bp: PLimb; n: SizeInt): TLimb; assembler; nostackframe;
 asm
-  xor eax, eax       // rax = 0, CF = 0
+  mov r10, r9
+  shr r9, 2
+  and r10d, 3
+  xor eax, eax       // rax = 0, CF = 0 (after the shr)
   test r9, r9
-  jz @done
-@loop:
-  mov r10, [rdx]
-  adc r10, [r8]
-  mov [rcx], r10
+  jz @tail
+  align 32
+@q:
+  mov r11, [rdx]
+  adc r11, [r8]
+  mov [rcx], r11
+  mov r11, [rdx + 8]
+  adc r11, [r8 + 8]
+  mov [rcx + 8], r11
+  mov r11, [rdx + 16]
+  adc r11, [r8 + 16]
+  mov [rcx + 16], r11
+  mov r11, [rdx + 24]
+  adc r11, [r8 + 24]
+  mov [rcx + 24], r11
+  lea rdx, [rdx + 32]
+  lea r8, [r8 + 32]
+  lea rcx, [rcx + 32]
+  dec r9
+  jnz @q
+@tail:
+  dec r10
+  js @fin
+@t:
+  mov r11, [rdx]
+  adc r11, [r8]
+  mov [rcx], r11
   lea rdx, [rdx + 8]
   lea r8, [r8 + 8]
   lea rcx, [rcx + 8]
-  dec r9
-  jnz @loop
+  dec r10
+  jns @t
+@fin:
   setc al
-@done:
 end;
 
-// rp := ap - bp over n limbs, returns borrow
+// rp := ap - bp over n limbs, returns borrow; same shape as MpnAddN
 function MpnSubN(rp, ap, bp: PLimb; n: SizeInt): TLimb; assembler; nostackframe;
 asm
+  mov r10, r9
+  shr r9, 2
+  and r10d, 3
   xor eax, eax
   test r9, r9
-  jz @done
-@loop:
-  mov r10, [rdx]
-  sbb r10, [r8]
-  mov [rcx], r10
+  jz @tail
+  align 32
+@q:
+  mov r11, [rdx]
+  sbb r11, [r8]
+  mov [rcx], r11
+  mov r11, [rdx + 8]
+  sbb r11, [r8 + 8]
+  mov [rcx + 8], r11
+  mov r11, [rdx + 16]
+  sbb r11, [r8 + 16]
+  mov [rcx + 16], r11
+  mov r11, [rdx + 24]
+  sbb r11, [r8 + 24]
+  mov [rcx + 24], r11
+  lea rdx, [rdx + 32]
+  lea r8, [r8 + 32]
+  lea rcx, [rcx + 32]
+  dec r9
+  jnz @q
+@tail:
+  dec r10
+  js @fin
+@t:
+  mov r11, [rdx]
+  sbb r11, [r8]
+  mov [rcx], r11
   lea rdx, [rdx + 8]
   lea r8, [r8 + 8]
   lea rcx, [rcx + 8]
-  dec r9
-  jnz @loop
+  dec r10
+  jns @t
+@fin:
   setc al
-@done:
 end;
 
 // rp := ap + b with carry propagation, returns the final carry
@@ -1295,96 +1346,6 @@ asm
 @done:
 end;
 
-// rp := ap * b, returns the high limb
-function MpnMul1(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb; assembler; nostackframe;
-asm
-  mov r10, rdx       // ap (mul clobbers rdx)
-  xor r11d, r11d     // carry
-  test r8, r8
-  jz @done
-@loop:
-  mov rax, [r10]
-  mul r9             // rdx:rax = ap[i] * b
-  add rax, r11
-  adc rdx, 0
-  mov [rcx], rax
-  mov r11, rdx
-  lea r10, [r10 + 8]
-  lea rcx, [rcx + 8]
-  dec r8
-  jnz @loop
-@done:
-  mov rax, r11
-end;
-
-// rp += ap * b, returns the carry limb (plain mul/adc variant)
-function MpnAddMul1Gen(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb; assembler; nostackframe;
-asm
-  mov r10, rdx
-  xor r11d, r11d
-  test r8, r8
-  jz @done
-@loop:
-  mov rax, [r10]
-  mul r9
-  add rax, r11
-  adc rdx, 0
-  add [rcx], rax     // rp[i] += low, CF = carry
-  adc rdx, 0
-  mov r11, rdx
-  lea r10, [r10 + 8]
-  lea rcx, [rcx + 8]
-  dec r8
-  jnz @loop
-@done:
-  mov rax, r11
-end;
-
-// rp += ap * b via mulx with independent adcx/adox carry chains, two limbs
-// per pass; counter control uses lea + jrcxz to leave both chains untouched
-function MpnAddMul1Adx(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb; assembler; nostackframe;
-asm
-  mov r10, rdx             // ap
-  mov rdx, r9              // b, implicit mulx operand
-  mov r9, rcx
-  mov rcx, r8              // n
-  mov r8, r9               // rp
-  xor r11d, r11d           // hi_prev = 0
-  shr rcx, 1               // pair count, CF = odd limb flag
-  jnc @even
-  // peel the odd limb with plain add/adc, the chains are not live yet
-  mulx r11, rax, [r10]
-  add rax, [r8]
-  adc r11, 0
-  mov [r8], rax
-  lea r10, [r10 + 8]
-  lea r8, [r8 + 8]
-@even:
-  test al, al              // CF = 0, OF = 0: both chains start clean
-  jrcxz @fold
-  align 32                 // pin the loop to a fixed cache-line offset
-@loop:
-  mulx r9, rax, [r10]
-  adcx rax, r11            // CF chain: previous high limb
-  adox rax, [r8]           // OF chain: rp accumulation
-  mov [r8], rax
-  mulx r11, rax, [r10 + 8]
-  adcx rax, r9
-  adox rax, [r8 + 8]
-  mov [r8 + 8], rax
-  lea r10, [r10 + 16]
-  lea r8, [r8 + 16]
-  lea rcx, [rcx - 1]
-  jrcxz @fold
-  jmp @loop
-@fold:
-  // carry limb = hi_prev + CF + OF, mathematically below the limb base
-  mov rax, r11
-  mov r9d, 0
-  adcx rax, r9
-  adox rax, r9
-end;
-
 // cpuid leaf 7: ebx bit 8 = BMI2 (mulx), bit 19 = ADX (adcx/adox)
 function CpuHasAdx: boolean; assembler; nostackframe;
 asm
@@ -1411,6 +1372,172 @@ end;
 
 var
   UseAdx: boolean = false; // set from cpuid in the unit initialization
+
+// rp := ap * b, returns the high limb (plain mul variant)
+function MpnMul1Gen(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb; assembler; nostackframe;
+asm
+  mov r10, rdx       // ap (mul clobbers rdx)
+  xor r11d, r11d     // carry
+  test r8, r8
+  jz @done
+@loop:
+  mov rax, [r10]
+  mul r9             // rdx:rax = ap[i] * b
+  add rax, r11
+  adc rdx, 0
+  mov [rcx], rax
+  mov r11, rdx
+  lea r10, [r10 + 8]
+  lea rcx, [rcx + 8]
+  dec r8
+  jnz @loop
+@done:
+  mov rax, r11
+end;
+
+// rp := ap * b via mulx with an adcx carry chain, four limbs per pass; the
+// low limbs are peeled first so the carry limb seeds the chain
+function MpnMul1Adx(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb; assembler; nostackframe;
+asm
+  push rbx
+  mov r10, rdx             // ap
+  mov rdx, r9              // b, implicit mulx operand
+  mov r9, rcx              // rp
+  xor r11d, r11d           // carry limb
+  mov rcx, r8
+  and ecx, 3               // peel count
+  shr r8, 2                // quad count
+  jrcxz @main
+@peel:
+  mulx rbx, rax, [r10]
+  add rax, r11
+  adc rbx, 0
+  mov [r9], rax
+  mov r11, rbx
+  lea r10, [r10 + 8]
+  lea r9, [r9 + 8]
+  dec ecx
+  jnz @peel
+@main:
+  mov rcx, r8
+  test rcx, rcx            // ZF for the branch, CF = 0 for the chain
+  jz @fold
+  align 32
+@loop:
+  mulx r8, rax, [r10]
+  adcx rax, r11
+  mov [r9], rax
+  mulx r11, rax, [r10 + 8]
+  adcx rax, r8
+  mov [r9 + 8], rax
+  mulx r8, rax, [r10 + 16]
+  adcx rax, r11
+  mov [r9 + 16], rax
+  mulx r11, rax, [r10 + 24]
+  adcx rax, r8
+  mov [r9 + 24], rax
+  lea r10, [r10 + 32]
+  lea r9, [r9 + 32]
+  lea rcx, [rcx - 1]
+  jrcxz @fold
+  jmp @loop
+@fold:
+  mov rax, r11
+  mov ebx, 0
+  adcx rax, rbx
+  pop rbx
+end;
+
+// rp := ap * b, returns the high limb
+function MpnMul1(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb; inline;
+begin
+  result := if UseAdx then MpnMul1Adx(rp, ap, n, b) else MpnMul1Gen(rp, ap, n, b);
+end;
+
+// rp += ap * b, returns the carry limb (plain mul/adc variant)
+function MpnAddMul1Gen(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb; assembler; nostackframe;
+asm
+  mov r10, rdx
+  xor r11d, r11d
+  test r8, r8
+  jz @done
+@loop:
+  mov rax, [r10]
+  mul r9
+  add rax, r11
+  adc rdx, 0
+  add [rcx], rax     // rp[i] += low, CF = carry
+  adc rdx, 0
+  mov r11, rdx
+  lea r10, [r10 + 8]
+  lea rcx, [rcx + 8]
+  dec r8
+  jnz @loop
+@done:
+  mov rax, r11
+end;
+
+// rp += ap * b via mulx with independent adcx/adox carry chains, four limbs
+// per pass; counter control uses lea + jrcxz to leave both chains untouched,
+// the low limbs are peeled first so the carry limb seeds the chains
+function MpnAddMul1Adx(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb; assembler; nostackframe;
+asm
+  push rbx
+  mov r10, rdx             // ap
+  mov rdx, r9              // b, implicit mulx operand
+  mov r9, rcx              // rp
+  xor r11d, r11d           // carry limb
+  mov rcx, r8
+  and ecx, 3               // peel count
+  shr r8, 2                // quad count
+  jrcxz @main
+@peel:
+  // plain add/adc, the chains are not live yet
+  mulx rbx, rax, [r10]
+  add rax, r11
+  adc rbx, 0
+  add [r9], rax
+  adc rbx, 0
+  mov r11, rbx
+  lea r10, [r10 + 8]
+  lea r9, [r9 + 8]
+  dec ecx
+  jnz @peel
+@main:
+  mov rcx, r8
+  test rcx, rcx            // ZF for the branch, CF = 0, OF = 0: clean chains
+  jz @fold
+  align 32                 // pin the loop to a fixed cache-line offset
+@loop:
+  mulx r8, rax, [r10]
+  adcx rax, r11            // CF chain: previous high limb
+  adox rax, [r9]           // OF chain: rp accumulation
+  mov [r9], rax
+  mulx r11, rax, [r10 + 8]
+  adcx rax, r8
+  adox rax, [r9 + 8]
+  mov [r9 + 8], rax
+  mulx r8, rax, [r10 + 16]
+  adcx rax, r11
+  adox rax, [r9 + 16]
+  mov [r9 + 16], rax
+  mulx r11, rax, [r10 + 24]
+  adcx rax, r8
+  adox rax, [r9 + 24]
+  mov [r9 + 24], rax
+  lea r10, [r10 + 32]
+  lea r9, [r9 + 32]
+  lea rcx, [rcx - 1]
+  jrcxz @fold
+  jmp @loop
+@fold:
+  // carry limb = hi_prev + CF + OF, mathematically below the limb base
+  mov rax, r11
+  mov ebx, 0
+  adcx rax, rbx
+  adox rax, rbx
+  pop rbx
+end;
 
 // rp += ap * b, returns the carry limb
 function MpnAddMul1(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb; inline;
@@ -1441,29 +1568,68 @@ asm
   mov rax, r11
 end;
 
-// two-chain variant: the product row rides the OF chain (adox), the borrow
-// rides the CF chain through the memory subtract, so the serial part is one
-// sbb per limb instead of four flag-coupled ops
+// two-chain variant, four limbs per pass: the product row for a quad rides
+// the OF chain (adox) through registers, then four sbb commits ride the CF
+// chain. sbb clobbers OF, so the row never resumes adox after an sbb; the
+// dec closing each pass resets OF for the next quad and leaves CF alone
 function MpnSubMul1Adx(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb; assembler; nostackframe;
 asm
-  mov r10, rdx        // ap
-  mov rdx, r9         // b, implicit mulx operand
-  xor r11d, r11d      // row carry = 0, CF = 0, OF = 0
-  test r8, r8
-  jz @done
-@loop:
-  mulx r9, rax, [r10]
-  adox rax, r11       // lo += row carry, OF = overflow
+  push rbx
+  push rsi
+  push rdi
+  mov r10, rdx             // ap
+  mov rdx, r9              // b, implicit mulx operand
+  mov r9, rcx              // rp
+  mov rcx, r8
+  and ecx, 3               // peel count
+  shr r8, 2                // quad count
+  xor r11d, r11d           // row carry = 0; clears the CF/OF the shr left over
+  jrcxz @main
+@peel:
+  mulx rbx, rax, [r10]
+  adox rax, r11            // lo += row carry, OF = overflow
   mov r11d, 0
-  adox r11, r9        // row carry = hi + overflow (cannot wrap), OF = 0
-  sbb [rcx], rax      // borrow chain lives in CF across iterations
+  adox r11, rbx            // row carry = hi + overflow (cannot wrap), OF = 0
+  sbb [r9], rax            // borrow chain lives in CF across iterations
   lea r10, [r10 + 8]
-  lea rcx, [rcx + 8]
-  dec r8              // dec leaves CF alone
+  lea r9, [r9 + 8]
+  dec ecx                  // OF := 0 for the next adox, CF survives
+  jnz @peel
+@main:
+  // CF is live, so no test here; jrcxz cannot reach past the body, hence the
+  // short trampoline
+  mov rcx, r8
+  jrcxz @tramp
+  jmp @go
+@tramp:
+  jmp @done
+@go:
+  align 32
+@loop:
+  mulx r8, rax, [r10]
+  adox rax, r11            // p0 = lo0 + row carry
+  mulx r11, rbx, [r10 + 8]
+  adox rbx, r8             // p1 = lo1 + hi0
+  mulx r8, rsi, [r10 + 16]
+  adox rsi, r11            // p2 = lo2 + hi1
+  mulx r11, rdi, [r10 + 24]
+  adox rdi, r8             // p3 = lo3 + hi2
+  mov r8d, 0
+  adox r11, r8             // row carry = hi3 + OF, cannot wrap, OF = 0 after
+  sbb [r9], rax
+  sbb [r9 + 8], rbx
+  sbb [r9 + 16], rsi
+  sbb [r9 + 24], rdi
+  lea r10, [r10 + 32]
+  lea r9, [r9 + 32]
+  dec rcx                  // OF := 0 for the next quad, CF survives
   jnz @loop
 @done:
   mov rax, r11
-  adc rax, 0          // fold the final borrow into the carry limb
+  adc rax, 0               // fold the final borrow into the carry limb
+  pop rdi
+  pop rsi
+  pop rbx
 end;
 
 function MpnSubMul1(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb; inline;
