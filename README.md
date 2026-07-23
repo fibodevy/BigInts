@@ -18,7 +18,7 @@ Arbitrary precision integers, decimals and rationals for Pascal in a single self
 - literals of any size with `_` separators and `$ 0x % 0b & 0o` prefixes; parsing and formatting in every base 2..36
 - multiplication: schoolbook, Karatsuba and Toom-3, picked by tunable thresholds, with dedicated squaring paths
 - division: Knuth algorithm D, plus divide-and-conquer base conversion for long numbers
-- modular arithmetic: Montgomery `modPow` (plus a constant-time `modPowSec` and a reusable `TModRing` context), `modInverse`, `modSqrt` (Tonelli-Shanks), `sqrtModN`, `nthRootMod`, `crt`, `discreteLog`, `multiplicativeOrder`, `primitiveRoot`/`isPrimitiveRoot`, `binomialMod`, `lucasSequence`
+- modular arithmetic: Montgomery `modPow` (plus an exponent-hardened `modPowSec`, and reusable `TModRing` / constant-time `TModRingSec` contexts), `modInverse`, `modSqrt` (Tonelli-Shanks), `sqrtModN`, `nthRootMod`, `crt`, `discreteLog`, `multiplicativeOrder`, `primitiveRoot`/`isPrimitiveRoot`, `binomialMod`, `lucasSequence`
 - primes: Miller-Rabin `isProbablePrime` (deterministic below 3.3e24), Baillie-PSW `isPrime`, `nextPrime`/`prevPrime`, `randomPrime`/`randomSafePrime`/`randomStrongPrime`, exact `primePi`/`primeCount`
 - factorization: trial division plus Pollard-Brent rho, exponents grouped into `(p, e)` tuples; the multiplicative functions `eulerPhi`, `carmichaelLambda`, `moebius`, `sigma`, `tau`, `divisors`, `radical` follow from it
 - number theory and combinatorics: Lehmer `gcd`, `gcdExt`, `jacobi`, `kronecker`, `continuedFraction`, and `factorial`, `fibonacci`, `lucas`, `binomial`, `multinomial`, `catalan`, `bell`, `stirling1`/`stirling2`, `bernoulli`, `partitions`, `subfactorial`, `primorial`
@@ -108,12 +108,18 @@ Everything is camelCase and discoverable through code completion. Methods live o
 | `isKthPower(k)` | whether the value is an exact `k`-th power |
 | `pow(e)`, `**` | plain powers |
 | `modPow(e, m)` | Montgomery with a windowed exponent for odd `m`; on `BigInt` the modulus must be positive, the result lands in `0..m-1` and a negative exponent goes through the modular inverse |
-| `modPowSec(e, m)` | same result as `modPow`, but the operation sequence does not branch on the exponent bits (side-channel resistant, for secret exponents) |
+| `modPowSec(e, m)` | same result as `modPow`, but the sequence of operations does not depend on the exponent bits, hiding the square-and-multiply pattern; the underlying mul/mod stay variable-time, so this is exponent-schedule hardening, not a full constant-time bignum (use `TModRingSec` for that) |
 | `modInverse(m)` | raises `EBigIntError` when no inverse exists |
 | `gcd`, `lcm` | Lehmer gcd |
 | `isProbablePrime(rounds = 24)` | Miller-Rabin; deterministic witnesses below 3.3e24, random rounds above |
 | `isPrime` | Baillie-PSW (deterministic small-range test, then strong base-2 Miller-Rabin plus a strong Lucas test); no known counterexample |
 | `nextPrime` | first prime above self |
+
+### Modular rings: `TModRing` vs `TModRingSec`
+
+`TModRing` is the fast, general-purpose Montgomery context: variable-time, windowed `modPow`, `mul`/`sqr`/`add`/`sub`/`pow`/`inv`/`reduce`. Use it for public data - primality, number theory, RSA verify with a public exponent, any modular math where the operands are not secret.
+
+`TModRingSec` is the hardened counterpart and the unit's only constant-time *arithmetic* surface (the plain `UBigInt`/`BigInt` types add constant-time comparison through `equalsCT`/`compareCT` and wiping through `secureClear`, but their arithmetic stays variable-time). The modulus width is fixed at `create`: every value is padded to that width and no operation normalizes, branches on operand values, or exits early, so the running time and the memory-access pattern depend only on the ring width, not on the secret data. It offers `modPow` (Montgomery ladder with `cswap`), `mul`/`sqr`/`addMod`/`subMod`/`negMod`, and the constant-time primitives `select`/`cswap`/`equalCT`/`isZeroCT`. Reach for it only when a secret drives the computation (RSA sign/decrypt, a private DH exponent); it runs several times slower than `TModRing`, which is the price of the guarantee. Operands import through a fixed masked-copy loop, the exponent is scanned as `bitWidth` bits wide, and internal scratch buffers are wiped before release. Remaining boundary caveats: reducing an unreduced base on entry is variable-time, and results come back as normalized `UBigInt`s whose representation length is that of the value itself - keep secrets reduced and `secureClear` values you drop.
 
 ### Constants and generators (class functions)
 

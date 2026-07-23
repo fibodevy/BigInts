@@ -965,6 +965,63 @@ type
     function reduce(const a: UBigInt): UBigInt;
   end;
 
+  { TModRingSec - constant-time modular arithmetic over a fixed odd modulus }
+
+  // hardened counterpart to TModRing for secret-dependent work (RSA/DH modular
+  // exponentiation with a secret exponent). the modulus width is fixed at
+  // create: every value is padded to that many limbs and no operation
+  // normalizes, branches on operand values, or exits early, so the running time
+  // and the memory-access pattern are independent of the secret data. this is
+  // the only type with constant-time arithmetic; UBigInt/BigInt add
+  // constant-time equalsCT/compareCT and secureClear, but not arithmetic. the
+  // multiply is schoolbook fixed-width (no Karatsuba): O(n^2) but every step is
+  // data-independent. operands import through a fixed masked-copy loop and
+  // scratch buffers are wiped before release. remaining boundary caveats: the
+  // entry reduce of an unreduced base (toMont/modPow) is variable-time, and
+  // results return as normalized UBigInts whose representation length is that
+  // of the value itself - keep secrets reduced and secureClear values you drop.
+  // share one ring per thread, not across
+  TModRingSec = record
+  private
+    fMU: UBigInt;
+    fM: TBigIntLimbs;
+    fN: SizeInt;
+    fMInv: TBigIntLimb;
+    fRR: TBigIntLimbs;
+    fOne: TBigIntLimbs;
+    function pad(const a: UBigInt): TBigIntLimbs;
+    function montMul(const a, b: TBigIntLimbs): TBigIntLimbs;
+  public
+    class function create(const m: UBigInt): TModRingSec; static;
+    // fixed width of the ring
+    function limbWidth: SizeInt;
+    function bitWidth: LongWord;
+    function byteWidth: LongWord;
+    function modulus: UBigInt;
+    function modulusBits: LongWord;
+    // Montgomery domain conversions (boundary, not constant-time)
+    function toMont(const a: UBigInt): UBigInt;
+    function fromMont(const a: UBigInt): UBigInt;
+    // constant-time modular products; operands reduced (below m) and in the
+    // Montgomery domain
+    function mul(const a, b: UBigInt): UBigInt;
+    function sqr(const a: UBigInt): UBigInt;
+    // constant-time modular add/sub/negate; operands reduced, either domain
+    function addMod(const a, b: UBigInt): UBigInt;
+    function subMod(const a, b: UBigInt): UBigInt;
+    function negMod(const a: UBigInt): UBigInt;
+    // constant-time data selection over the fixed width
+    function select(cond: boolean; const a, b: UBigInt): UBigInt;
+    procedure cswap(cond: boolean; var a, b: UBigInt);
+    function equalCT(const a, b: UBigInt): boolean;
+    function isZeroCT(const a: UBigInt): boolean;
+    // constant-time modular exponentiation via a Montgomery ladder: the running
+    // time depends only on the ring width, not on the secret exponent bits or
+    // the intermediate values. the exponent is scanned as bitWidth bits wide;
+    // base is reduced on entry (that reduction is not constant-time)
+    function modPow(const base, e: UBigInt): UBigInt;
+  end;
+
   // bridges declared after BigDecimal so the integer types can return the
   // wider types (BigInt for UBigInt, BigDecimal for both)
   TUBigIntBridge = record helper for UBigInt
@@ -4863,6 +4920,337 @@ function TModRing.inv(const a: UBigInt): UBigInt;
 begin
   result := a.modInverse(fMU);
 end;
+
+// -- TModRingSec -------------------
+
+{$push}
+{$BOOLEVAL+} // full boolean evaluation, so no short-circuit reveals which term decided
+
+// spread a 0/1 flag into a full-width limb mask (0 -> 0, 1 -> all ones)
+function CtMask(bit: TLimb): TLimb; inline;
+begin
+  result := TLimb(0) - bit;
+end;
+
+// all-ones mask when i < len, from the sign bit of the difference (no compare
+// instruction the compiler could turn into a branch)
+function CtLtMask(i, len: SizeInt): TLimb; inline;
+begin
+  result := TLimb(0) - TLimb(PtrUInt(i - len) shr (8 * SizeOf(PtrUInt) - 1));
+end;
+
+// zero a scratch buffer that held secret-dependent limbs before it goes back
+// to the heap
+procedure CtWipe(var v: TLimbs);
+begin
+  if v <> nil then FillChar(v[0], Length(v) * SizeOf(TLimb), 0);
+end;
+
+// rp := ap + b over all n limbs: unlike MpnAdd1 the loop never stops when the
+// carry dies, and the carry itself comes from bit arithmetic, so the run shape
+// is independent of the data
+function CtAdd1(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb;
+begin
+  var c := b;
+  for var i := 0 to n - 1 do begin
+    var a := ap[i];
+    var s := a + c;
+    c := ((a and c) or ((a or c) and not s)) shr (LIMB_BITS - 1);
+    rp[i] := s;
+  end;
+  result := c;
+end;
+
+// constant-time select over n limbs: rp[i] := if mask all-ones then ap[i] else bp[i]
+procedure CtSelect(rp, ap, bp: PLimb; n: SizeInt; mask: TLimb);
+begin
+  for var i := 0 to n - 1 do rp[i] := (ap[i] and mask) or (bp[i] and not mask);
+end;
+
+// constant-time conditional swap of two n-limb vectors when mask is all-ones
+procedure CtSwap(ap, bp: PLimb; n: SizeInt; mask: TLimb);
+begin
+  for var i := 0 to n - 1 do begin
+    var t := (ap[i] xor bp[i]) and mask;
+    ap[i] := ap[i] xor t;
+    bp[i] := bp[i] xor t;
+  end;
+end;
+
+// same as MontMul but the final reduce is branchless: t-m is always computed and
+// selected on the borrow, so timing never reveals whether the subtract happened.
+// t is a 2n+1 limb workspace, sub an n limb scratch; rp may alias ap and bp
+procedure CtMontMul(rp, ap, bp: PLimb; const m: TLimbs; mInv: TLimb; n: SizeInt; var t, sub: TLimbs);
+begin
+  t[2 * n] := 0;
+  t[n] := MpnMul1(@t[0], ap, n, bp[0]);
+  for var j := 1 to n - 1 do t[n + j] := MpnAddMul1(@t[j], ap, n, bp[j]);
+  for var i := 0 to n - 1 do begin
+    var u: TLimb := t[i] * mInv;
+    var c := MpnAddMul1(@t[i], @m[0], n, u);
+    // CtAdd1, not MpnAdd1: the latter stops once the carry dies, which would
+    // tie the REDC timing to the intermediate values
+    CtAdd1(@t[i + n], @t[i + n], n + 1 - i, c);
+  end;
+  // t[n..2n] is below 2m; borrow is 1 exactly when t[n..2n] < m, so subtract m
+  // when the top limb carried out or no borrow occurred
+  var borrow := MpnSubN(@sub[0], @t[n], @m[0], n);
+  var top := t[2 * n];
+  var topNz := (top or (TLimb(0) - top)) shr (LIMB_BITS - 1);
+  var doSub := (topNz or (TLimb(1) - borrow)) and 1;
+  CtSelect(rp, @sub[0], @t[n], n, CtMask(doSub));
+end;
+
+class function TModRingSec.create(const m: UBigInt): TModRingSec;
+var
+  q, r: TLimbs;
+begin
+  if m.isZero then RaiseDivByZero;
+  if (not m.isOdd) or m.isOne then raise EBigIntError.Create('TModRingSec needs an odd modulus above 1');
+  result := default(TModRingSec);
+  result.fMU := m;
+  result.fM := Copy(m.fLimbs);
+  result.fN := Length(result.fM);
+  result.fMInv := MontInv(result.fM[0]);
+  // R mod m and R^2 mod m, R = B^n
+  LDivMod(LShl(LFromQWord(1), LongWord(result.fN) * LIMB_BITS), result.fM, q, r);
+  result.fOne := r;
+  SetLength(result.fOne, result.fN);
+  LDivMod(LShl(LFromQWord(1), LongWord(result.fN) * 2 * LIMB_BITS), result.fM, q, r);
+  result.fRR := r;
+  SetLength(result.fRR, result.fN);
+end;
+
+// zero-extend a reduced value to the fixed ring width; the copy is a fixed
+// fN-limb loop with masked reads, so neither the loop shape nor the copy
+// length tracks the value's limb count. a value wider than the ring is misuse
+// (not a reduced operand) and raises off the constant-time path
+function TModRingSec.pad(const a: UBigInt): TBigIntLimbs;
+begin
+  if a.fLen > fN then raise EBigIntError.Create('value exceeds ring width');
+  result := LNew(fN);
+  var p := a.dataPtr;
+  for var i := 0 to fN - 1 do begin
+    var msk := CtLtMask(i, a.fLen);
+    result[i] := p[i and SizeInt(msk)] and msk;
+  end;
+end;
+
+function TModRingSec.montMul(const a, b: TBigIntLimbs): TBigIntLimbs;
+var
+  t, sub: TLimbs;
+begin
+  result := LNewZ(fN);
+  t := LNewZ(2 * fN + 1);
+  sub := LNewZ(fN);
+  CtMontMul(@result[0], @a[0], @b[0], fM, fMInv, fN, t, sub);
+  CtWipe(t);
+  CtWipe(sub);
+end;
+
+function TModRingSec.limbWidth: SizeInt;
+begin
+  result := fN;
+end;
+
+function TModRingSec.bitWidth: LongWord;
+begin
+  result := LongWord(fN) * LIMB_BITS;
+end;
+
+function TModRingSec.byteWidth: LongWord;
+begin
+  result := LongWord(fN) * (LIMB_BITS div 8);
+end;
+
+function TModRingSec.modulus: UBigInt;
+begin
+  result := fMU;
+end;
+
+function TModRingSec.modulusBits: LongWord;
+begin
+  result := fMU.bitLength;
+end;
+
+function TModRingSec.toMont(const a: UBigInt): UBigInt;
+begin
+  var ar := if a < fMU then a else a mod fMU; // boundary reduce, not constant-time
+  var pa := pad(ar);
+  var r := montMul(pa, fRR);
+  CtWipe(pa);
+  LNorm(r);
+  result.fLimbs := r;
+end;
+
+function TModRingSec.fromMont(const a: UBigInt): UBigInt;
+var
+  one: TLimbs;
+begin
+  one := LNewZ(fN);
+  one[0] := 1;
+  var pa := pad(a);
+  var r := montMul(pa, one);
+  CtWipe(pa);
+  LNorm(r);
+  result.fLimbs := r;
+end;
+
+function TModRingSec.mul(const a, b: UBigInt): UBigInt;
+begin
+  var pa := pad(a);
+  var pb := pad(b);
+  var r := montMul(pa, pb);
+  CtWipe(pa);
+  CtWipe(pb);
+  LNorm(r);
+  result.fLimbs := r;
+end;
+
+function TModRingSec.sqr(const a: UBigInt): UBigInt;
+begin
+  var pa := pad(a);
+  var r := montMul(pa, pa);
+  CtWipe(pa);
+  LNorm(r);
+  result.fLimbs := r;
+end;
+
+function TModRingSec.addMod(const a, b: UBigInt): UBigInt;
+var
+  s, sub, r: TLimbs;
+begin
+  var pa := pad(a);
+  var pb := pad(b);
+  s := LNewZ(fN);
+  sub := LNewZ(fN);
+  var carry := MpnAddN(@s[0], @pa[0], @pb[0], fN);
+  // a+b < 2m: subtract m when the sum overflowed the width or reached m
+  var borrow := MpnSubN(@sub[0], @s[0], @fM[0], fN);
+  var doSub := (carry or (TLimb(1) - borrow)) and 1;
+  r := LNewZ(fN);
+  CtSelect(@r[0], @sub[0], @s[0], fN, CtMask(doSub));
+  CtWipe(pa);
+  CtWipe(pb);
+  CtWipe(s);
+  CtWipe(sub);
+  LNorm(r);
+  result.fLimbs := r;
+end;
+
+function TModRingSec.subMod(const a, b: UBigInt): UBigInt;
+var
+  d, add, r: TLimbs;
+begin
+  var pa := pad(a);
+  var pb := pad(b);
+  d := LNewZ(fN);
+  var borrow := MpnSubN(@d[0], @pa[0], @pb[0], fN);
+  // a<b wrapped the difference; add m back
+  add := LNewZ(fN);
+  MpnAddN(@add[0], @d[0], @fM[0], fN);
+  r := LNewZ(fN);
+  CtSelect(@r[0], @add[0], @d[0], fN, CtMask(borrow));
+  CtWipe(pa);
+  CtWipe(pb);
+  CtWipe(d);
+  CtWipe(add);
+  LNorm(r);
+  result.fLimbs := r;
+end;
+
+function TModRingSec.negMod(const a: UBigInt): UBigInt;
+begin
+  result := subMod(default(UBigInt), a);
+end;
+
+function TModRingSec.select(cond: boolean; const a, b: UBigInt): UBigInt;
+var
+  r: TLimbs;
+begin
+  var pa := pad(a);
+  var pb := pad(b);
+  r := LNewZ(fN);
+  CtSelect(@r[0], @pa[0], @pb[0], fN, CtMask(TLimb(ord(cond))));
+  CtWipe(pa);
+  CtWipe(pb);
+  LNorm(r);
+  result.fLimbs := r;
+end;
+
+procedure TModRingSec.cswap(cond: boolean; var a, b: UBigInt);
+begin
+  var pa := pad(a);
+  var pb := pad(b);
+  CtSwap(@pa[0], @pb[0], fN, CtMask(TLimb(ord(cond))));
+  LNorm(pa);
+  LNorm(pb);
+  a.fLimbs := pa;
+  b.fLimbs := pb;
+end;
+
+function TModRingSec.equalCT(const a, b: UBigInt): boolean;
+begin
+  var pa := pad(a);
+  var pb := pad(b);
+  var acc: TLimb := 0;
+  for var i := 0 to fN - 1 do acc := acc or (pa[i] xor pb[i]);
+  CtWipe(pa);
+  CtWipe(pb);
+  result := acc = 0;
+end;
+
+function TModRingSec.isZeroCT(const a: UBigInt): boolean;
+begin
+  var pa := pad(a);
+  var acc: TLimb := 0;
+  for var i := 0 to fN - 1 do acc := acc or pa[i];
+  CtWipe(pa);
+  result := acc = 0;
+end;
+
+function TModRingSec.modPow(const base, e: UBigInt): UBigInt;
+var
+  x0, x1, tmp, t, sub, ovec, eLimbs: TLimbs;
+begin
+  if e.fLen > fN then raise EBigIntError.Create('exponent exceeds ring width');
+  // base reduced on entry (public), then mapped into the Montgomery domain
+  var br := if base < fMU then base else base mod fMU;
+  var pb := pad(br);
+  x1 := montMul(pb, fRR);
+  CtWipe(pb);
+  x0 := Copy(fOne); // Montgomery form of 1 = R mod m
+  t := LNewZ(2 * fN + 1);
+  sub := LNewZ(fN);
+  tmp := LNewZ(fN);
+  // fixed-width exponent: the padded import and the scan both run at the ring
+  // width, so neither the copy nor the loop count leaks the exponent's magnitude
+  eLimbs := pad(e);
+  for var i := SizeInt(fN) * LIMB_BITS - 1 downto 0 do begin
+    var bit := (eLimbs[i div LIMB_BITS] shr (i mod LIMB_BITS)) and 1;
+    var mask := CtMask(bit);
+    CtSwap(@x0[0], @x1[0], fN, mask);
+    // fixed op with the branch hidden by the swaps: x1 := x0*x1 ; x0 := x0*x0
+    CtMontMul(@tmp[0], @x0[0], @x1[0], fM, fMInv, fN, t, sub);
+    Move(tmp[0], x1[0], fN * SizeOf(TLimb));
+    CtMontMul(@x0[0], @x0[0], @x0[0], fM, fMInv, fN, t, sub);
+    CtSwap(@x0[0], @x1[0], fN, mask);
+  end;
+  // back out of Montgomery form by a multiply against plain 1
+  ovec := LNewZ(fN);
+  ovec[0] := 1;
+  CtMontMul(@x0[0], @x0[0], @ovec[0], fM, fMInv, fN, t, sub);
+  // scrub every scratch that carried exponent bits or intermediate values
+  CtWipe(eLimbs);
+  CtWipe(x1);
+  CtWipe(tmp);
+  CtWipe(t);
+  CtWipe(sub);
+  LNorm(x0);
+  result.fLimbs := x0;
+end;
+
+{$pop}
 
 function UBigInt.modPow(const e, m: UBigInt): UBigInt;
 begin

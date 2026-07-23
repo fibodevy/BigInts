@@ -2325,6 +2325,40 @@ begin
   check(cring.fromMont(mx) = want1, 'ring 50-step chain = x^51');
   checkRaises(procedure begin TModRing.create(UBigInt(10)); end, EBigIntError, 'ring even modulus');
   checkRaises(procedure begin TModRing.create(UBigInt.one); end, EBigIntError, 'ring modulus 1');
+  // constant-time ring: every operation matches plain modular arithmetic
+  for var i := 1 to 40 do begin
+    var m := randU(30 + Random(500)) or UBigInt.one;
+    if m.isOne then continue;
+    var sring := TModRingSec.create(m);
+    check(sring.modulus = m, 'sec ring modulus');
+    var a := UBigInt.randomBelow(m);
+    var b := UBigInt.randomBelow(m);
+    check(sring.fromMont(sring.toMont(a)) = a, 'sec toMont/fromMont roundtrip');
+    check(sring.fromMont(sring.mul(sring.toMont(a), sring.toMont(b))) = (a * b) mod m, 'sec mul');
+    check(sring.fromMont(sring.sqr(sring.toMont(a))) = a.sqr mod m, 'sec sqr');
+    check(sring.addMod(a, b) = (a + b) mod m, 'sec addMod');
+    check(sring.subMod(a, b) = (a.toBigInt - b.toBigInt).floorMod(m.toBigInt).toUBigInt, 'sec subMod');
+    check(sring.negMod(a) = (m.toBigInt - a.toBigInt).floorMod(m.toBigInt).toUBigInt, 'sec negMod');
+    // the constant-time ladder scans exactly bitWidth bits, so the exponent
+    // must fit the ring width (holds for RSA/DH where the exponent is below m)
+    var e := UBigInt.randomBelow(m);
+    check(sring.modPow(a, e) = a.modPow(e, m), 'sec modPow matches modPow');
+    // select and cswap move the right operand without leaking the flag path
+    check(sring.select(true, a, b) = a, 'sec select true');
+    check(sring.select(false, a, b) = b, 'sec select false');
+    var x := a;
+    var y := b;
+    sring.cswap(true, x, y);
+    check((x = b) and (y = a), 'sec cswap on');
+    sring.cswap(false, x, y);
+    check((x = b) and (y = a), 'sec cswap off');
+    check(sring.equalCT(a, a), 'sec equalCT self');
+    if a <> b then check(not sring.equalCT(a, b), 'sec equalCT differ');
+    check(sring.isZeroCT(default(UBigInt)), 'sec isZeroCT zero');
+    if not a.isZero then check(not sring.isZeroCT(a), 'sec isZeroCT nonzero');
+  end;
+  checkRaises(procedure begin TModRingSec.create(UBigInt(10)); end, EBigIntError, 'sec ring even modulus');
+  checkRaises(procedure begin TModRingSec.create(UBigInt.one); end, EBigIntError, 'sec ring modulus 1');
   // sqrtModN: every returned root squares back, and a residue is found
   for var i := 1 to 100 do begin
     var n := randU(40) or UBigInt.one;
