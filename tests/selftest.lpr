@@ -1161,6 +1161,38 @@ begin
   end;
 end;
 
+procedure testBurnikelZiegler;
+begin
+  section('Burnikel-Ziegler division vs Knuth');
+  var saved := BigIntDivDCThreshold;
+  // threshold 4 forces the recursive path down to tiny sub-sizes
+  for var i := 1 to 60 do begin
+    var a := randU(2000 + Random(60000));
+    var b := randU(600 + Random(20000));
+    if b.isZero then continue;
+    BigIntDivDCThreshold := 4;
+    var (q1, r1) := a.divMod(b);
+    BigIntDivDCThreshold := 1000000000;
+    var (q2, r2) := a.divMod(b);
+    check(q1 = q2, 'bz q = knuth q');
+    check(r1 = r2, 'bz r = knuth r');
+    check(q1 * b + r1 = a, 'bz division identity');
+    check(r1 < b, 'bz remainder below divisor');
+    BigIntDivDCThreshold := saved;
+  end;
+  // exact multiples and the boundaries around them
+  for var i := 1 to 30 do begin
+    var b := randU(1000 + Random(20000));
+    if b.isZero or b.isOne then continue;
+    var qe := randU(1000 + Random(20000));
+    BigIntDivDCThreshold := 4;
+    check((qe * b) div b = qe, 'bz exact multiple');
+    check((qe * b) mod b = UBigInt.zero, 'bz exact multiple remainder');
+    check((qe * b + (b - 1)) div b = qe, 'bz just below next multiple');
+    BigIntDivDCThreshold := saved;
+  end;
+end;
+
 procedure testStressChain;
 begin
   section('stress: long random operator chains vs Int64 oracle');
@@ -2880,6 +2912,7 @@ begin
   testToom3;
   testToom4;
   testNtt;
+  testBurnikelZiegler;
   testStressChain;
   testStressStrings;
 

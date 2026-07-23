@@ -1053,6 +1053,12 @@ var
   // (NttUse), above it the NTT wins outright
   BigIntNttThreshold: integer = {$ifdef BIGINT_ASM} 30000 {$else} 16000 {$endif};
 
+  // divisor limb count above which division switches from Knuth to recursive
+  // Burnikel-Ziegler (built on the fast multiply); the quotient must also span
+  // at least this many limbs. exposed for tuning and testing. the asm Knuth
+  // kernels stay ahead much longer, so the switch sits higher there
+  BigIntDivDCThreshold: integer = {$ifdef BIGINT_ASM} 400 {$else} 150 {$endif};
+
   // generator used by random/randomBelow/randomRange/randomPrime
   BigIntRngAlgo: TBigIntRngAlgo = rngXoshiro256ss;
 
@@ -2656,6 +2662,7 @@ end;
 function LMul(const a, b: TLimbs): TLimbs; forward;
 function LSqr(const a: TLimbs): TLimbs; forward;
 function LShl(const a: TLimbs; n: LongWord): TLimbs; forward;
+function LShlP(pa: PLimb; la: SizeInt; n: LongWord): TLimbs; forward;
 function LShr(const a: TLimbs; n: LongWord): TLimbs; forward;
 function LDivModW(const a: TLimbs; w: TLimb; out rem: TLimb): TLimbs; forward;
 function LMulW(const a: TLimbs; w: TLimb): TLimbs; forward;
@@ -3585,7 +3592,7 @@ const
   // limbs) with no heap traffic and layout-independent addresses
   DIVMOD_STACK_LIMBS = 512;
 
-procedure LDivModP(pu: PLimb; m: SizeInt; pv: PLimb; n: SizeInt; out q, r: TLimbs);
+procedure LDivKnuthP(pu: PLimb; m: SizeInt; pv: PLimb; n: SizeInt; out q, r: TLimbs);
 var
   scratch: TLimbs;
   stackBuf: array[0..DIVMOD_STACK_LIMBS - 1] of TLimb;
@@ -3655,6 +3662,125 @@ begin
   if s = 0 then Move(un[0], r[0], n * SizeOf(TLimb))
   else MpnRshift(@r[0], @un[0], n, s);
   LNorm(r);
+end;
+
+// value * B^k (prepend k zero limbs); B = the limb base
+function LLimbShl(const a: TLimbs; k: SizeInt): TLimbs;
+begin
+  if (Length(a) = 0) or (k <= 0) then exit(a);
+  result := LNew(Length(a) + k);
+  FillChar(result[0], k * SizeOf(TLimb), 0);
+  Move(a[0], result[k], Length(a) * SizeOf(TLimb));
+end;
+
+// value div B^k (drop the low k limbs)
+function LLimbShr(const a: TLimbs; k: SizeInt): TLimbs;
+begin
+  if k <= 0 then exit(a);
+  if k >= Length(a) then exit(nil);
+  result := Copy(a, k, Length(a) - k);
+end;
+
+// value mod B^k (keep the low k limbs, normalized)
+function LLimbLow(const a: TLimbs; k: SizeInt): TLimbs;
+begin
+  if k >= Length(a) then exit(a);
+  result := Copy(a, 0, k);
+  LNorm(result);
+end;
+
+procedure BzDiv2n1n(const a, b: TLimbs; n: SizeInt; out q, r: TLimbs); forward;
+
+// divide a (< b*B^m, up to 3m limbs) by the 2m-limb normalized b; quotient
+// below B^m. all arithmetic is exact, the final loop corrects at most twice
+procedure BzDiv3n2n(const a, b: TLimbs; m: SizeInt; out q, r: TLimbs);
+var
+  q1, r1: TLimbs;
+begin
+  var a2 := LLimbShr(a, 2 * m);   // top m limbs
+  var b1 := LLimbShr(b, m);       // top m limbs of b
+  var ahi := LLimbShr(a, m);      // [a2,a1], the top 2m limbs
+  if LCmp(a2, b1) < 0 then BzDiv2n1n(ahi, b1, m, q1, r1)
+  else begin
+    // q = B^m - 1; r1 = ahi - q*b1 = a1 + b1 (nonnegative)
+    q1 := LSub(LLimbShl([1], m), [1]);
+    var t := LMul(q1, b1);
+    if LCmp(ahi, t) < 0 then begin
+      // guard: preconditions violated, fall back to the exact base case
+      LDivKnuthP(PLimb(Pointer(a)), Length(a), PLimb(Pointer(b)), Length(b), q, r);
+      exit;
+    end;
+    r1 := LSub(ahi, t);
+  end;
+  // p = r1*B^m + (a mod B^m); r = p - q1*b0 with borrow corrected by +b, q1--
+  var b0 := LLimbLow(b, m);
+  var p := LAdd(LLimbShl(r1, m), LLimbLow(a, m));
+  var d := LMul(q1, b0);
+  while LCmp(p, d) < 0 do begin
+    p := LAdd(p, b);
+    q1 := LSub(q1, [1]);
+  end;
+  q := q1;
+  r := LSub(p, d);
+end;
+
+// divide the up-to-2n-limb a (< b*B^n) by the n-limb normalized b; quotient
+// below B^n. splits into two 3-by-2 half-size divisions
+procedure BzDiv2n1n(const a, b: TLimbs; n: SizeInt; out q, r: TLimbs);
+begin
+  if (n and 1 = 1) or (n < BigIntDivDCThreshold) then begin
+    LDivKnuthP(PLimb(Pointer(a)), Length(a), PLimb(Pointer(b)), Length(b), q, r);
+    exit;
+  end;
+  var m := n shr 1;
+  var q1, r1, q0: TLimbs;
+  BzDiv3n2n(LLimbShr(a, m), b, m, q1, r1);       // top 3m limbs by b
+  BzDiv3n2n(LAdd(LLimbShl(r1, m), LLimbLow(a, m)), b, m, q0, r); // [r1,a0] by b
+  q := LAdd(LLimbShl(q1, m), q0);
+end;
+
+// full division through Burnikel-Ziegler: pad the divisor to j*2^k limbs so
+// every recursion level stays even down to the base case (an odd size would
+// fall back to quadratic Knuth), then sweep the dividend in super-digits
+procedure LDivBzP(pu: PLimb; m: SizeInt; pv: PLimb; n: SizeInt; out q, r: TLimbs);
+begin
+  // smallest power of two whose base-case size lands below the threshold
+  var k: SizeInt := 1;
+  while n div k >= BigIntDivDCThreshold do k := k shl 1;
+  var bl := ((n + k - 1) div k) * k;
+  // shift so the divisor fills bl limbs exactly, top bit set
+  var sigma := LongWord(bl) * LIMB_BITS - LBitLenP(pv, n);
+  var bn := LShlP(pv, n, sigma);
+  var an := LShlP(pu, m, sigma);
+  SetLength(bn, bl);
+  var t := (Length(an) + bl - 1) div bl;
+  if t < 1 then t := 1;
+  var acc: TLimbs := nil;
+  var rem: TLimbs := nil;
+  for var i := t - 1 downto 0 do begin
+    // [rem, block_i] = rem*B^bl + block_i, below bn*B^bl since rem < bn. the
+    // dividend reads rem, so the step writes into a fresh nr (rem doubles as
+    // the out slot, which the compiler would finalize before the read)
+    var block := LLimbLow(LLimbShr(an, i * bl), bl);
+    var qi, nr: TLimbs;
+    BzDiv2n1n(LAdd(LLimbShl(rem, bl), block), bn, bl, qi, nr);
+    rem := nr;
+    acc := LAdd(acc, LLimbShl(qi, i * bl));
+  end;
+  LNorm(acc);
+  q := acc;
+  rem := LShr(rem, sigma);
+  LNorm(rem);
+  r := rem;
+end;
+
+procedure LDivModP(pu: PLimb; m: SizeInt; pv: PLimb; n: SizeInt; out q, r: TLimbs);
+begin
+  // recursive division pays off once the divisor is large and the quotient
+  // spans several super-digits; Knuth stays for everything smaller
+  if (n >= BigIntDivDCThreshold) and (m - n >= BigIntDivDCThreshold) and (LCmpP(pu, m, pv, n) >= 0) then
+    LDivBzP(pu, m, pv, n, q, r)
+  else LDivKnuthP(pu, m, pv, n, q, r);
 end;
 
 procedure LDivMod(const u, v: TLimbs; out q, r: TLimbs);
