@@ -5,7 +5,14 @@
    BigInt      - signed big integer, two's complement semantics for bitwise ops
    BigDecimal  - decimal float over the same core: BigInt mantissa * 10^exp
    BigRational - exact fraction: normalized BigInt num/den pair
-                 plus TModRing, a reusable Montgomery context for modular arithmetic }
+
+ Two Montgomery contexts over a fixed odd modulus, for many products against one modulus:
+   TModRing    - fast modular arithmetic (RSA/ECC-style workloads)
+   TModRingSec - constant-time hardened counterpart for secret-dependent work
+
+ Free helpers:
+   addTo / subTo - in-place dst := a +/- b, reusing dst's buffer
+   BigIntRandomSeed / BigIntRandomize - seed the generators deterministically / from OS entropy }
 
 { Copyright (c) 2026 @fibodevy / https://github.com/fibodevy
   This Source Code Form is subject to the terms of the Mozilla Public
