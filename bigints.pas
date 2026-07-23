@@ -1567,6 +1567,8 @@ begin
 end;
 
 // rp -= ap * b, returns the borrow limb
+// n is assumed positive (< 2^63): a larger limb count needs an array past
+// addressable memory, so it never occurs; the noasm loop below is signed
 function MpnSubMul1Gen(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb; assembler; nostackframe;
 asm
   mov r10, rdx
