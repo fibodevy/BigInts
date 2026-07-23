@@ -75,12 +75,12 @@ type
   PBigIntLimb = ^TBigIntLimb;
 
 const
-  // values up to this many limbs (256 bits) live inline in the record with no
+  // values up to this many limbs (512 bits) live inline in the record with no
   // heap allocation; larger ones spill into a refcounted block. tunable
   {$ifdef BIGINT_LIMB64}
-  BIGINT_INLINE_LIMBS = 6;
-  {$else}
   BIGINT_INLINE_LIMBS = 8;
+  {$else}
+  BIGINT_INLINE_LIMBS = 16;
   {$endif}
 
 type
@@ -2414,15 +2414,9 @@ procedure AddInline(pa: PLimb; alen: SizeInt; pb: PLimb; blen: SizeInt; dst: PLi
 begin
   var n := if alen > blen then alen else blen;
   var buf: array[0..BIGINT_INLINE_LIMBS] of TLimb;
-  var carry: TLimb := 0;
-  for var i := 0 to n - 1 do begin
-    var av := pa[i];
-    var s := av + pb[i];
-    var c1 := TLimb(Ord(s < av));
-    s := s + carry;
-    carry := c1 or TLimb(Ord(s < carry));
-    buf[i] := s;
-  end;
+  // inline operands are zero-padded to the capacity, so the row kernel may add
+  // the full n limbs even when one is shorter
+  var carry := MpnAddN(@buf[0], pa, pb, n);
   buf[n] := carry;
   var m: SizeInt;
   if carry <> 0 then m := n + 1
@@ -2438,16 +2432,8 @@ end;
 procedure SubInline(pa: PLimb; alen: SizeInt; pb: PLimb; dst: PLimb; var rarr: TLimbs; var rlen: SizeInt);
 begin
   var buf: array[0..BIGINT_INLINE_LIMBS] of TLimb;
-  var borrow: TLimb := 0;
-  for var i := 0 to alen - 1 do begin
-    var av := pa[i];
-    var bv := pb[i];
-    var s := av - bv;
-    var b1 := TLimb(Ord(av < bv));
-    var s2 := s - borrow;
-    borrow := b1 or TLimb(Ord(s < borrow));
-    buf[i] := s2;
-  end;
+  // pb is zero-padded past its length, so the row kernel subtracts all alen
+  MpnSubN(@buf[0], pa, pb, alen);
   var m := alen;
   while (m > 0) and (buf[m - 1] = 0) do dec(m);
   PutInline(@buf[0], m, dst, rarr, rlen);
