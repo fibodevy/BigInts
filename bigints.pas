@@ -515,7 +515,7 @@ type
     function sqrt: BigInt;
     function nthRoot(n: LongWord): BigInt;
     function pow(e: LongWord): BigInt;
-    // modPow follows Java: modulus must be positive, result in [0, m),
+    // modPow: modulus must be positive, result in [0, m),
     // a negative exponent goes through the modular inverse
     function modPow(const e, m: BigInt): BigInt;
     function modInverse(const m: BigInt): BigInt;
