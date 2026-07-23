@@ -826,6 +826,30 @@ begin
     check(a.gcd(b) * a.lcm(b) = a * b, 'gcd * lcm = product');
     check((a mod a.gcd(b)).isZero and (b mod a.gcd(b)).isZero, 'gcd divides both');
   end;
+  // half-gcd reduction vs pure Lehmer, random and structured operands
+  var saved := BigIntGcdDCThreshold;
+  for var i := 1 to 12 do begin
+    var a := randU(40000 + Random(160000));
+    var b := randU(30000 + Random(120000));
+    BigIntGcdDCThreshold := 16;
+    var g1 := a.gcd(b);
+    BigIntGcdDCThreshold := 1000000000;
+    var g2 := a.gcd(b);
+    check(g1 = g2, 'half-gcd = lehmer gcd');
+    BigIntGcdDCThreshold := saved;
+  end;
+  for var bits in [50000, 131072] do begin
+    var g := randU(3000) + 1;
+    var a := (UBigInt.pow2(bits) - 1) * g;
+    var b := (UBigInt.pow2(bits div 2 + 1) + 1) * g;
+    BigIntGcdDCThreshold := 16;
+    var g1 := a.gcd(b);
+    BigIntGcdDCThreshold := 1000000000;
+    var g2 := a.gcd(b);
+    check(g1 = g2, 'half-gcd structured operands');
+    check((a mod g1).isZero and (b mod g1).isZero and (g1 >= g), 'half-gcd common factor survives');
+    BigIntGcdDCThreshold := saved;
+  end;
 end;
 
 procedure testMathModular;

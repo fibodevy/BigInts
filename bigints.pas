@@ -1064,6 +1064,10 @@ var
   // kernels stay ahead much longer, so the switch sits higher there
   BigIntDivDCThreshold: integer = {$ifdef BIGINT_ASM} 400 {$else} 150 {$endif};
 
+  // limb count above which gcd runs the recursive half-gcd reduction before
+  // the Lehmer loop; exposed for tuning and testing
+  BigIntGcdDCThreshold: integer = 1800;
+
   // generator used by random/randomBelow/randomRange/randomPrime
   BigIntRngAlgo: TBigIntRngAlgo = rngXoshiro256ss;
 
@@ -6583,38 +6587,206 @@ begin
   result := res;
 end;
 
+// one Lehmer window: Euclid on the top 63 bits of (aL, bL), aL >= bL; false
+// when the window cannot certify a single quotient
+function LehmerWindow(const aL, bL: TLimbs; out mA, mB, mC, mD: Int64): boolean;
+begin
+  var shs := SizeInt(LBitLen(aL)) - 63;
+  if shs < 0 then shs := 0;
+  var x := Int64(LExtract64(aL, LongWord(shs)));
+  var y := Int64(LExtract64(bL, LongWord(shs)));
+  mA := 1;
+  mB := 0;
+  mC := 0;
+  mD := 1;
+  while (y + mC > 0) and (y + mD > 0) do begin
+    var q := (x + mA) div (y + mC);
+    if (q <> (x + mB) div (y + mD)) or (q > $7FFFFFFF) then break;
+    var t1 := mA - q * mC;
+    var t2 := mB - q * mD;
+    mA := mC;
+    mB := mD;
+    mC := t1;
+    mD := t2;
+    var t := x - q * y;
+    x := y;
+    y := t;
+    if (System.Abs(mC) > $40000000) or (System.Abs(mD) > $40000000) then break;
+  end;
+  result := mB <> 0;
+end;
+
+type
+  // 2x2 Euclid step matrix accumulated during half-gcd reduction; entries are
+  // signed since consecutive convergents alternate
+  TGcdMat = record
+    m00, m01, m10, m11: BigInt;
+    ident: boolean;
+  end;
+
+procedure GcdMatInit(out M: TGcdMat);
+begin
+  M.m00 := 1;
+  M.m01 := 0;
+  M.m10 := 0;
+  M.m11 := 1;
+  M.ident := true;
+end;
+
+// M := [[wa, wb], [wc, wd]] * M
+procedure GcdMatWordMul(var M: TGcdMat; wa, wb, wc, wd: Int64);
+begin
+  var n00 := wa * M.m00 + wb * M.m10;
+  var n01 := wa * M.m01 + wb * M.m11;
+  var n10 := wc * M.m00 + wd * M.m10;
+  var n11 := wc * M.m01 + wd * M.m11;
+  M.m00 := n00;
+  M.m01 := n01;
+  M.m10 := n10;
+  M.m11 := n11;
+  M.ident := false;
+end;
+
+// M := S * M
+procedure GcdMatMul(var M: TGcdMat; const s: TGcdMat);
+begin
+  var n00 := s.m00 * M.m00 + s.m01 * M.m10;
+  var n01 := s.m00 * M.m01 + s.m01 * M.m11;
+  var n10 := s.m10 * M.m00 + s.m11 * M.m10;
+  var n11 := s.m10 * M.m01 + s.m11 * M.m11;
+  M.m00 := n00;
+  M.m01 := n01;
+  M.m10 := n10;
+  M.m11 := n11;
+  M.ident := false;
+end;
+
+// M := [[0, 1], [1, -q]] * M, one full division step
+procedure GcdMatDivStep(var M: TGcdMat; const q: BigInt);
+begin
+  var n10 := M.m00 - q * M.m10;
+  var n11 := M.m01 - q * M.m11;
+  M.m00 := M.m10;
+  M.m01 := M.m11;
+  M.m10 := n10;
+  M.m11 := n11;
+  M.ident := false;
+end;
+
+// M := [[0, 1], [1, 0]] * M
+procedure GcdMatSwap(var M: TGcdMat);
+begin
+  M.m00.swap(M.m10);
+  M.m01.swap(M.m11);
+  M.ident := false;
+end;
+
+// half-gcd: reduce (aL, bL), aL >= bL, with exact Euclid steps until bL fits
+// target limbs; with track on, M accumulates so (aL', bL') = M * (aL, bL).
+// the recursion computes a step matrix from the top limbs alone and applies
+// it to the full pair - the matrix is unimodular, so the gcd survives no
+// matter what, and a result that goes negative or stalls (possible only at
+// the truncation margin) is discarded for one exact base step instead
+procedure GcdReduce(var aL, bL: TLimbs; target: SizeInt; track: boolean; var M: TGcdMat);
+const
+  GCD_BASE_LIMBS = 48; // below this the word window carries the whole load
+  GCD_GUARD = 2;       // truncation margin kept above the reduction target
+
+  procedure baseStep;
+  var
+    mA, mB, mC, mD: Int64;
+  begin
+    if LehmerWindow(aL, bL, mA, mB, mC, mD) then begin
+      var na := LSignedComb(mA, aL, mB, bL);
+      var nb := LSignedComb(mC, aL, mD, bL);
+      aL := na;
+      bL := nb;
+      if track then GcdMatWordMul(M, mA, mB, mC, mD);
+    end else begin
+      var q, r: TLimbs;
+      LDivMod(aL, bL, q, r);
+      aL := bL;
+      bL := r;
+      if track then begin
+        var qU: UBigInt;
+        qU.fLimbs := q;
+        GcdMatDivStep(M, qU);
+      end;
+    end;
+    if LCmp(aL, bL) < 0 then begin
+      SwapValues(aL, bL);
+      if track then GcdMatSwap(M);
+    end;
+  end;
+
+begin
+  while (Length(bL) > target) and (Length(bL) > 1) do begin
+    var n := Length(aL);
+    if (n <= GCD_BASE_LIMBS) or (n - target <= 8) then begin
+      baseStep;
+      continue;
+    end;
+    // cut the low half away and half-reduce the tops: each pass shrinks the
+    // pair towards the target with a half-sized recursive subproblem
+    var p := MinS(n div 2, target);
+    if p < 1 then p := 1;
+    if Length(bL) <= p + GCD_GUARD then begin
+      baseStep;
+      continue;
+    end;
+    var ah := LLimbShr(aL, p);
+    var bh := LLimbShr(bL, p);
+    var sub: TGcdMat;
+    GcdMatInit(sub);
+    GcdReduce(ah, bh, MaxS((Length(ah) + 1) div 2, target - p) + GCD_GUARD, true, sub);
+    if sub.ident then begin
+      baseStep;
+      continue;
+    end;
+    var av, bv: UBigInt;
+    av.fLimbs := aL;
+    bv.fLimbs := bL;
+    var a2 := sub.m00 * av + sub.m01 * bv;
+    var b2 := sub.m10 * av + sub.m11 * bv;
+    if a2.isNegative or b2.isNegative then begin
+      baseStep;
+      continue;
+    end;
+    var na := a2.magnitude.fLimbs;
+    var nb := b2.magnitude.fLimbs;
+    var swapped := LCmp(na, nb) < 0;
+    if swapped then SwapValues(na, nb);
+    if Length(nb) >= Length(bL) then begin
+      baseStep;
+      continue;
+    end;
+    aL := na;
+    bL := nb;
+    if track then begin
+      GcdMatMul(M, sub);
+      if swapped then GcdMatSwap(M);
+    end;
+  end;
+end;
+
 function UBigInt.gcd(const other: UBigInt): UBigInt;
 begin
   var aL := Copy(fLimbs);
   var bL := Copy(other.fLimbs);
   if LCmp(aL, bL) < 0 then SwapValues(aL, bL);
+  // subquadratic half-gcd reduction down to the Lehmer range
+  while Length(bL) > BigIntGcdDCThreshold do begin
+    var M: TGcdMat;
+    GcdMatInit(M);
+    var target := MaxS(BigIntGcdDCThreshold, MinS((Length(aL) + 1) div 2 + 1, Length(bL) - 1));
+    GcdReduce(aL, bL, target, false, M);
+  end;
   // Lehmer: run Euclid on the top 63 bits, apply the resulting 2x2 matrix to
   // the full numbers with single-limb rows, fall back to one big division
   // whenever the word view cannot certify a quotient
   while Length(bL) > 1 do begin
-    var shs := SizeInt(LBitLen(aL)) - 63;
-    if shs < 0 then shs := 0;
-    var x := Int64(LExtract64(aL, LongWord(shs)));
-    var y := Int64(LExtract64(bL, LongWord(shs)));
-    var mA: Int64 := 1;
-    var mB: Int64 := 0;
-    var mC: Int64 := 0;
-    var mD: Int64 := 1;
-    while (y + mC > 0) and (y + mD > 0) do begin
-      var q := (x + mA) div (y + mC);
-      if (q <> (x + mB) div (y + mD)) or (q > $7FFFFFFF) then break;
-      var t1 := mA - q * mC;
-      var t2 := mB - q * mD;
-      mA := mC;
-      mB := mD;
-      mC := t1;
-      mD := t2;
-      var t := x - q * y;
-      x := y;
-      y := t;
-      if (System.Abs(mC) > $40000000) or (System.Abs(mD) > $40000000) then break;
-    end;
-    if mB = 0 then begin
+    var mA, mB, mC, mD: Int64;
+    if not LehmerWindow(aL, bL, mA, mB, mC, mD) then begin
       // no certified quotient in the top words: one full division step
       var q, r: TLimbs;
       LDivMod(aL, bL, q, r);
