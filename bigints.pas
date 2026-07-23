@@ -71,7 +71,7 @@ const
   // values up to this many limbs (256 bits) live inline in the record with no
   // heap allocation; larger ones spill into a refcounted block. tunable
   {$ifdef BIGINT_LIMB64}
-  BIGINT_INLINE_LIMBS = 4;
+  BIGINT_INLINE_LIMBS = 6;
   {$else}
   BIGINT_INLINE_LIMBS = 8;
   {$endif}
