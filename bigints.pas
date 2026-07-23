@@ -1068,6 +1068,11 @@ var
   // the Lehmer loop; exposed for tuning and testing
   BigIntGcdDCThreshold: integer = 1800;
 
+  // modulus limb count above which modPow's Montgomery products go through
+  // the fast multiply (a*b, then a low and a full product for the reduction)
+  // instead of the schoolbook interleaved REDC; exposed for tuning
+  BigIntMontMulThreshold: integer = 400;
+
   // generator used by random/randomBelow/randomRange/randomPrime
   BigIntRngAlgo: TBigIntRngAlgo = rngXoshiro256ss;
 
@@ -6035,6 +6040,90 @@ begin
   else Move(t[n], rp^, n * SizeOf(TLimb));
 end;
 
+// B^k as limbs
+function LBPow(k: SizeInt): TLimbs;
+begin
+  result := LNewZ(k + 1);
+  result[k] := 1;
+end;
+
+// -m^-1 mod B^n for odd m, by Newton lifting on the low limbs
+function MontInvFullNeg(const m: TLimbs; n: SizeInt): TLimbs;
+begin
+  // limb seed: m0^-1 mod B (see MontInv, without the negation)
+  var v := m[0];
+  for var i := 1 to 5 do v := v * (TLimb(2) - m[0] * v);
+  var cur: TLimbs := nil;
+  SetLength(cur, 1);
+  cur[0] := v;
+  var k: SizeInt := 1;
+  while k < n do begin
+    var k2 := MinS(2 * k, n);
+    // v := v * (2 - m*v) mod B^k2 doubles the correct low limbs
+    var u := LLimbLow(LMul(cur, LLimbLow(Copy(m, 0, MinS(k2, Length(m))), k2)), k2);
+    var w := LLimbLow(LSub(LAdd(LBPow(k2), [2]), u), k2);
+    cur := LLimbLow(LMul(cur, w), k2);
+    k := k2;
+  end;
+  result := LLimbLow(LSub(LBPow(n), cur), n);
+end;
+
+// Montgomery product r := a*b / B^n mod m through the fast multiply: one
+// full product, one low product against -m^-1, one full product to cancel
+// the low half; ~3 M(n) against the schoolbook's 2n^2
+function MontMulBig(const a, b, m, mNeg: TLimbs; n: SizeInt): TLimbs;
+begin
+  var t := LMul(a, b);
+  var u := LLimbLow(LMul(LLimbLow(t, n), mNeg), n);
+  var r := LLimbShr(LAdd(t, LMul(u, m)), n);
+  if LCmp(r, m) >= 0 then r := LSub(r, m);
+  result := r;
+end;
+
+// squaring variant, saves the forward transform of one operand
+function MontSqrBig(const a, m, mNeg: TLimbs; n: SizeInt): TLimbs;
+begin
+  var t := LSqr(a);
+  var u := LLimbLow(LMul(LLimbLow(t, n), mNeg), n);
+  var r := LLimbShr(LAdd(t, LMul(u, m)), n);
+  if LCmp(r, m) >= 0 then r := LSub(r, m);
+  result := r;
+end;
+
+// modular exponentiation for large odd m: the same fixed-window ladder as
+// UMontModPow below, with every Montgomery product going through the fast
+// multiply instead of the schoolbook REDC loop
+function UMontModPowBig(const base, e, m: UBigInt): UBigInt;
+var
+  q, rr, bred, baseM, acc: TLimbs;
+  table: array of TLimbs;
+begin
+  var n := m.fLen;
+  var mLimbs := m.fLimbs;
+  var eLimbs := e.fLimbs;
+  var mNeg := MontInvFullNeg(mLimbs, n);
+  // base*R mod m
+  LDivMod(base.fLimbs, mLimbs, q, rr);
+  bred := LShl(rr, LongWord(n) * LIMB_BITS);
+  LDivMod(bred, mLimbs, q, baseM);
+  var ebits := e.bitLength;
+  var k := if ebits >= 1024 then 6 else if ebits >= 256 then 5 else if ebits >= 64 then 4 else if ebits >= 16 then 3 else if ebits >= 4 then 2 else 1;
+  SetLength(table, 1 shl k);
+  table[1] := baseM;
+  for var j := 2 to (1 shl k) - 1 do table[j] := MontMulBig(table[j - 1], baseM, mLimbs, mNeg, n);
+  var chunks := (SizeInt(ebits) + k - 1) div k;
+  acc := Copy(table[LGetBits(eLimbs, LongWord((chunks - 1) * k), k)]);
+  for var c := chunks - 2 downto 0 do begin
+    for var s := 1 to k do acc := MontSqrBig(acc, mLimbs, mNeg, n);
+    var d := LGetBits(eLimbs, LongWord(c * k), k);
+    if d <> 0 then acc := MontMulBig(acc, table[d], mLimbs, mNeg, n);
+  end;
+  // back out of Montgomery form via a multiply by plain 1
+  acc := MontMulBig(acc, [1], mLimbs, mNeg, n);
+  LNorm(acc);
+  result.fLimbs := acc;
+end;
+
 // modular exponentiation for odd m: Montgomery form with a fixed k-bit window
 function UMontModPow(const base, e, m: UBigInt): UBigInt;
 var
@@ -6042,6 +6131,7 @@ var
   table: array of TLimbs;
 begin
   var n := m.fLen;
+  if n >= BigIntMontMulThreshold then exit(UMontModPowBig(base, e, m));
   // materialize the modulus and exponent limbs once; MontMul/LGetBits run in a
   // loop and would otherwise rebuild these arrays on every step
   var mLimbs := m.fLimbs;
