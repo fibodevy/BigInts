@@ -16,8 +16,8 @@ Arbitrary precision integers, decimals and rationals for Pascal in a single self
 - full operator coverage: `+ - * div mod / ** shl shr and or xor not`, all comparisons, `inc`/`dec`, compound assignments (`+=`, `*=`, ...), unary `+`/`-`
 - mixed expressions with plain integers on either side, implicit conversions from `Int64`/`QWord`/string, explicit casts in both directions (`Double` included; integer casts never round through floating point)
 - literals of any size with `_` separators and `$ 0x % 0b & 0o` prefixes; parsing and formatting in every base 2..36
-- multiplication: schoolbook, Karatsuba and Toom-3, picked by tunable thresholds, with dedicated squaring paths
-- division: Knuth algorithm D, plus divide-and-conquer base conversion for long numbers
+- multiplication: schoolbook, Karatsuba, Toom-3, Toom-4 and an exact number-theoretic transform, picked by tunable thresholds, with dedicated squaring paths
+- division: Knuth algorithm D, then recursive Burnikel-Ziegler at multiply speed for large operands, plus divide-and-conquer base conversion for long numbers
 - modular arithmetic: Montgomery `modPow` (plus reusable `TModRing` / constant-time `TModRingSec` contexts), `modInverse`, `modSqrt` (Tonelli-Shanks), `sqrtModN`, `nthRootMod`, `crt`, `discreteLog`, `multiplicativeOrder`, `primitiveRoot`/`isPrimitiveRoot`, `binomialMod`, `lucasSequence`
 - primes: Miller-Rabin `isProbablePrime` (deterministic below 3.3e24), Baillie-PSW `isPrime`, `nextPrime`/`prevPrime`, `randomPrime`/`randomSafePrime`/`randomStrongPrime`, exact `primePi`/`primeCount`
 - factorization: trial division plus Pollard-Brent rho, exponents grouped into `(p, e)` tuples; the multiplicative functions `eulerPhi`, `carmichaelLambda`, `moebius`, `sigma`, `tau`, `divisors`, `radical` follow from it
