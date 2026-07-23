@@ -1121,6 +1121,46 @@ begin
   BigIntToom4Threshold := savedT4;
 end;
 
+procedure testNtt;
+begin
+  section('NTT vs Toom/schoolbook cross-check');
+  var savedN := BigIntNttThreshold;
+  // threshold 8 puts every operand below at 4x it, so the force branch of
+  // NttUse takes the NTT path regardless of the sawtooth fill gate
+  for var i := 1 to 40 do begin
+    var a := randU(2600 + Random(90000));
+    var b := randU(2600 + Random(90000));
+    BigIntNttThreshold := 8;
+    var pn := a * b;
+    var sn := a.sqr;
+    BigIntNttThreshold := 1000000000;
+    check(pn = a * b, 'ntt mul = toom mul');
+    check(sn = a.sqr, 'ntt sqr = toom sqr');
+    BigIntNttThreshold := savedN;
+  end;
+  // several transform lengths and carry-maximal patterns
+  for var bits in [40000, 65536, 65537, 131072, 200003] do begin
+    var ones := UBigInt.pow2(bits) - 1;
+    BigIntNttThreshold := 8;
+    var po := ones * ones;
+    var so := ones.sqr;
+    BigIntNttThreshold := 1000000000;
+    check(po = ones * ones, 'all-ones ntt mul');
+    check(so = po, 'all-ones ntt sqr');
+    BigIntNttThreshold := savedN;
+  end;
+  // unbalanced within the 2x gate
+  for var i := 1 to 20 do begin
+    var a := randU(60000 + Random(40000));
+    var b := randU(32000 + Random(20000));
+    BigIntNttThreshold := 8;
+    var pn := a * b;
+    BigIntNttThreshold := 1000000000;
+    check(pn = a * b, 'unbalanced ntt mul');
+    BigIntNttThreshold := savedN;
+  end;
+end;
+
 procedure testStressChain;
 begin
   section('stress: long random operator chains vs Int64 oracle');
@@ -2839,6 +2879,7 @@ begin
   testKaratsuba;
   testToom3;
   testToom4;
+  testNtt;
   testStressChain;
   testStressStrings;
 

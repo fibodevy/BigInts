@@ -1047,6 +1047,12 @@ var
   // Toom-3 competitive much longer, so the switch sits high there
   BigIntToom4Threshold: integer = {$ifdef BIGINT_ASM} 12000 {$else} 2600 {$endif};
 
+  // limb count above which balanced multiplication and squaring may leave the
+  // Toom family for the exact single-prime NTT; exposed for tuning and testing.
+  // in the band up to 4x this the switch also needs a well-filled transform
+  // (NttUse), above it the NTT wins outright
+  BigIntNttThreshold: integer = {$ifdef BIGINT_ASM} 30000 {$else} 16000 {$endif};
+
   // generator used by random/randomBelow/randomRange/randomPrime
   BigIntRngAlgo: TBigIntRngAlgo = rngXoshiro256ss;
 
@@ -2653,6 +2659,7 @@ function LShl(const a: TLimbs; n: LongWord): TLimbs; forward;
 function LShr(const a: TLimbs; n: LongWord): TLimbs; forward;
 function LDivModW(const a: TLimbs; w: TLimb; out rem: TLimb): TLimbs; forward;
 function LMulW(const a: TLimbs; w: TLimb): TLimbs; forward;
+function LBitLenP(p: PLimb; len: SizeInt): LongWord; forward;
 
 // normalized copy of a[start..start+count-1] out of a (ptr, len) view
 function LSliceP(pa: PLimb; la, start, count: SizeInt): TLimbs;
@@ -2924,11 +2931,549 @@ begin
   result := res;
 end;
 
+// ---------------------------------------------------------------------------
+// NTT multiplication: number-theoretic transform over one 62-bit prime
+// ---------------------------------------------------------------------------
+
+// the operands split into b-bit coefficients and multiply as polynomials via
+// a radix-2 NTT mod p = 29*2^57 + 1 (transforms up to 2^57 points). b adapts
+// per size so the largest convolution coefficient n*(2^b-1)^2 stays below p,
+// which keeps the whole pipeline exact - no rounding anywhere. twiddles live
+// in the Montgomery domain, data stays plain, so every butterfly product is
+// one REDC; the caches below are single-threaded like the base-10 tables
+
+{$ifndef BIGINT_INT128}
+// portable 64x64 -> 128 product (independent of the limb width)
+procedure Mul64x64(a, b: QWord; out hi, lo: QWord);
+begin
+  var a0 := a and $FFFFFFFF;
+  var a1 := a shr 32;
+  var b0 := b and $FFFFFFFF;
+  var b1 := b shr 32;
+  var p00 := a0 * b0;
+  var p10 := a1 * b0 + (p00 shr 32);
+  var p01 := a0 * b1 + (p10 and $FFFFFFFF);
+  hi := a1 * b1 + (p10 shr 32) + (p01 shr 32);
+  lo := (p01 shl 32) or (p00 and $FFFFFFFF);
+end;
+{$endif}
+
+const
+  NTT_P = QWord(4179340454199820289); // 29*2^57 + 1
+
+var
+  NttReady: boolean = false;
+  NttPInv: QWord = 0; // -p^-1 mod 2^64
+  NttR: QWord = 0;    // 2^64 mod p, the Montgomery one
+  NttR2: QWord = 0;   // (2^64)^2 mod p
+  NttG: QWord = 0;    // generator of the multiplicative group
+  NttTabN: SizeInt = 0;
+  // per-block zetas in heap order: entry k (1..NttTabN-1) is the root that
+  // splits subtree k of the transform's CRT tree, so every stage reads its
+  // zetas sequentially and a smaller transform just reads the prefix. plain
+  // values on builds with a native 128-bit type (paired with the Shoup
+  // companions below), the Montgomery form elsewhere
+  NttWF, NttWI: array of QWord;
+  {$ifdef BIGINT_INT128}
+  NttWS, NttWIS: array of QWord; // floor(z * 2^64 / p) for the Shoup product
+  NttPN: QWord = 0; // p shl 2, top bit set, for the Shoup builder division
+  NttVN: QWord = 0; // Moller-Granlund reciprocal of NttPN
+  {$endif}
+
+// Montgomery product a * b / 2^64 mod p; for a plain operand and a Montgomery
+// one the result is the plain product
+function NttMulMod(a, b: QWord): QWord; inline;
+{$ifdef BIGINT_INT128}
+begin
+  var t := UInt128(a) * b;
+  var m := QWord(t) * NttPInv;
+  var r := QWord((t + UInt128(m) * NTT_P) shr 64);
+  result := if r >= NTT_P then r - NTT_P else r;
+end;
+{$else}
+begin
+  Mul64x64(a, b, var hi, var lo);
+  var m := lo * NttPInv;
+  Mul64x64(m, NTT_P, var h2, var l2);
+  // lo + l2 wraps to zero exactly, so only its carry survives
+  var r := hi + h2 + QWord(ord(lo <> 0));
+  result := if r >= NTT_P then r - NTT_P else r;
+end;
+{$endif}
+
+// setup-only modular product by double-and-add, needs no Montgomery constants
+function NttSlowMul(a, b: QWord): QWord;
+begin
+  result := 0;
+  while b > 0 do begin
+    if b and 1 = 1 then begin
+      result := result + a;
+      if result >= NTT_P then result := result - NTT_P;
+    end;
+    a := a + a;
+    if a >= NTT_P then a := a - NTT_P;
+    b := b shr 1;
+  end;
+end;
+
+function NttPowMod(b, e: QWord): QWord;
+begin
+  var acc := NttR;
+  var bm := NttMulMod(b, NttR2);
+  while e > 0 do begin
+    if e and 1 = 1 then acc := NttMulMod(acc, bm);
+    bm := NttMulMod(bm, bm);
+    e := e shr 1;
+  end;
+  result := NttMulMod(acc, 1);
+end;
+
+procedure NttInitOnce;
+begin
+  if NttReady then exit;
+  // p^-1 mod 2^64 by Newton doubling, negated (see MontInv)
+  var inv := NTT_P;
+  for var i := 1 to 5 do inv := inv * (QWord(2) - NTT_P * inv);
+  NttPInv := QWord(0) - inv;
+  // 2^64 mod p; spelled without a negation so constant folding stays unsigned
+  NttR := QWord(High(QWord) - NTT_P + 1) mod NTT_P;
+  NttR2 := NttSlowMul(NttR, NttR);
+  // p-1 = 2^57 * 29: a generator fails both cofactor power tests
+  var g: QWord := 3;
+  while (NttPowMod(g, (NTT_P - 1) shr 1) = 1) or (NttPowMod(g, (NTT_P - 1) div 29) = 1) do g := g + 2;
+  NttG := g;
+  {$ifdef BIGINT_INT128}
+  NttPN := NTT_P shl 2;
+  NttVN := QWord((not UInt128(0)) div NttPN - (UInt128(1) shl 64));
+  {$endif}
+  NttReady := true;
+end;
+
+{$ifdef BIGINT_INT128}
+// floor(x * 2^64 / p) for x < p, the Shoup companion of a twiddle; a 2/1
+// division by the normalized p shl 2 with the precomputed reciprocal
+// (Moller-Granlund), far cheaper than a generic 128-by-64 division
+function NttShoup(x: QWord): QWord;
+begin
+  var u1 := x shl 2;
+  var q := UInt128(NttVN) * u1 + (UInt128(u1) shl 64);
+  var qh := QWord(q shr 64) + 1;
+  var ql := QWord(q);
+  var r := QWord(0) - qh * NttPN;
+  if r > ql then begin
+    qh := qh - 1;
+    r := r + NttPN;
+  end;
+  if r >= NttPN then qh := qh + 1;
+  result := qh;
+end;
+{$endif}
+
+// grow the zeta tables to n points. level d (blocks k = 2^d..2^(d+1)-1) holds
+// the (2^(d+1))-th roots of unity in bit-reversed order: stepping the natural
+// powers and scattering to k = cnt + brv(i) makes entry k the exact splitting
+// root of x^(2len) - z^2 at heap node k
+procedure NttEnsureTables(n: SizeInt);
+begin
+  if n <= NttTabN then exit;
+  SetLength(NttWF, n);
+  SetLength(NttWI, n);
+  {$ifdef BIGINT_INT128}
+  SetLength(NttWS, n);
+  SetLength(NttWIS, n);
+  {$endif}
+  var cnt: SizeInt := 1;
+  while cnt < n do begin
+    var wl := NttPowMod(NttG, (NTT_P - 1) div (QWord(cnt) * 2));
+    var wli := NttPowMod(wl, NTT_P - 2);
+    var wlm := NttMulMod(wl, NttR2);
+    var wlim := NttMulMod(wli, NttR2);
+    // a plain accumulator times a Montgomery factor stays plain; the non-128
+    // build steps Montgomery-form values so the butterfly REDC yields plain
+    // products
+    {$ifdef BIGINT_INT128}
+    var curF: QWord := 1;
+    var curI: QWord := 1;
+    {$else}
+    var curF := NttR;
+    var curI := NttR;
+    {$endif}
+    var rev: SizeInt := 0;
+    for var i := 0 to cnt - 1 do begin
+      NttWF[cnt + rev] := curF;
+      NttWI[cnt + rev] := curI;
+      {$ifdef BIGINT_INT128}
+      NttWS[cnt + rev] := NttShoup(curF);
+      NttWIS[cnt + rev] := NttShoup(curI);
+      {$endif}
+      curF := NttMulMod(curF, wlm);
+      curI := NttMulMod(curI, wlim);
+      // reverse-increment enumerates brv(i) without a bit-reversal pass
+      var bit := cnt shr 1;
+      while (rev and bit) <> 0 do begin
+        rev := rev xor bit;
+        bit := bit shr 1;
+      end;
+      rev := rev or bit;
+    end;
+    cnt := cnt shl 1;
+  end;
+  NttTabN := n;
+end;
+
+// zeta tables above this transform length are 16-32 bytes per point (2-4 GB
+// at 2^27), too big to keep cached between calls
+const
+  NTT_TAB_CACHE_MAX = SizeInt(1) shl 20;
+
+// free oversized twiddle tables after a transform; cached ones stay
+procedure NttReleaseTables;
+begin
+  if NttTabN <= NTT_TAB_CACHE_MAX then exit;
+  NttWF := nil;
+  NttWI := nil;
+  {$ifdef BIGINT_INT128}
+  NttWS := nil;
+  NttWIS := nil;
+  {$endif}
+  NttTabN := 0;
+end;
+
+// the zeta products below are written out inline: with a native 128-bit type
+// they use the Shoup trick (q = high(x * z'), t = x*z - q*p), elsewhere a
+// hand-inlined Montgomery REDC over Mul64x64. both leave results in [0,2p)
+// for any 64-bit input, and the butterflies keep values reduced only lazily
+// (Harvey): the forward invariant is [0,4p), the inverse [0,2p), with masked
+// subtractions instead of data-dependent branches - random data makes such
+// branches mispredict half the time, which used to dominate the transform
+const
+  NTT_2P = QWord(2) * NTT_P;
+
+// block k of the CRT tree splits with zeta[k] into blocks 2k and 2k+1, so a
+// transform decomposes into independent half transforms at any point; the
+// recursive drivers below use that to keep sub-cache blocks resident instead
+// of streaming the whole array once per stage, and the heap-ordered table
+// makes every stage's zeta loads sequential (one zeta per block, not one
+// twiddle per element)
+const
+  NTT_BLOCK_POINTS = SizeInt(1) shl 15; // 256 KB of points, cache resident
+
+// iterative forward transform of block k (n points): CT butterfly
+// (u, x) -> (u + z*x, u - z*x), natural in, bit-reversed out
+procedure NttFwdBlock(a: PQWord; n: SizeInt; k: SizeInt);
+begin
+  var len := n shr 1;
+  var kb := k;
+  while len >= 1 do begin
+    var kk := kb;
+    var i := 0;
+    while i < n do begin
+      var w := NttWF[kk];
+      {$ifdef BIGINT_INT128}
+      var ws := NttWS[kk];
+      {$endif}
+      inc(kk);
+      for var j := i to i + len - 1 do begin
+        var x := a[j + len];
+        {$ifdef BIGINT_INT128}
+        var q := QWord((UInt128(x) * ws) shr 64);
+        var t := x * w - q * NTT_P;
+        {$else}
+        Mul64x64(x, w, var hi, var lo);
+        var m := lo * NttPInv;
+        Mul64x64(m, NTT_P, var h2, var l2);
+        var t := hi + h2 + QWord(ord(lo <> 0));
+        {$endif}
+        var u := a[j];
+        u := u - (NTT_2P and (QWord(0) - QWord(ord(u >= NTT_2P))));
+        a[j] := u + t;
+        a[j + len] := u + NTT_2P - t;
+      end;
+      i := i + 2 * len;
+    end;
+    len := len shr 1;
+    kb := kb shl 1;
+  end;
+end;
+
+// forward transform of block k: one streaming stage with a single zeta in a
+// register, then two independent cache-sized halves
+procedure NttFwdRec(a: PQWord; n: SizeInt; k: SizeInt);
+begin
+  if n <= NTT_BLOCK_POINTS then begin
+    NttFwdBlock(a, n, k);
+    exit;
+  end;
+  var len := n shr 1;
+  var w := NttWF[k];
+  {$ifdef BIGINT_INT128}
+  var ws := NttWS[k];
+  {$endif}
+  for var j := 0 to len - 1 do begin
+    var x := a[j + len];
+    {$ifdef BIGINT_INT128}
+    var q := QWord((UInt128(x) * ws) shr 64);
+    var t := x * w - q * NTT_P;
+    {$else}
+    Mul64x64(x, w, var hi, var lo);
+    var m := lo * NttPInv;
+    Mul64x64(m, NTT_P, var h2, var l2);
+    var t := hi + h2 + QWord(ord(lo <> 0));
+    {$endif}
+    var u := a[j];
+    u := u - (NTT_2P and (QWord(0) - QWord(ord(u >= NTT_2P))));
+    a[j] := u + t;
+    a[j + len] := u + NTT_2P - t;
+  end;
+  NttFwdRec(a, len, 2 * k);
+  NttFwdRec(@a[len], len, 2 * k + 1);
+end;
+
+// forward transform: values in [0,4p) throughout
+procedure NttFwd(a: PQWord; n: SizeInt);
+begin
+  NttFwdRec(a, n, 1);
+end;
+
+// iterative inverse transform of block k (n points): GS butterfly
+// (u, v) -> (u + v, (u - v)*zinv), bit-reversed in, natural out
+procedure NttInvBlock(a: PQWord; n: SizeInt; k: SizeInt);
+begin
+  var len := 1;
+  while len < n do begin
+    var kk := k * (n div (2 * len));
+    var i := 0;
+    while i < n do begin
+      var w := NttWI[kk];
+      {$ifdef BIGINT_INT128}
+      var ws := NttWIS[kk];
+      {$endif}
+      inc(kk);
+      for var j := i to i + len - 1 do begin
+        var u := a[j];
+        var v := a[j + len];
+        var s := u + v;
+        s := s - (NTT_2P and (QWord(0) - QWord(ord(s >= NTT_2P))));
+        a[j] := s;
+        var d := u + NTT_2P - v; // (0, 4p)
+        {$ifdef BIGINT_INT128}
+        var q := QWord((UInt128(d) * ws) shr 64);
+        var t := d * w - q * NTT_P;
+        {$else}
+        Mul64x64(d, w, var hi, var lo);
+        var m := lo * NttPInv;
+        Mul64x64(m, NTT_P, var h2, var l2);
+        var t := hi + h2 + QWord(ord(lo <> 0));
+        {$endif}
+        a[j + len] := t;
+      end;
+      i := i + 2 * len;
+    end;
+    len := len shl 1;
+  end;
+end;
+
+// inverse transform of block k: two independent cache-sized halves, then one
+// streaming merge stage with a single zeta in a register
+procedure NttInvRec(a: PQWord; n: SizeInt; k: SizeInt);
+begin
+  if n <= NTT_BLOCK_POINTS then begin
+    NttInvBlock(a, n, k);
+    exit;
+  end;
+  var len := n shr 1;
+  NttInvRec(a, len, 2 * k);
+  NttInvRec(@a[len], len, 2 * k + 1);
+  var w := NttWI[k];
+  {$ifdef BIGINT_INT128}
+  var ws := NttWIS[k];
+  {$endif}
+  for var j := 0 to len - 1 do begin
+    var u := a[j];
+    var v := a[j + len];
+    var s := u + v;
+    s := s - (NTT_2P and (QWord(0) - QWord(ord(s >= NTT_2P))));
+    a[j] := s;
+    var d := u + NTT_2P - v;
+    {$ifdef BIGINT_INT128}
+    var q := QWord((UInt128(d) * ws) shr 64);
+    var t := d * w - q * NTT_P;
+    {$else}
+    Mul64x64(d, w, var hi, var lo);
+    var m := lo * NttPInv;
+    Mul64x64(m, NTT_P, var h2, var l2);
+    var t := hi + h2 + QWord(ord(lo <> 0));
+    {$endif}
+    a[j + len] := t;
+  end;
+end;
+
+// inverse transform: values in [0,2p) throughout; the caller's final scaling
+// pass reduces exactly (and folds in the 1/n factor)
+procedure NttInv(a: PQWord; n: SizeInt);
+begin
+  NttInvRec(a, n, 1);
+end;
+
+// largest coefficient width so the convolution stays below p: n*(2^b-1)^2 <
+// 2^(log2(n) + 2b) <= 2^61 < p; 0 when even 8-bit coefficients cannot fit
+function NttChooseB(abits, bbits: Int64): integer;
+begin
+  for var b := 30 downto 8 do begin
+    var coeffs := (abits + b - 1) div b + (bbits + b - 1) div b;
+    var log := 0;
+    var n: Int64 := 1;
+    while n < coeffs do begin
+      n := n shl 1;
+      inc(log);
+    end;
+    if log + 2 * b <= 61 then exit(b);
+  end;
+  result := 0;
+end;
+
+// whether the single-prime NTT should handle these operand sizes. the
+// transform length is the next power of two, so just past a boundary it wastes
+// up to 2x - the classic FFT sawtooth. below the force multiple that waste can
+// lose to Toom, so the mid band only takes NTT when the transform fills well;
+// above it even a half-empty transform wins
+function NttUse(la, lb: SizeInt): boolean;
+begin
+  var abits := Int64(la) * LIMB_BITS;
+  var bbits := Int64(lb) * LIMB_BITS;
+  var b := NttChooseB(abits, bbits);
+  if b = 0 then exit(false);
+  var mn := MinS(la, lb);
+  if mn < BigIntNttThreshold then exit(false);
+  if mn >= Int64(BigIntNttThreshold) * 4 then exit(true);
+  var need := SizeInt((abits + b - 1) div b + (bbits + b - 1) div b);
+  var n: SizeInt := 1;
+  while n < need do n := n shl 1;
+  result := need * 4 >= n * 3; // fill >= 0.75, the good half of the sawtooth
+end;
+
+// split (p, len) into b-bit coefficients, zero-padding the transform tail
+procedure NttPack(p: PLimb; len: SizeInt; b: integer; a: PQWord; na, n: SizeInt);
+begin
+  var mask := (QWord(1) shl b) - 1;
+  for var i := 0 to na - 1 do begin
+    var bit := QWord(i) * LongWord(b);
+    var li := SizeInt(bit shr LIMB_SHIFT);
+    var off := integer(bit and LIMB_MASK);
+    var v: QWord := QWord(p[li]) shr off;
+    if (off + b > LIMB_BITS) and (li + 1 < len) then v := v or (QWord(p[li + 1]) shl (LIMB_BITS - off));
+    a[i] := v and mask;
+  end;
+  for var i := na to n - 1 do a[i] := 0;
+end;
+
+// reassemble n coefficients (each below 2^62) spaced b bits apart; a sliding
+// 128-bit accumulator emits the low b bits per step - they are final, later
+// coefficients cannot reach below the next window
+function NttUnpack(a: PQWord; n: SizeInt; b: integer; outLimbs: SizeInt): TLimbs;
+
+  procedure emit(w: QWord; bitPos: QWord; res: PLimb; lim: SizeInt);
+  begin
+    var li := SizeInt(bitPos shr LIMB_SHIFT);
+    var off := integer(bitPos and LIMB_MASK);
+    if li >= lim then exit;
+    res[li] := res[li] or TLimb(w shl off);
+    if (off + b > LIMB_BITS) and (li + 1 < lim) then res[li + 1] := res[li + 1] or TLimb(w shr (LIMB_BITS - off));
+  end;
+
+begin
+  result := LNewZ(outLimbs);
+  var accLo: QWord := 0;
+  var accHi: QWord := 0;
+  var bitPos: QWord := 0;
+  var mask := (QWord(1) shl b) - 1;
+  for var i := 0 to n - 1 do begin
+    accLo := accLo + a[i];
+    if accLo < a[i] then inc(accHi);
+    emit(accLo and mask, bitPos, PLimb(Pointer(result)), outLimbs);
+    accLo := (accLo shr b) or (accHi shl (64 - b));
+    accHi := accHi shr b;
+    bitPos := bitPos + LongWord(b);
+  end;
+  while (accLo or accHi) <> 0 do begin
+    emit(accLo and mask, bitPos, PLimb(Pointer(result)), outLimbs);
+    accLo := (accLo shr b) or (accHi shl (64 - b));
+    accHi := accHi shr b;
+    bitPos := bitPos + LongWord(b);
+  end;
+  LNorm(result);
+end;
+
+function LMulNttP(pa: PLimb; la: SizeInt; pb: PLimb; lb: SizeInt): TLimbs;
+var
+  fa, fb: array of QWord;
+begin
+  var abits := Int64(LBitLenP(pa, la));
+  var bbits := Int64(LBitLenP(pb, lb));
+  var b := NttChooseB(abits, bbits);
+  var na := SizeInt((abits + b - 1) div b);
+  var nb := SizeInt((bbits + b - 1) div b);
+  var n: SizeInt := 1;
+  while n < na + nb do n := n shl 1;
+  NttInitOnce;
+  NttEnsureTables(n);
+  SetLength(fa, n);
+  SetLength(fb, n);
+  NttPack(pa, la, b, @fa[0], na, n);
+  NttPack(pb, lb, b, @fb[0], nb, n);
+  NttFwd(@fa[0], n);
+  NttFwd(@fb[0], n);
+  // the forward transforms leave values in [0,4p); reduce below 2p so the
+  // pointwise Montgomery product cannot overflow 128 bits
+  for var i := 0 to n - 1 do begin
+    var x := fa[i];
+    x := x - (NTT_2P and (QWord(0) - QWord(ord(x >= NTT_2P))));
+    var y := fb[i];
+    y := y - (NTT_2P and (QWord(0) - QWord(ord(y >= NTT_2P))));
+    fa[i] := NttMulMod(x, y);
+  end;
+  NttInv(@fa[0], n);
+  // one pass folds 1/n and the Montgomery factor left by the pointwise step
+  var k := NttMulMod(NttMulMod(NttPowMod(QWord(n), NTT_P - 2), NttR2), NttR2);
+  for var i := 0 to na + nb - 2 do fa[i] := NttMulMod(fa[i], k);
+  result := NttUnpack(@fa[0], na + nb - 1, b, la + lb);
+  NttReleaseTables;
+end;
+
+function LSqrNttP(pa: PLimb; la: SizeInt): TLimbs;
+var
+  fa: array of QWord;
+begin
+  var abits := Int64(LBitLenP(pa, la));
+  var b := NttChooseB(abits, abits);
+  var na := SizeInt((abits + b - 1) div b);
+  var n: SizeInt := 1;
+  while n < 2 * na do n := n shl 1;
+  NttInitOnce;
+  NttEnsureTables(n);
+  SetLength(fa, n);
+  NttPack(pa, la, b, @fa[0], na, n);
+  NttFwd(@fa[0], n);
+  // the forward transform leaves values in [0,4p); reduce below 2p so the
+  // pointwise Montgomery product cannot overflow 128 bits
+  for var i := 0 to n - 1 do begin
+    var x := fa[i];
+    x := x - (NTT_2P and (QWord(0) - QWord(ord(x >= NTT_2P))));
+    fa[i] := NttMulMod(x, x);
+  end;
+  NttInv(@fa[0], n);
+  var k := NttMulMod(NttMulMod(NttPowMod(QWord(n), NTT_P - 2), NttR2), NttR2);
+  for var i := 0 to 2 * na - 2 do fa[i] := NttMulMod(fa[i], k);
+  result := NttUnpack(@fa[0], 2 * na - 1, b, 2 * la);
+  NttReleaseTables;
+end;
+
 function LMulP(pa: PLimb; la: SizeInt; pb: PLimb; lb: SizeInt): TLimbs;
 begin
   var mn := MinS(la, lb);
   if mn < BigIntKaratsubaThreshold then exit(LMulBasicP(pa, la, pb, lb));
   if MaxS(la, lb) < 2 * mn then begin
+    if NttUse(la, lb) then exit(LMulNttP(pa, la, pb, lb));
     if mn >= BigIntToom4Threshold then exit(LMulToom4P(pa, la, pb, lb));
     if mn >= BigIntToom3Threshold then exit(LMulToom3P(pa, la, pb, lb));
   end;
@@ -2943,6 +3488,7 @@ end;
 function LSqrP(pa: PLimb; la: SizeInt): TLimbs;
 begin
   if la < BigIntKaratsubaThreshold then exit(LSqrBasicP(pa, la));
+  if NttUse(la, la) then exit(LSqrNttP(pa, la));
   if la >= BigIntToom4Threshold then exit(LSqrToom4P(pa, la));
   if la >= BigIntToom3Threshold then exit(LSqrToom3P(pa, la));
   result := LSqrKaraP(pa, la);
@@ -6525,22 +7071,6 @@ begin
   xoshiroState[2] := xoshiroState[2] xor t;
   xoshiroState[3] := RotL64(xoshiroState[3], 45);
 end;
-
-{$ifndef BIGINT_INT128}
-// portable 64x64 -> 128 product (independent of the limb width)
-procedure Mul64x64(a, b: QWord; out hi, lo: QWord);
-begin
-  var a0 := a and $FFFFFFFF;
-  var a1 := a shr 32;
-  var b0 := b and $FFFFFFFF;
-  var b1 := b shr 32;
-  var p00 := a0 * b0;
-  var p10 := a1 * b0 + (p00 shr 32);
-  var p01 := a0 * b1 + (p10 and $FFFFFFFF);
-  hi := a1 * b1 + (p10 shr 32) + (p01 shr 32);
-  lo := (p01 shl 32) or (p00 and $FFFFFFFF);
-end;
-{$endif}
 
 // PCG XSL-RR 128/64 with the reference multiplier and stream
 function PcgNext: QWord;
