@@ -966,15 +966,16 @@ type
   // exponentiation with a secret exponent). the modulus width is fixed at
   // create: every value is padded to that many limbs and no operation
   // normalizes, branches on operand values, or exits early, so the running time
-  // and the memory-access pattern are independent of the secret data. this is
+  // and the memory-access pattern are independent of the limb contents. this is
   // the only type with constant-time arithmetic; UBigInt/BigInt add
   // constant-time equalsCT/compareCT and secureClear, but not arithmetic. the
   // multiply is schoolbook fixed-width (no Karatsuba): O(n^2) but every step is
   // data-independent. operands import through a fixed masked-copy loop and
   // scratch buffers are wiped before release. remaining boundary caveats: the
   // entry reduce of an unreduced base (toMont/modPow) is variable-time, and
-  // results return as normalized UBigInts whose representation length is that
-  // of the value itself - keep secrets reduced and secureClear values you drop.
+  // values pass the boundary as normalized UBigInts, so a handle's limb count
+  // (and the import reads over it) can reveal the value's magnitude at limb
+  // granularity - keep secrets reduced and secureClear values you drop.
   // share one ring per thread, not across
   TModRingSec = record
   private
@@ -5022,9 +5023,11 @@ begin
 end;
 
 // zero-extend a reduced value to the fixed ring width; the copy is a fixed
-// fN-limb loop with masked reads, so neither the loop shape nor the copy
-// length tracks the value's limb count. a value wider than the ring is misuse
-// (not a reduced operand) and raises off the constant-time path
+// fN-limb loop with masked reads, so the loop shape never depends on the limb
+// contents. the read addresses stop advancing at the value's stored limb
+// count, which reveals no more than the handle length already does (see the
+// type-level caveat). a value wider than the ring is misuse (not a reduced
+// operand) and raises off the constant-time path
 function TModRingSec.pad(const a: UBigInt): TBigIntLimbs;
 begin
   if a.fLen > fN then raise EBigIntError.Create('value exceeds ring width');
