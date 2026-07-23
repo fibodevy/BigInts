@@ -4320,13 +4320,14 @@ begin
   var q := LExtract64(fLimbs, LongWord(e));
   var limb := SizeInt(LongWord(e) shr LIMB_SHIFT);
   var off := integer(LongWord(e) and LIMB_MASK);
+  var p := dataPtr;
   var sticky := false;
   for var i := 0 to limb - 1 do
-    if fLimbs[i] <> 0 then begin
+    if p[i] <> 0 then begin
       sticky := true;
       break;
     end;
-  if (not sticky) and (off > 0) then sticky := fLimbs[limb] and ((TLimb(1) shl off) - 1) <> 0;
+  if (not sticky) and (off > 0) then sticky := p[limb] and ((TLimb(1) shl off) - 1) <> 0;
   if sticky then q := q or 1;
   result := Double(FltLdexp(Extended(q), e));
 end;
@@ -4524,7 +4525,8 @@ begin
   if width = 0 then exit(default(UBigInt));
   var n := SizeInt((QWord(width) + LIMB_MASK) shr LIMB_SHIFT);
   SetLength(res, n);
-  for var i := 0 to n - 1 do res[i] := if i < fLen then not fLimbs[i] else High(TLimb);
+  var p := dataPtr;
+  for var i := 0 to n - 1 do res[i] := if i < fLen then not p[i] else High(TLimb);
   // mask off bits above width
   var topBits := integer(width and LIMB_MASK);
   if topBits <> 0 then res[n - 1] := res[n - 1] and (High(TLimb) shr (LIMB_BITS - topBits));
@@ -5452,12 +5454,12 @@ begin
     var z := a.lowestSetBit;
     if z and 1 = 1 then begin
       // (2/m) = -1 exactly for m = 3, 5 (mod 8)
-      var m8 := m.fLimbs[0] and 7;
+      var m8 := m.dataPtr[0] and 7;
       if (m8 = 3) or (m8 = 5) then result := -result;
     end;
     a := a shr z;
     // both odd here: quadratic reciprocity
-    if (a.fLimbs[0] and 3 = 3) and (m.fLimbs[0] and 3 = 3) then result := -result;
+    if (a.dataPtr[0] and 3 = 3) and (m.dataPtr[0] and 3 = 3) then result := -result;
     a.swap(m);
     a := a mod m;
   end;
@@ -6177,7 +6179,8 @@ var
 begin
   var n := SizeInt((QWord(bitLength) + 7) shr 3);
   SetLength(res, n);
-  for var i := 0 to n - 1 do res[i] := byte(fLimbs[i shr BYTES_SHIFT] shr ((i and BYTES_MASK) * 8));
+  var p := dataPtr;
+  for var i := 0 to n - 1 do res[i] := byte(p[i shr BYTES_SHIFT] shr ((i and BYTES_MASK) * 8));
   result := res;
 end;
 
@@ -6187,7 +6190,8 @@ var
 begin
   var n := SizeInt((QWord(bitLength) + 7) shr 3);
   SetLength(res, n);
-  for var i := 0 to n - 1 do res[n - 1 - i] := byte(fLimbs[i shr BYTES_SHIFT] shr ((i and BYTES_MASK) * 8));
+  var p := dataPtr;
+  for var i := 0 to n - 1 do res[n - 1 - i] := byte(p[i shr BYTES_SHIFT] shr ((i and BYTES_MASK) * 8));
   result := res;
 end;
 
@@ -6240,10 +6244,11 @@ function UBigInt.hashCode: DWord;
 begin
   // FNV-1a over 32-bit chunks, identical result for either limb width
   result := 2166136261;
+  var p := dataPtr;
   for var i := 0 to fLen - 1 do begin
-    result := (result xor DWord(fLimbs[i])) * 16777619;
+    result := (result xor DWord(p[i])) * 16777619;
     {$if LIMB_BITS = 64}
-    result := (result xor DWord(fLimbs[i] shr 32)) * 16777619;
+    result := (result xor DWord(p[i] shr 32)) * 16777619;
     {$endif}
   end;
 end;
