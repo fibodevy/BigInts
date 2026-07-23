@@ -4477,9 +4477,11 @@ begin
     exit;
   end;
   if ArrUnshared(fArr) then begin
-    // in place; a shortened value keeps its (now oversized) array
+    // in place; a shortened value keeps its (now oversized) array unless it
+    // fits inline - the arithmetic fast paths assume spilled values are wide
     fArr[limb] := fArr[limb] and mask;
     while (fLen > 0) and (fArr[fLen - 1] = 0) do dec(fLen);
+    if fLen <= BIGINT_INLINE_LIMBS then PutInline(PLimb(Pointer(fArr)), fLen, @fInline[0], fArr, fLen);
     exit;
   end;
   var l := fLimbs;
@@ -4501,6 +4503,7 @@ begin
     if ArrUnshared(fArr) then begin
       fArr[limb] := fArr[limb] xor mask;
       while (fLen > 0) and (fArr[fLen - 1] = 0) do dec(fLen);
+      if fLen <= BIGINT_INLINE_LIMBS then PutInline(PLimb(Pointer(fArr)), fLen, @fInline[0], fArr, fLen);
       exit;
     end;
   end else if (fArr = nil) and (limb < BIGINT_INLINE_LIMBS) then begin
@@ -7832,6 +7835,7 @@ begin
     if ArrUnshared(fArr) then begin
       fArr[limb] := fArr[limb] and mask;
       while (fLen > 0) and (fArr[fLen - 1] = 0) do dec(fLen);
+      if fLen <= BIGINT_INLINE_LIMBS then PutInline(PLimb(Pointer(fArr)), fLen, @fInline[0], fArr, fLen);
       exit;
     end;
     var l := fLimbs;
@@ -7855,6 +7859,7 @@ begin
       if ArrUnshared(fArr) then begin
         fArr[limb] := fArr[limb] xor mask;
         while (fLen > 0) and (fArr[fLen - 1] = 0) do dec(fLen);
+        if fLen <= BIGINT_INLINE_LIMBS then PutInline(PLimb(Pointer(fArr)), fLen, @fInline[0], fArr, fLen);
         exit;
       end;
     end else if (fArr = nil) and (limb < BIGINT_INLINE_LIMBS) then begin

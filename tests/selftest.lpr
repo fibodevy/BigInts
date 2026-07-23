@@ -305,6 +305,28 @@ begin
   u.bits[77] := false;
   check(u = 1, 'bits[] clear');
 
+  // in-place clearBit/flipBit on a spilled value must restore the inline
+  // invariant, or the +/- Int64 fast paths wrap instead of raising
+  var sp := UBigInt.pow2(300);
+  sp.clearBit(300);
+  check(sp.isZero, 'clearBit shrinks spilled value to zero');
+  var raised := false;
+  try
+    sp := sp - 1;
+  except
+    on ERangeError do raised := true;
+  end;
+  check(raised, 'subtract below zero raises after spilled clearBit');
+  sp := UBigInt.pow2(300);
+  sp.flipBit(300);
+  raised := false;
+  try
+    sp := sp + (-1);
+  except
+    on ERangeError do raised := true;
+  end;
+  check(raised, 'negative add below zero raises after spilled flipBit');
+
   u := '0b101101';
   check(u.popCount = 4, 'popCount');
   check(u.bitLength = 6, 'bitLength');
