@@ -1042,6 +1042,11 @@ var
   // sits high there; below ~520 limbs Toom-3 is a net loss on the asm build
   BigIntToom3Threshold: integer = {$ifdef BIGINT_ASM} 700 {$else} 200 {$endif};
 
+  // limb count above which balanced multiplication and squaring switch from
+  // Toom-3 to Toom-4; exposed for tuning and testing. the asm kernels keep
+  // Toom-3 competitive much longer, so the switch sits high there
+  BigIntToom4Threshold: integer = {$ifdef BIGINT_ASM} 12000 {$else} 2600 {$endif};
+
   // generator used by random/randomBelow/randomRange/randomPrime
   BigIntRngAlgo: TBigIntRngAlgo = rngXoshiro256ss;
 
@@ -2647,6 +2652,7 @@ function LSqr(const a: TLimbs): TLimbs; forward;
 function LShl(const a: TLimbs; n: LongWord): TLimbs; forward;
 function LShr(const a: TLimbs; n: LongWord): TLimbs; forward;
 function LDivModW(const a: TLimbs; w: TLimb; out rem: TLimb): TLimbs; forward;
+function LMulW(const a: TLimbs; w: TLimb): TLimbs; forward;
 
 // normalized copy of a[start..start+count-1] out of a (ptr, len) view
 function LSliceP(pa: PLimb; la, start, count: SizeInt): TLimbs;
@@ -2710,6 +2716,12 @@ end;
 function DivExact3(const x: TLimbs): TLimbs;
 begin
   result := LDivModW(x, 3, _);
+end;
+
+// exact division by 5 for the Toom-4 interpolation
+function DivExact5(const x: TLimbs): TLimbs;
+begin
+  result := LDivModW(x, 5, _);
 end;
 
 // Toom-3: split into three k-limb parts, evaluate at 0, 1, -1, 2 and
@@ -2790,11 +2802,136 @@ begin
   result := res;
 end;
 
+// Toom-4: split into four k-limb parts, evaluate at 0, 1, -1, 2, -2, 3 and
+// infinity, recombine seven recursive products instead of sixteen
+function LMulToom4P(pa: PLimb; la: SizeInt; pb: PLimb; lb: SizeInt): TLimbs;
+var
+  res: TLimbs;
+begin
+  var k := (MaxS(la, lb) + 3) shr 2;
+  var a0 := LSliceP(pa, la, 0, k);
+  var a1 := LSliceP(pa, la, k, k);
+  var a2 := LSliceP(pa, la, 2 * k, k);
+  var a3 := LSliceP(pa, la, 3 * k, la);
+  var b0 := LSliceP(pb, lb, 0, k);
+  var b1 := LSliceP(pb, lb, k, k);
+  var b2 := LSliceP(pb, lb, 2 * k, k);
+  var b3 := LSliceP(pb, lb, 3 * k, lb);
+  // evaluations: even/odd splits share the sums, the -1/-2 points carry signs
+  var ae := LAdd(a0, a2);
+  var ao := LAdd(a1, a3);
+  var be := LAdd(b0, b2);
+  var bo := LAdd(b1, b3);
+  var ae2 := LAdd(a0, LShl(a2, 2));
+  var ao2 := LShl(LAdd(a1, LShl(a3, 2)), 1);
+  var be2 := LAdd(b0, LShl(b2, 2));
+  var bo2 := LShl(LAdd(b1, LShl(b3, 2)), 1);
+  var an1 := LCmp(ae, ao) < 0;
+  var bn1 := LCmp(be, bo) < 0;
+  var an2 := LCmp(ae2, ao2) < 0;
+  var bn2 := LCmp(be2, bo2) < 0;
+  var am1 := if an1 then LSub(ao, ae) else LSub(ae, ao);
+  var bm1 := if bn1 then LSub(bo, be) else LSub(be, bo);
+  var am2 := if an2 then LSub(ao2, ae2) else LSub(ae2, ao2);
+  var bm2 := if bn2 then LSub(bo2, be2) else LSub(be2, bo2);
+  var a3v := LAdd(a0, LMulW(LAdd(a1, LMulW(LAdd(a2, LMulW(a3, 3)), 3)), 3));
+  var b3v := LAdd(b0, LMulW(LAdd(b1, LMulW(LAdd(b2, LMulW(b3, 3)), 3)), 3));
+  // seven products
+  var v0 := LMul(a0, b0);
+  var v1 := LMul(LAdd(ae, ao), LAdd(be, bo));
+  var vm1 := LMul(am1, bm1);
+  var vm1Neg := an1 xor bn1;
+  var v2 := LMul(LAdd(ae2, ao2), LAdd(be2, bo2));
+  var vm2 := LMul(am2, bm2);
+  var vm2Neg := an2 xor bn2;
+  var v3 := LMul(a3v, b3v);
+  var vinf := LMul(a3, b3);
+  // interpolation; every value below is a nonnegative coefficient combination
+  var s1 := LShr(if vm1Neg then LSub(v1, vm1) else LAdd(v1, vm1), 1); // c0+c2+c4+c6
+  var s2 := LShr(if vm1Neg then LAdd(v1, vm1) else LSub(v1, vm1), 1); // c1+c3+c5
+  var s3 := LShr(if vm2Neg then LSub(v2, vm2) else LAdd(v2, vm2), 1); // c0+4c2+16c4+64c6
+  var s4 := LShr(if vm2Neg then LAdd(v2, vm2) else LSub(v2, vm2), 2); // c1+4c3+16c5
+  var e1 := LSub(LSub(s1, v0), vinf);                                 // c2+c4
+  var e2 := LShr(LSub(LSub(s3, v0), LShl(vinf, 6)), 2);               // c2+4c4
+  var c4 := DivExact3(LSub(e2, e1));
+  var c2 := LSub(e1, c4);
+  // strip the even part off the 3-point value, then peel the odd system
+  var t3 := DivExact3(LSub(v3, LAdd(LAdd(v0, LMulW(c2, 9)), LAdd(LMulW(c4, 81), LMulW(vinf, 729))))); // c1+9c3+81c5
+  var u1 := DivExact3(LSub(s4, s2));                                  // c3+5c5
+  var u2 := DivExact5(LSub(t3, s4));                                  // c3+13c5
+  var c5 := LShr(LSub(u2, u1), 3);
+  var c3 := LSub(u1, LMulW(c5, 5));
+  var c1 := LSub(s2, LAdd(c3, c5));
+  res := LNewZ(la + lb);
+  LAddInto(res, v0, 0);
+  LAddInto(res, c1, k);
+  LAddInto(res, c2, 2 * k);
+  LAddInto(res, c3, 3 * k);
+  LAddInto(res, c4, 4 * k);
+  LAddInto(res, c5, 5 * k);
+  LAddInto(res, vinf, 6 * k);
+  LNorm(res);
+  result := res;
+end;
+
+function LSqrToom4P(pa: PLimb; la: SizeInt): TLimbs;
+var
+  res: TLimbs;
+begin
+  var k := (la + 3) shr 2;
+  var a0 := LSliceP(pa, la, 0, k);
+  var a1 := LSliceP(pa, la, k, k);
+  var a2 := LSliceP(pa, la, 2 * k, k);
+  var a3 := LSliceP(pa, la, 3 * k, la);
+  var ae := LAdd(a0, a2);
+  var ao := LAdd(a1, a3);
+  var ae2 := LAdd(a0, LShl(a2, 2));
+  var ao2 := LShl(LAdd(a1, LShl(a3, 2)), 1);
+  // squaring makes the -1 and -2 evaluations sign-free
+  var am1 := if LCmp(ae, ao) < 0 then LSub(ao, ae) else LSub(ae, ao);
+  var am2 := if LCmp(ae2, ao2) < 0 then LSub(ao2, ae2) else LSub(ae2, ao2);
+  var a3v := LAdd(a0, LMulW(LAdd(a1, LMulW(LAdd(a2, LMulW(a3, 3)), 3)), 3));
+  var v0 := LSqr(a0);
+  var v1 := LSqr(LAdd(ae, ao));
+  var vm1 := LSqr(am1);
+  var v2 := LSqr(LAdd(ae2, ao2));
+  var vm2 := LSqr(am2);
+  var v3 := LSqr(a3v);
+  var vinf := LSqr(a3);
+  var s1 := LShr(LAdd(v1, vm1), 1);
+  var s2 := LShr(LSub(v1, vm1), 1);
+  var s3 := LShr(LAdd(v2, vm2), 1);
+  var s4 := LShr(LSub(v2, vm2), 2);
+  var e1 := LSub(LSub(s1, v0), vinf);
+  var e2 := LShr(LSub(LSub(s3, v0), LShl(vinf, 6)), 2);
+  var c4 := DivExact3(LSub(e2, e1));
+  var c2 := LSub(e1, c4);
+  var t3 := DivExact3(LSub(v3, LAdd(LAdd(v0, LMulW(c2, 9)), LAdd(LMulW(c4, 81), LMulW(vinf, 729)))));
+  var u1 := DivExact3(LSub(s4, s2));
+  var u2 := DivExact5(LSub(t3, s4));
+  var c5 := LShr(LSub(u2, u1), 3);
+  var c3 := LSub(u1, LMulW(c5, 5));
+  var c1 := LSub(s2, LAdd(c3, c5));
+  res := LNewZ(2 * la);
+  LAddInto(res, v0, 0);
+  LAddInto(res, c1, k);
+  LAddInto(res, c2, 2 * k);
+  LAddInto(res, c3, 3 * k);
+  LAddInto(res, c4, 4 * k);
+  LAddInto(res, c5, 5 * k);
+  LAddInto(res, vinf, 6 * k);
+  LNorm(res);
+  result := res;
+end;
+
 function LMulP(pa: PLimb; la: SizeInt; pb: PLimb; lb: SizeInt): TLimbs;
 begin
   var mn := MinS(la, lb);
   if mn < BigIntKaratsubaThreshold then exit(LMulBasicP(pa, la, pb, lb));
-  if (mn >= BigIntToom3Threshold) and (MaxS(la, lb) < 2 * mn) then exit(LMulToom3P(pa, la, pb, lb));
+  if MaxS(la, lb) < 2 * mn then begin
+    if mn >= BigIntToom4Threshold then exit(LMulToom4P(pa, la, pb, lb));
+    if mn >= BigIntToom3Threshold then exit(LMulToom3P(pa, la, pb, lb));
+  end;
   result := LMulKaraP(pa, la, pb, lb);
 end;
 
@@ -2806,6 +2943,7 @@ end;
 function LSqrP(pa: PLimb; la: SizeInt): TLimbs;
 begin
   if la < BigIntKaratsubaThreshold then exit(LSqrBasicP(pa, la));
+  if la >= BigIntToom4Threshold then exit(LSqrToom4P(pa, la));
   if la >= BigIntToom3Threshold then exit(LSqrToom3P(pa, la));
   result := LSqrKaraP(pa, la);
 end;

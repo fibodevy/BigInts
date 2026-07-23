@@ -1081,6 +1081,46 @@ begin
   BigIntToom3Threshold := savedT;
 end;
 
+procedure testToom4;
+begin
+  section('Toom-4 vs schoolbook cross-check');
+  var savedK := BigIntKaratsubaThreshold;
+  var savedT3 := BigIntToom3Threshold;
+  var savedT4 := BigIntToom4Threshold;
+  for var i := 1 to 30 do begin
+    var a := randU(3000 + Random(20000));
+    var b := randU(3000 + Random(20000));
+    BigIntKaratsubaThreshold := 4;
+    BigIntToom3Threshold := 1000000;
+    BigIntToom4Threshold := 8;
+    var pt := a * b;
+    var st := a.sqr;
+    BigIntToom4Threshold := 1000000;
+    BigIntKaratsubaThreshold := 1000000;
+    check(pt = a * b, 'toom4 mul = schoolbook mul');
+    check(st = a.sqr, 'toom4 sqr = schoolbook sqr');
+    BigIntKaratsubaThreshold := savedK;
+    BigIntToom3Threshold := savedT3;
+    BigIntToom4Threshold := savedT4;
+    check((a * b) div b = a, 'roundtrip at default thresholds');
+    check(a.sqr = a * a, 'sqr = mul at default thresholds');
+  end;
+  // all-ones operands push maximal carries through the interpolation
+  var ones := UBigInt.pow2(40000) - 1;
+  BigIntKaratsubaThreshold := 4;
+  BigIntToom3Threshold := 1000000;
+  BigIntToom4Threshold := 8;
+  var po := ones * ones;
+  var so := ones.sqr;
+  BigIntToom4Threshold := 1000000;
+  BigIntKaratsubaThreshold := 1000000;
+  check(po = ones * ones, 'all-ones toom4 mul');
+  check(so = po, 'all-ones toom4 sqr');
+  BigIntKaratsubaThreshold := savedK;
+  BigIntToom3Threshold := savedT3;
+  BigIntToom4Threshold := savedT4;
+end;
+
 procedure testStressChain;
 begin
   section('stress: long random operator chains vs Int64 oracle');
@@ -2798,6 +2838,7 @@ begin
 
   testKaratsuba;
   testToom3;
+  testToom4;
   testStressChain;
   testStressStrings;
 
