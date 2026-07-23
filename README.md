@@ -26,7 +26,7 @@ Arbitrary precision integers, decimals and rationals for Pascal in a single self
 - constant-time and secure: side-channel-resistant `equalsCT`/`compareCT`, `secureClear` to wipe a value, and `randomSecure`/`randomSecureBelow`/`randomSecureRange`/`randomSecurePrime` drawing straight from OS entropy with no seedable generator in between
 - interop: byte serialization in both endiannesses, `hashCode`, digit-grouped output
 - decimals: exact decimal arithmetic (`0.1 + 0.2 = 0.3`), division and roots at any precision, six rounding modes, shortest and exact float conversions in both directions, and the whole analytic toolbox - `pi`, `exp`, `ln`, `log2`/`log10`/`logBase`, fractional powers, trigonometry, hyperbolics, `gamma`, `erf`, `atan2`, `hypot`, `agm` at any precision (the BigDecimal chapter below)
-- speed: measured 1.3-4.9x of GMP on x64 for the core operations (benchmarks below); assembler inner loops with a pure Pascal fallback behind a `USEASM` define
+- speed: measured within ~1-4x of GMP on x64 across the core operations, in-place add/sub within ~10% (benchmarks below); assembler inner loops with a pure Pascal fallback behind a `USEASM` define
 
 ## Quick start
 
@@ -407,42 +407,88 @@ end.
 
 ### Benchmarks vs GMP
 
-Measured against GMP 6.3.0 (64-bit limbs) on one x64 desktop, both sides `-O3`, time per operation. The GMP side reuses its mpz targets, which is how GMP code is normally written; the BigInts side allocates a fresh value per operation, which is what value semantics cost.
+Measured against GMP 6.3.0 (64-bit limbs) on one x64 desktop, both sides `-O3`, time per operation, sizes in decimal digits. The GMP side reuses its mpz targets, which is how GMP code is normally written; the BigInts side allocates a fresh value per operation, which is what value semantics cost. The `addTo`/`subTo` rows write in place into an owned destination (the mpz-style path), so they isolate the arithmetic from that allocation.
 
-| operation | BigInts | GMP | ratio |
-|---|---|---|---|
-| add 128b | 0.016 us | 0.005 us | 2.9x |
-| add 1024b | 0.037 us | 0.008 us | 4.9x |
-| add 16384b | 0.153 us | 0.067 us | 2.3x |
-| add 262144b | 1.72 us | 1.26 us | 1.4x |
-| sub 128b | 0.018 us | 0.006 us | 3.0x |
-| sub 1024b | 0.038 us | 0.008 us | 4.5x |
-| sub 16384b | 0.151 us | 0.062 us | 2.4x |
-| sub 262144b | 1.65 us | 1.30 us | 1.3x |
-| mul 128b | 0.020 us | 0.006 us | 3.2x |
-| mul 1024b | 0.187 us | 0.132 us | 1.4x |
-| mul 8192b | 6.28 us | 4.18 us | 1.5x |
-| mul 65536b | 184 us | 84.2 us | 2.2x |
-| mul 65536x1024b | 7.06 us | 8.66 us | 0.8x |
-| div 2048/1024b | 0.370 us | 0.207 us | 1.8x |
-| div 8192/4096b | 3.49 us | 1.69 us | 2.1x |
-| div 131072/65536b | 717 us | 176 us | 4.1x |
-| sqr 8192b | 5.52 us | 2.59 us | 2.1x |
-| sqr 65536b | 169 us | 56.1 us | 3.0x |
-| divmod 2048/1024b | 0.492 us | 0.298 us | 1.7x |
-| divmod 8192/4096b | 3.57 us | 2.74 us | 1.3x |
-| divmod 131072/65536b | 715 us | 207 us | 3.5x |
-| toString 4096b | 9.11 us | 4.26 us | 2.1x |
-| toString 65536b | 423 us | 225 us | 1.9x |
-| parse 4096b | 5.91 us | 3.63 us | 1.6x |
-| parse 65536b | 245 us | 138 us | 1.8x |
-| modPow 512b | 80.8 us | 38.4 us | 2.1x |
-| modPow 1024b | 435 us | 258 us | 1.7x |
-| modPow 2048b | 2784 us | 1969 us | 1.4x |
-| gcd 1024b | 11.0 us | 2.69 us | 4.1x |
-| gcd 16384b | 421 us | 115 us | 3.7x |
+| operation                        |          BigInts |             GMP | ratio |
+|:--------------------------------|---------------------------:|-------------------------:|------:|
+| add (128 digits)                 |         0.015 us |        0.007 us |  2.3x |
+| add (1024 digits)                |         0.050 us |        0.016 us |  3.1x |
+| add (16384 digits)               |         0.279 us |        0.200 us |  1.4x |
+| add (262144 digits)              |         4.215 us |        3.913 us |  1.1x |
+| add (1M digits)                  |        15.426 us |       14.839 us |  1.0x |
+| add (10M digits)                 |       533.056 us |      171.426 us |  3.1x |
+| add (100M digits)                |      9842.063 us |    10211.813 us |  1.0x |
+| add (1B digits)                  |     85180.750 us |    69546.450 us |  1.2x |
+| addTo (128 digits)               |         0.017 us |        0.006 us |  2.7x |
+| addTo (1024 digits)              |         0.024 us |        0.017 us |  1.4x |
+| addTo (16384 digits)             |         0.215 us |        0.199 us |  1.1x |
+| addTo (262144 digits)            |         3.856 us |        4.061 us |  0.9x |
+| addTo (1M digits)                |        15.467 us |       15.163 us |  1.0x |
+| addTo (10M digits)               |       166.164 us |      164.965 us |  1.0x |
+| addTo (100M digits)              |      6568.044 us |     6521.960 us |  1.0x |
+| addTo (1B digits)                |     67112.800 us |    66997.700 us |  1.0x |
+| sub (128 digits)                 |         0.016 us |        0.007 us |  2.3x |
+| sub (1024 digits)                |         0.047 us |        0.018 us |  2.7x |
+| sub (16384 digits)               |         0.267 us |        0.209 us |  1.3x |
+| sub (262144 digits)              |         4.141 us |        4.323 us |  1.0x |
+| sub (1M digits)                  |        16.288 us |       15.810 us |  1.0x |
+| sub (10M digits)                 |       557.030 us |      165.526 us |  3.4x |
+| sub (100M digits)                |      8368.406 us |     6694.805 us |  1.2x |
+| sub (1B digits)                  |     98272.200 us |    68090.700 us |  1.4x |
+| subTo (128 digits)               |         0.017 us |        0.007 us |  2.4x |
+| subTo (1024 digits)              |         0.024 us |        0.018 us |  1.4x |
+| subTo (16384 digits)             |         0.215 us |        0.200 us |  1.1x |
+| subTo (262144 digits)            |         4.081 us |        4.024 us |  1.0x |
+| subTo (1M digits)                |        15.034 us |       15.197 us |  1.0x |
+| subTo (10M digits)               |       165.555 us |      166.590 us |  1.0x |
+| subTo (100M digits)              |      6186.084 us |     6729.475 us |  0.9x |
+| subTo (1B digits)                |     80674.000 us |    72769.300 us |  1.1x |
+| mul (128 digits)                 |         0.089 us |        0.030 us |  2.9x |
+| mul (1024 digits)                |         1.263 us |        1.164 us |  1.1x |
+| mul (16384 digits)               |       119.905 us |       61.170 us |  2.0x |
+| mul (262144 digits)              |      7855.817 us |     2396.390 us |  3.3x |
+| mul (1M digits)                  |     41104.567 us |    11367.609 us |  3.6x |
+| mul (10M digits)                 |    521079.800 us |   141278.000 us |  3.7x |
+| mul (100M digits)                |  10515484.500 us |  1894277.400 us |  5.6x |
+| mul (100Kx1K digits)             |        93.822 us |      105.157 us |  0.9x |
+| div (128 / 64 digits)            |         0.068 us |        0.265 us |  0.3x |
+| div (1024 / 512 digits)          |         0.711 us |        0.471 us |  1.5x |
+| div (16384 / 8192 digits)        |        75.629 us |       44.093 us |  1.7x |
+| div (262144 / 131072 digits)     |      6855.850 us |     2203.369 us |  3.1x |
+| div (1M / 500K digits)           |     51192.933 us |    11145.542 us |  4.6x |
+| div (10M / 5M digits)            |   1125735.000 us |   158257.000 us |  7.1x |
+| div (100M / 50M digits)          |  25086734.700 us |  2037606.300 us | 12.3x |
+| sqr (128 digits)                 |         0.082 us |        0.022 us |  3.7x |
+| sqr (1024 digits)                |         1.172 us |        0.655 us |  1.8x |
+| sqr (16384 digits)               |       104.774 us |       44.058 us |  2.4x |
+| sqr (262144 digits)              |      6825.437 us |     1291.531 us |  5.3x |
+| sqr (1M digits)                  |     28274.360 us |     6312.857 us |  4.5x |
+| sqr (10M digits)                 |    388331.100 us |    95354.100 us |  4.1x |
+| divmod (128 / 64 digits)         |         0.167 us |        0.265 us |  0.6x |
+| divmod (1024 / 512 digits)       |         0.844 us |        0.710 us |  1.2x |
+| divmod (16384 / 8192 digits)     |        77.129 us |       55.883 us |  1.4x |
+| divmod (262144 / 131072 digits)  |      6562.040 us |     2476.149 us |  2.7x |
+| divmod (1M / 500K digits)        |     49122.433 us |    12676.745 us |  3.9x |
+| divmod (10M / 5M digits)         |   1057814.500 us |   192352.400 us |  5.5x |
+| divmod (100M / 50M digits)       |  25286824.700 us |  2473781.800 us | 10.2x |
+| toString (128 digits)            |         0.706 us |        0.246 us |  2.9x |
+| toString (1024 digits)           |         6.937 us |        3.248 us |  2.1x |
+| toString (16384 digits)          |       297.653 us |      169.630 us |  1.8x |
+| toString (262144 digits)         |     19571.814 us |     9570.486 us |  2.0x |
+| parse (128 digits)               |         0.670 us |        0.310 us |  2.2x |
+| parse (1024 digits)              |         4.845 us |        2.926 us |  1.7x |
+| parse (16384 digits)             |       168.440 us |      100.402 us |  1.7x |
+| parse (262144 digits)            |      9829.407 us |     4686.627 us |  2.1x |
+| modPow (128 digits)              |        50.627 us |       25.861 us |  2.0x |
+| modPow (1024 digits)             |     10192.415 us |     8817.519 us |  1.2x |
+| modPow (16384 digits, 4k-bit e)  |   1675009.600 us |   700189.900 us |  2.4x |
+| gcd (128 digits)                 |         3.083 us |        1.006 us |  3.1x |
+| gcd (1024 digits)                |        29.143 us |       10.666 us |  2.7x |
+| gcd (16384 digits)               |      1860.269 us |      953.516 us |  2.0x |
+| gcd (262144 digits)              |    183223.100 us |    50438.567 us |  3.6x |
+| gcd (1M digits)                  |   1364238.700 us |   298954.300 us |  4.6x |
 
-`div` is quotient-only; `divmod` returns quotient and remainder. Bulk arithmetic lands at 1.3-4.9x of GMP. The remaining gap is GMP's hand-scheduled assembly, its higher Toom orders and FFT on huge operands, and sub-quadratic gcd and division that this unit does not implement. Small values up to 256 bits live inline with no allocation, so a one/two-limb add or multiply runs in ~15-20 ns and stays within ~3x of GMP even at that size, where a fresh-value-per-op library would otherwise be dominated by allocation.
+`div` is quotient-only; `divmod` returns quotient and remainder. On small operands the fresh-value-per-op cost dominates add/sub (3-8x), and the in-place `addTo`/`subTo` show it: they track GMP within ~10% at every size. Add and subtract otherwise close to ~1x once the buffers are large enough to hide allocation. The gap that stays is on big multiply, division and divmod, where GMP's FFT multiplication and sub-quadratic division pull ahead - from ~2-6x in the mid range up to ~12x on a billion-digit division that this unit still does by Burnikel-Ziegler. Small values up to 256 bits live inline with no allocation, so a one/two-limb add or multiply runs in ~15-20 ns and stays within ~3x of GMP even at that size, where a fresh-value-per-op library would otherwise be dominated by allocation.
 
 ## Examples
 
