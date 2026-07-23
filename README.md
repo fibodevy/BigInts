@@ -18,7 +18,7 @@ Arbitrary precision integers, decimals and rationals for Pascal in a single self
 - literals of any size with `_` separators and `$ 0x % 0b & 0o` prefixes; parsing and formatting in every base 2..36
 - multiplication: schoolbook, Karatsuba and Toom-3, picked by tunable thresholds, with dedicated squaring paths
 - division: Knuth algorithm D, plus divide-and-conquer base conversion for long numbers
-- modular arithmetic: Montgomery `modPow` (plus an exponent-hardened `modPowSec`, and reusable `TModRing` / constant-time `TModRingSec` contexts), `modInverse`, `modSqrt` (Tonelli-Shanks), `sqrtModN`, `nthRootMod`, `crt`, `discreteLog`, `multiplicativeOrder`, `primitiveRoot`/`isPrimitiveRoot`, `binomialMod`, `lucasSequence`
+- modular arithmetic: Montgomery `modPow` (plus reusable `TModRing` / constant-time `TModRingSec` contexts), `modInverse`, `modSqrt` (Tonelli-Shanks), `sqrtModN`, `nthRootMod`, `crt`, `discreteLog`, `multiplicativeOrder`, `primitiveRoot`/`isPrimitiveRoot`, `binomialMod`, `lucasSequence`
 - primes: Miller-Rabin `isProbablePrime` (deterministic below 3.3e24), Baillie-PSW `isPrime`, `nextPrime`/`prevPrime`, `randomPrime`/`randomSafePrime`/`randomStrongPrime`, exact `primePi`/`primeCount`
 - factorization: trial division plus Pollard-Brent rho, exponents grouped into `(p, e)` tuples; the multiplicative functions `eulerPhi`, `carmichaelLambda`, `moebius`, `sigma`, `tau`, `divisors`, `radical` follow from it
 - number theory and combinatorics: Lehmer `gcd`, `gcdExt`, `jacobi`, `kronecker`, `continuedFraction`, and `factorial`, `fibonacci`, `lucas`, `binomial`, `multinomial`, `catalan`, `bell`, `stirling1`/`stirling2`, `bernoulli`, `partitions`, `subfactorial`, `primorial`
@@ -108,7 +108,6 @@ Everything is camelCase and discoverable through code completion. Methods live o
 | `isKthPower(k)` | whether the value is an exact `k`-th power |
 | `pow(e)`, `**` | plain powers |
 | `modPow(e, m)` | Montgomery with a windowed exponent for odd `m`; on `BigInt` the modulus must be positive, the result lands in `0..m-1` and a negative exponent goes through the modular inverse |
-| `modPowSec(e, m)` | same result as `modPow`, but the sequence of operations does not depend on the exponent bits, hiding the square-and-multiply pattern; the underlying mul/mod stay variable-time, so this is exponent-schedule hardening, not a full constant-time bignum (use `TModRingSec` for that) |
 | `modInverse(m)` | raises `EBigIntError` when no inverse exists |
 | `gcd`, `lcm` | Lehmer gcd |
 | `isProbablePrime(rounds = 24)` | Miller-Rabin; deterministic witnesses below 3.3e24, random rounds above |

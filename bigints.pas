@@ -245,11 +245,6 @@ type
     function isKthPower(k: LongWord): boolean;
     function pow(e: LongWord): UBigInt;
     function modPow(const e, m: UBigInt): UBigInt;
-    // Montgomery ladder: the sequence of big-integer operations does not depend
-    // on the exponent bits, hiding the classic square-and-multiply pattern. the
-    // underlying mul/mod are still variable-time, so this is not a constant-time
-    // bignum, only exponent-schedule hardening for secret exponents
-    function modPowSec(const e, m: UBigInt): UBigInt;
     function modInverse(const m: UBigInt): UBigInt;
     function gcd(const other: UBigInt): UBigInt;
     function lcm(const other: UBigInt): UBigInt;
@@ -5993,28 +5988,6 @@ begin
   if not MillerRabin2(self) then exit(false);
   if isPerfectSquare then exit(false);
   result := LucasStrongPRP(self);
-end;
-
-function UBigInt.modPowSec(const e, m: UBigInt): UBigInt;
-begin
-  if m.isZero then RaiseDivByZero;
-  if m.isOne then exit(default(UBigInt));
-  // Montgomery ladder: every bit runs one multiply and one square, and the two
-  // registers swap roles without branching on the operation performed, so the
-  // sequence of big-integer operations does not depend on the exponent bits
-  var x0 := UBigInt.one;
-  var x1 := self mod m;
-  var bits := e.bitLength;
-  if bits = 0 then bits := 1;
-  for var i := integer(bits) - 1 downto 0 do
-    if e.testBit(i) then begin
-      x0 := (x0 * x1) mod m;
-      x1 := (x1 * x1) mod m;
-    end else begin
-      x1 := (x0 * x1) mod m;
-      x0 := (x0 * x0) mod m;
-    end;
-  result := x0;
 end;
 
 // Kronecker symbol (a/n), the full extension of Jacobi to any integers

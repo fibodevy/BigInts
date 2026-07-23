@@ -2254,14 +2254,6 @@ begin
   check(BigInt(7).kronecker(BigInt(2)) = 1, 'kronecker(7,2)');
   check(BigInt(-1).kronecker(BigInt(7)) = -1, 'kronecker(-1,7)');
   check(BigInt(6).kronecker(BigInt(10)) = 0, 'kronecker shares factor');
-  // constant-time modPow agrees with the fast one on random inputs
-  for var i := 1 to 200 do begin
-    var b := randU(200);
-    var e := randU(200);
-    var m := randU(200) or UBigInt.one;
-    if m.isOne then continue;
-    check(b.modPowSec(e, m) = b.modPow(e, m), 'modPowSec matches modPow');
-  end;
   // constant-time compare/equals agree with the plain ones
   for var i := 1 to 300 do begin
     var a := randU(1 + Random(300));
