@@ -1053,6 +1053,11 @@ var
   // (NttUse), above it the NTT wins outright
   BigIntNttThreshold: integer = {$ifdef BIGINT_ASM} 30000 {$else} 16000 {$endif};
 
+  // limb count above which the fixed-b=64 3-prime NTT (64-bit builds only)
+  // competes; it beats the single-prime transform once its power-of-two
+  // length fills well, decided per call by a butterfly-count cost model
+  BigIntNtt3Threshold: integer = 14000;
+
   // divisor limb count above which division switches from Knuth to recursive
   // Burnikel-Ziegler (built on the fast multiply); the quotient must also span
   // at least this many limbs. exposed for tuning and testing. the asm Knuth
@@ -3132,135 +3137,154 @@ end;
 {$endif}
 
 const
-  NTT_P = QWord(4179340454199820289); // 29*2^57 + 1
+  // NTT-friendly primes below 2^62 (the lazy butterflies need 4p < 2^64),
+  // ascending for the Garner CRT: 27*2^56+1, 69*2^55+1, 29*2^57+1. the
+  // adaptive-b single-prime path uses index 2 alone; the fixed-b=64 3-prime
+  // path uses all three (product ~2^185 covers n * (2^64-1)^2)
+  NTT_NP = 3;
+  NTT_PRIMES: array[0..NTT_NP - 1] of QWord = (QWord(1945555039024054273), QWord(2485986994308513793), QWord(4179340454199820289));
+  // odd cofactors of p-1 and their prime factors, for the generator search
+  NTT_COF: array[0..NTT_NP - 1, 0..1] of QWord = ((3, 3), (3, 23), (29, 29));
+  NTT_P = QWord(4179340454199820289); // = NTT_PRIMES[2], the single-prime modulus
 
 var
   NttReady: boolean = false;
-  NttPInv: QWord = 0; // -p^-1 mod 2^64
-  NttR: QWord = 0;    // 2^64 mod p, the Montgomery one
-  NttR2: QWord = 0;   // (2^64)^2 mod p
-  NttG: QWord = 0;    // generator of the multiplicative group
-  NttTabN: SizeInt = 0;
-  // per-block zetas in heap order: entry k (1..NttTabN-1) is the root that
+  NttPInvA: array[0..NTT_NP - 1] of QWord; // -p^-1 mod 2^64
+  NttRA: array[0..NTT_NP - 1] of QWord;    // 2^64 mod p, the Montgomery one
+  NttR2A: array[0..NTT_NP - 1] of QWord;   // (2^64)^2 mod p
+  NttGA: array[0..NTT_NP - 1] of QWord;    // generator of the multiplicative group
+  NttTabNA: array[0..NTT_NP - 1] of SizeInt;
+  // per-block zetas in heap order: entry k (1..tabN-1) is the root that
   // splits subtree k of the transform's CRT tree, so every stage reads its
   // zetas sequentially and a smaller transform just reads the prefix. plain
   // values on builds with a native 128-bit type (paired with the Shoup
   // companions below), the Montgomery form elsewhere
-  NttWF, NttWI: array of QWord;
+  NttWFA, NttWIA: array[0..NTT_NP - 1] of array of QWord;
   {$ifdef BIGINT_INT128}
-  NttWS, NttWIS: array of QWord; // floor(z * 2^64 / p) for the Shoup product
-  NttPN: QWord = 0; // p shl 2, top bit set, for the Shoup builder division
-  NttVN: QWord = 0; // Moller-Granlund reciprocal of NttPN
+  NttWSA, NttWISA: array[0..NTT_NP - 1] of array of QWord; // floor(z * 2^64 / p) for the Shoup product
+  // per-prime normalized modulus (top bit set) and its Moller-Granlund
+  // reciprocal, for the Shoup companion builder
+  NttPNA, NttVNA: array[0..NTT_NP - 1] of QWord;
   {$endif}
 
-// Montgomery product a * b / 2^64 mod p; for a plain operand and a Montgomery
-// one the result is the plain product
-function NttMulMod(a, b: QWord): QWord; inline;
+// Montgomery product a * b / 2^64 mod prime pk; for a plain operand and a
+// Montgomery one the result is the plain product
+function NttMulMod(a, b: QWord; pk: integer): QWord; inline;
 {$ifdef BIGINT_INT128}
 begin
+  var p := NTT_PRIMES[pk];
   var t := UInt128(a) * b;
-  var m := QWord(t) * NttPInv;
-  var r := QWord((t + UInt128(m) * NTT_P) shr 64);
-  result := if r >= NTT_P then r - NTT_P else r;
+  var m := QWord(t) * NttPInvA[pk];
+  var r := QWord((t + UInt128(m) * p) shr 64);
+  result := if r >= p then r - p else r;
 end;
 {$else}
 begin
+  var p := NTT_PRIMES[pk];
   Mul64x64(a, b, var hi, var lo);
-  var m := lo * NttPInv;
-  Mul64x64(m, NTT_P, var h2, var l2);
+  var m := lo * NttPInvA[pk];
+  Mul64x64(m, p, var h2, var l2);
   // lo + l2 wraps to zero exactly, so only its carry survives
   var r := hi + h2 + QWord(ord(lo <> 0));
-  result := if r >= NTT_P then r - NTT_P else r;
+  result := if r >= p then r - p else r;
 end;
 {$endif}
 
 // setup-only modular product by double-and-add, needs no Montgomery constants
-function NttSlowMul(a, b: QWord): QWord;
+function NttSlowMul(a, b: QWord; pk: integer): QWord;
 begin
+  var p := NTT_PRIMES[pk];
   result := 0;
   while b > 0 do begin
     if b and 1 = 1 then begin
       result := result + a;
-      if result >= NTT_P then result := result - NTT_P;
+      if result >= p then result := result - p;
     end;
     a := a + a;
-    if a >= NTT_P then a := a - NTT_P;
+    if a >= p then a := a - p;
     b := b shr 1;
   end;
 end;
 
-function NttPowMod(b, e: QWord): QWord;
+function NttPowMod(b, e: QWord; pk: integer): QWord;
 begin
-  var acc := NttR;
-  var bm := NttMulMod(b, NttR2);
+  var acc := NttRA[pk];
+  var bm := NttMulMod(b, NttR2A[pk], pk);
   while e > 0 do begin
-    if e and 1 = 1 then acc := NttMulMod(acc, bm);
-    bm := NttMulMod(bm, bm);
+    if e and 1 = 1 then acc := NttMulMod(acc, bm, pk);
+    bm := NttMulMod(bm, bm, pk);
     e := e shr 1;
   end;
-  result := NttMulMod(acc, 1);
+  result := NttMulMod(acc, 1, pk);
 end;
 
 procedure NttInitOnce;
 begin
   if NttReady then exit;
-  // p^-1 mod 2^64 by Newton doubling, negated (see MontInv)
-  var inv := NTT_P;
-  for var i := 1 to 5 do inv := inv * (QWord(2) - NTT_P * inv);
-  NttPInv := QWord(0) - inv;
-  // 2^64 mod p; spelled without a negation so constant folding stays unsigned
-  NttR := QWord(High(QWord) - NTT_P + 1) mod NTT_P;
-  NttR2 := NttSlowMul(NttR, NttR);
-  // p-1 = 2^57 * 29: a generator fails both cofactor power tests
-  var g: QWord := 3;
-  while (NttPowMod(g, (NTT_P - 1) shr 1) = 1) or (NttPowMod(g, (NTT_P - 1) div 29) = 1) do g := g + 2;
-  NttG := g;
-  {$ifdef BIGINT_INT128}
-  NttPN := NTT_P shl 2;
-  NttVN := QWord((not UInt128(0)) div NttPN - (UInt128(1) shl 64));
-  {$endif}
+  for var k := 0 to NTT_NP - 1 do begin
+    var p := NTT_PRIMES[k];
+    // p^-1 mod 2^64 by Newton doubling, negated (see MontInv)
+    var inv := p;
+    for var i := 1 to 5 do inv := inv * (QWord(2) - p * inv);
+    NttPInvA[k] := QWord(0) - inv;
+    // 2^64 mod p; spelled without a negation so constant folding stays unsigned
+    NttRA[k] := QWord(High(QWord) - p + 1) mod p;
+    NttR2A[k] := NttSlowMul(NttRA[k], NttRA[k], k);
+    // a generator fails the power test for 2 and every odd prime factor of p-1
+    var g: QWord := 3;
+    while (NttPowMod(g, (p - 1) shr 1, k) = 1) or (NttPowMod(g, (p - 1) div NTT_COF[k, 0], k) = 1) or (NttPowMod(g, (p - 1) div NTT_COF[k, 1], k) = 1) do g := g + 2;
+    NttGA[k] := g;
+    NttTabNA[k] := 0;
+    {$ifdef BIGINT_INT128}
+    NttPNA[k] := p shl (LIMB_MASK - integer(LimbBsr(p)));
+    NttVNA[k] := QWord((not UInt128(0)) div NttPNA[k] - (UInt128(1) shl 64));
+    {$endif}
+  end;
   NttReady := true;
 end;
 
 {$ifdef BIGINT_INT128}
 // floor(x * 2^64 / p) for x < p, the Shoup companion of a twiddle; a 2/1
-// division by the normalized p shl 2 with the precomputed reciprocal
-// (Moller-Granlund), far cheaper than a generic 128-by-64 division
-function NttShoup(x: QWord): QWord;
+// division by the normalized p shl s with the precomputed reciprocal, far
+// cheaper than a generic 128-by-64 division across a full table build
+function NttShoup(x: QWord; pk: integer): QWord;
 begin
-  var u1 := x shl 2;
-  var q := UInt128(NttVN) * u1 + (UInt128(u1) shl 64);
+  var pn := NttPNA[pk];
+  var s := LIMB_MASK - integer(LimbBsr(NTT_PRIMES[pk]));
+  var u1 := x shl s;
+  var q := UInt128(NttVNA[pk]) * u1 + (UInt128(u1) shl 64);
   var qh := QWord(q shr 64) + 1;
   var ql := QWord(q);
-  var r := QWord(0) - qh * NttPN;
+  var r := QWord(0) - qh * pn;
   if r > ql then begin
     qh := qh - 1;
-    r := r + NttPN;
+    r := r + pn;
   end;
-  if r >= NttPN then qh := qh + 1;
+  if r >= pn then qh := qh + 1;
   result := qh;
 end;
 {$endif}
 
-// grow the zeta tables to n points. level d (blocks k = 2^d..2^(d+1)-1) holds
-// the (2^(d+1))-th roots of unity in bit-reversed order: stepping the natural
-// powers and scattering to k = cnt + brv(i) makes entry k the exact splitting
-// root of x^(2len) - z^2 at heap node k
-procedure NttEnsureTables(n: SizeInt);
+// grow the zeta tables of prime pk to n points. level d (blocks k =
+// 2^d..2^(d+1)-1) holds the (2^(d+1))-th roots of unity in bit-reversed
+// order: stepping the natural powers and scattering to k = cnt + brv(i)
+// makes entry k the exact splitting root of x^(2len) - z^2 at heap node k
+procedure NttEnsureTables(n: SizeInt; pk: integer);
 begin
-  if n <= NttTabN then exit;
-  SetLength(NttWF, n);
-  SetLength(NttWI, n);
+  if n <= NttTabNA[pk] then exit;
+  var p := NTT_PRIMES[pk];
+  SetLength(NttWFA[pk], n);
+  SetLength(NttWIA[pk], n);
   {$ifdef BIGINT_INT128}
-  SetLength(NttWS, n);
-  SetLength(NttWIS, n);
+  SetLength(NttWSA[pk], n);
+  SetLength(NttWISA[pk], n);
   {$endif}
   var cnt: SizeInt := 1;
   while cnt < n do begin
-    var wl := NttPowMod(NttG, (NTT_P - 1) div (QWord(cnt) * 2));
-    var wli := NttPowMod(wl, NTT_P - 2);
-    var wlm := NttMulMod(wl, NttR2);
-    var wlim := NttMulMod(wli, NttR2);
+    var wl := NttPowMod(NttGA[pk], (p - 1) div (QWord(cnt) * 2), pk);
+    var wli := NttPowMod(wl, p - 2, pk);
+    var wlm := NttMulMod(wl, NttR2A[pk], pk);
+    var wlim := NttMulMod(wli, NttR2A[pk], pk);
     // a plain accumulator times a Montgomery factor stays plain; the non-128
     // build steps Montgomery-form values so the butterfly REDC yields plain
     // products
@@ -3268,19 +3292,19 @@ begin
     var curF: QWord := 1;
     var curI: QWord := 1;
     {$else}
-    var curF := NttR;
-    var curI := NttR;
+    var curF := NttRA[pk];
+    var curI := NttRA[pk];
     {$endif}
     var rev: SizeInt := 0;
     for var i := 0 to cnt - 1 do begin
-      NttWF[cnt + rev] := curF;
-      NttWI[cnt + rev] := curI;
+      NttWFA[pk][cnt + rev] := curF;
+      NttWIA[pk][cnt + rev] := curI;
       {$ifdef BIGINT_INT128}
-      NttWS[cnt + rev] := NttShoup(curF);
-      NttWIS[cnt + rev] := NttShoup(curI);
+      NttWSA[pk][cnt + rev] := NttShoup(curF, pk);
+      NttWISA[pk][cnt + rev] := NttShoup(curI, pk);
       {$endif}
-      curF := NttMulMod(curF, wlm);
-      curI := NttMulMod(curI, wlim);
+      curF := NttMulMod(curF, wlm, pk);
+      curI := NttMulMod(curI, wlim, pk);
       // reverse-increment enumerates brv(i) without a bit-reversal pass
       var bit := cnt shr 1;
       while (rev and bit) <> 0 do begin
@@ -3291,7 +3315,7 @@ begin
     end;
     cnt := cnt shl 1;
   end;
-  NttTabN := n;
+  NttTabNA[pk] := n;
 end;
 
 // zeta tables above this transform length are 16-32 bytes per point (2-4 GB
@@ -3302,14 +3326,16 @@ const
 // free oversized twiddle tables after a transform; cached ones stay
 procedure NttReleaseTables;
 begin
-  if NttTabN <= NTT_TAB_CACHE_MAX then exit;
-  NttWF := nil;
-  NttWI := nil;
-  {$ifdef BIGINT_INT128}
-  NttWS := nil;
-  NttWIS := nil;
-  {$endif}
-  NttTabN := 0;
+  for var k := 0 to NTT_NP - 1 do begin
+    if NttTabNA[k] <= NTT_TAB_CACHE_MAX then continue;
+    NttWFA[k] := nil;
+    NttWIA[k] := nil;
+    {$ifdef BIGINT_INT128}
+    NttWSA[k] := nil;
+    NttWISA[k] := nil;
+    {$endif}
+    NttTabNA[k] := 0;
+  end;
 end;
 
 // the zeta products below are written out inline: with a native 128-bit type
@@ -3319,8 +3345,6 @@ end;
 // (Harvey): the forward invariant is [0,4p), the inverse [0,2p), with masked
 // subtractions instead of data-dependent branches - random data makes such
 // branches mispredict half the time, which used to dominate the transform
-const
-  NTT_2P = QWord(2) * NTT_P;
 
 // block k of the CRT tree splits with zeta[k] into blocks 2k and 2k+1, so a
 // transform decomposes into independent half transforms at any point; the
@@ -3333,34 +3357,39 @@ const
 
 // iterative forward transform of block k (n points): CT butterfly
 // (u, x) -> (u + z*x, u - z*x), natural in, bit-reversed out
-procedure NttFwdBlock(a: PQWord; n: SizeInt; k: SizeInt);
+procedure NttFwdBlock(a: PQWord; n: SizeInt; k: SizeInt; pk: integer);
 begin
+  var p := NTT_PRIMES[pk];
+  var p2 := 2 * p;
+  {$ifndef BIGINT_INT128}
+  var pinv := NttPInvA[pk];
+  {$endif}
   var len := n shr 1;
   var kb := k;
   while len >= 1 do begin
     var kk := kb;
     var i := 0;
     while i < n do begin
-      var w := NttWF[kk];
+      var w := NttWFA[pk][kk];
       {$ifdef BIGINT_INT128}
-      var ws := NttWS[kk];
+      var ws := NttWSA[pk][kk];
       {$endif}
       inc(kk);
       for var j := i to i + len - 1 do begin
         var x := a[j + len];
         {$ifdef BIGINT_INT128}
         var q := QWord((UInt128(x) * ws) shr 64);
-        var t := x * w - q * NTT_P;
+        var t := x * w - q * p;
         {$else}
         Mul64x64(x, w, var hi, var lo);
-        var m := lo * NttPInv;
-        Mul64x64(m, NTT_P, var h2, var l2);
+        var m := lo * pinv;
+        Mul64x64(m, p, var h2, var l2);
         var t := hi + h2 + QWord(ord(lo <> 0));
         {$endif}
         var u := a[j];
-        u := u - (NTT_2P and (QWord(0) - QWord(ord(u >= NTT_2P))));
+        u := u - (p2 and (QWord(0) - QWord(ord(u >= p2))));
         a[j] := u + t;
-        a[j + len] := u + NTT_2P - t;
+        a[j + len] := u + p2 - t;
       end;
       i := i + 2 * len;
     end;
@@ -3371,71 +3400,81 @@ end;
 
 // forward transform of block k: one streaming stage with a single zeta in a
 // register, then two independent cache-sized halves
-procedure NttFwdRec(a: PQWord; n: SizeInt; k: SizeInt);
+procedure NttFwdRec(a: PQWord; n: SizeInt; k: SizeInt; pk: integer);
 begin
   if n <= NTT_BLOCK_POINTS then begin
-    NttFwdBlock(a, n, k);
+    NttFwdBlock(a, n, k, pk);
     exit;
   end;
+  var p := NTT_PRIMES[pk];
+  var p2 := 2 * p;
+  {$ifndef BIGINT_INT128}
+  var pinv := NttPInvA[pk];
+  {$endif}
   var len := n shr 1;
-  var w := NttWF[k];
+  var w := NttWFA[pk][k];
   {$ifdef BIGINT_INT128}
-  var ws := NttWS[k];
+  var ws := NttWSA[pk][k];
   {$endif}
   for var j := 0 to len - 1 do begin
     var x := a[j + len];
     {$ifdef BIGINT_INT128}
     var q := QWord((UInt128(x) * ws) shr 64);
-    var t := x * w - q * NTT_P;
+    var t := x * w - q * p;
     {$else}
     Mul64x64(x, w, var hi, var lo);
-    var m := lo * NttPInv;
-    Mul64x64(m, NTT_P, var h2, var l2);
+    var m := lo * pinv;
+    Mul64x64(m, p, var h2, var l2);
     var t := hi + h2 + QWord(ord(lo <> 0));
     {$endif}
     var u := a[j];
-    u := u - (NTT_2P and (QWord(0) - QWord(ord(u >= NTT_2P))));
+    u := u - (p2 and (QWord(0) - QWord(ord(u >= p2))));
     a[j] := u + t;
-    a[j + len] := u + NTT_2P - t;
+    a[j + len] := u + p2 - t;
   end;
-  NttFwdRec(a, len, 2 * k);
-  NttFwdRec(@a[len], len, 2 * k + 1);
+  NttFwdRec(a, len, 2 * k, pk);
+  NttFwdRec(@a[len], len, 2 * k + 1, pk);
 end;
 
 // forward transform: values in [0,4p) throughout
-procedure NttFwd(a: PQWord; n: SizeInt);
+procedure NttFwd(a: PQWord; n: SizeInt; pk: integer);
 begin
-  NttFwdRec(a, n, 1);
+  NttFwdRec(a, n, 1, pk);
 end;
 
 // iterative inverse transform of block k (n points): GS butterfly
 // (u, v) -> (u + v, (u - v)*zinv), bit-reversed in, natural out
-procedure NttInvBlock(a: PQWord; n: SizeInt; k: SizeInt);
+procedure NttInvBlock(a: PQWord; n: SizeInt; k: SizeInt; pk: integer);
 begin
+  var p := NTT_PRIMES[pk];
+  var p2 := 2 * p;
+  {$ifndef BIGINT_INT128}
+  var pinv := NttPInvA[pk];
+  {$endif}
   var len := 1;
   while len < n do begin
     var kk := k * (n div (2 * len));
     var i := 0;
     while i < n do begin
-      var w := NttWI[kk];
+      var w := NttWIA[pk][kk];
       {$ifdef BIGINT_INT128}
-      var ws := NttWIS[kk];
+      var ws := NttWISA[pk][kk];
       {$endif}
       inc(kk);
       for var j := i to i + len - 1 do begin
         var u := a[j];
         var v := a[j + len];
         var s := u + v;
-        s := s - (NTT_2P and (QWord(0) - QWord(ord(s >= NTT_2P))));
+        s := s - (p2 and (QWord(0) - QWord(ord(s >= p2))));
         a[j] := s;
-        var d := u + NTT_2P - v; // (0, 4p)
+        var d := u + p2 - v; // (0, 4p)
         {$ifdef BIGINT_INT128}
         var q := QWord((UInt128(d) * ws) shr 64);
-        var t := d * w - q * NTT_P;
+        var t := d * w - q * p;
         {$else}
         Mul64x64(d, w, var hi, var lo);
-        var m := lo * NttPInv;
-        Mul64x64(m, NTT_P, var h2, var l2);
+        var m := lo * pinv;
+        Mul64x64(m, p, var h2, var l2);
         var t := hi + h2 + QWord(ord(lo <> 0));
         {$endif}
         a[j + len] := t;
@@ -3448,33 +3487,38 @@ end;
 
 // inverse transform of block k: two independent cache-sized halves, then one
 // streaming merge stage with a single zeta in a register
-procedure NttInvRec(a: PQWord; n: SizeInt; k: SizeInt);
+procedure NttInvRec(a: PQWord; n: SizeInt; k: SizeInt; pk: integer);
 begin
   if n <= NTT_BLOCK_POINTS then begin
-    NttInvBlock(a, n, k);
+    NttInvBlock(a, n, k, pk);
     exit;
   end;
+  var p := NTT_PRIMES[pk];
+  var p2 := 2 * p;
+  {$ifndef BIGINT_INT128}
+  var pinv := NttPInvA[pk];
+  {$endif}
   var len := n shr 1;
-  NttInvRec(a, len, 2 * k);
-  NttInvRec(@a[len], len, 2 * k + 1);
-  var w := NttWI[k];
+  NttInvRec(a, len, 2 * k, pk);
+  NttInvRec(@a[len], len, 2 * k + 1, pk);
+  var w := NttWIA[pk][k];
   {$ifdef BIGINT_INT128}
-  var ws := NttWIS[k];
+  var ws := NttWISA[pk][k];
   {$endif}
   for var j := 0 to len - 1 do begin
     var u := a[j];
     var v := a[j + len];
     var s := u + v;
-    s := s - (NTT_2P and (QWord(0) - QWord(ord(s >= NTT_2P))));
+    s := s - (p2 and (QWord(0) - QWord(ord(s >= p2))));
     a[j] := s;
-    var d := u + NTT_2P - v;
+    var d := u + p2 - v;
     {$ifdef BIGINT_INT128}
     var q := QWord((UInt128(d) * ws) shr 64);
-    var t := d * w - q * NTT_P;
+    var t := d * w - q * p;
     {$else}
     Mul64x64(d, w, var hi, var lo);
-    var m := lo * NttPInv;
-    Mul64x64(m, NTT_P, var h2, var l2);
+    var m := lo * pinv;
+    Mul64x64(m, p, var h2, var l2);
     var t := hi + h2 + QWord(ord(lo <> 0));
     {$endif}
     a[j + len] := t;
@@ -3483,9 +3527,9 @@ end;
 
 // inverse transform: values in [0,2p) throughout; the caller's final scaling
 // pass reduces exactly (and folds in the 1/n factor)
-procedure NttInv(a: PQWord; n: SizeInt);
+procedure NttInv(a: PQWord; n: SizeInt; pk: integer);
 begin
-  NttInvRec(a, n, 1);
+  NttInvRec(a, n, 1, pk);
 end;
 
 // largest coefficient width so the convolution stays below p: n*(2^b-1)^2 <
@@ -3505,24 +3549,49 @@ begin
   result := 0;
 end;
 
-// whether the single-prime NTT should handle these operand sizes. the
-// transform length is the next power of two, so just past a boundary it wastes
-// up to 2x - the classic FFT sawtooth. below the force multiple that waste can
-// lose to Toom, so the mid band only takes NTT when the transform fills well;
-// above it even a half-empty transform wins
-function NttUse(la, lb: SizeInt): boolean;
+// which NTT should handle these operand sizes: 0 = none (Toom), 1 = the
+// adaptive-b single-prime transform, 3 = the fixed-b=64 3-prime transform.
+// the transform length is the next power of two, so just past a boundary it
+// wastes up to 2x - the classic FFT sawtooth. below the force multiple that
+// waste can lose to Toom, so the mid band only takes a transform when it
+// fills well; above it even a half-empty transform wins. between the two
+// variants the butterfly inner loops are identical, so the total butterfly
+// count (transforms x points x stages) decides
+function NttPick(la, lb: SizeInt): integer;
 begin
+  result := 0;
+  var mn := MinS(la, lb);
+  var c1 := High(Int64);
+  var c3 := High(Int64);
   var abits := Int64(la) * LIMB_BITS;
   var bbits := Int64(lb) * LIMB_BITS;
-  var b := NttChooseB(abits, bbits);
-  if b = 0 then exit(false);
-  var mn := MinS(la, lb);
-  if mn < BigIntNttThreshold then exit(false);
-  if mn >= Int64(BigIntNttThreshold) * 4 then exit(true);
-  var need := SizeInt((abits + b - 1) div b + (bbits + b - 1) div b);
-  var n: SizeInt := 1;
-  while n < need do n := n shl 1;
-  result := need * 4 >= n * 3; // fill >= 0.75, the good half of the sawtooth
+  if mn >= BigIntNttThreshold then begin
+    var b := NttChooseB(abits, bbits);
+    if b > 0 then begin
+      var need := SizeInt((abits + b - 1) div b + (bbits + b - 1) div b);
+      var n: SizeInt := 1;
+      var lg := 0;
+      while n < need do begin
+        n := n shl 1;
+        inc(lg);
+      end;
+      if (mn >= Int64(BigIntNttThreshold) * 4) or (need * 4 >= n * 3) then c1 := Int64(3) * n * lg;
+    end;
+  end;
+  {$ifdef BIGINT_INT128}
+  if mn >= BigIntNtt3Threshold then begin
+    var need := la + lb;
+    var n: SizeInt := 1;
+    var lg := 0;
+    while n < need do begin
+      n := n shl 1;
+      inc(lg);
+    end;
+    if (mn >= Int64(BigIntNtt3Threshold) * 4) or (need * 4 >= n * 3) then c3 := Int64(9) * n * lg;
+  end;
+  {$endif}
+  if (c3 < High(Int64)) and (c3 <= c1) then exit(3);
+  if c1 < High(Int64) then exit(1);
 end;
 
 // split (p, len) into b-bit coefficients, zero-padding the transform tail
@@ -3577,6 +3646,10 @@ begin
   LNorm(result);
 end;
 
+// the single-prime transform runs entirely in prime index 2
+const
+  NTT_PK1 = 2;
+
 function LMulNttP(pa: PLimb; la: SizeInt; pb: PLimb; lb: SizeInt): TLimbs;
 var
   fa, fb: array of QWord;
@@ -3589,26 +3662,27 @@ begin
   var n: SizeInt := 1;
   while n < na + nb do n := n shl 1;
   NttInitOnce;
-  NttEnsureTables(n);
+  NttEnsureTables(n, NTT_PK1);
   SetLength(fa, n);
   SetLength(fb, n);
   NttPack(pa, la, b, @fa[0], na, n);
   NttPack(pb, lb, b, @fb[0], nb, n);
-  NttFwd(@fa[0], n);
-  NttFwd(@fb[0], n);
+  NttFwd(@fa[0], n, NTT_PK1);
+  NttFwd(@fb[0], n, NTT_PK1);
   // the forward transforms leave values in [0,4p); reduce below 2p so the
   // pointwise Montgomery product cannot overflow 128 bits
+  var p2 := QWord(2) * NTT_P; // QWord() keeps the folded constant unsigned
   for var i := 0 to n - 1 do begin
     var x := fa[i];
-    x := x - (NTT_2P and (QWord(0) - QWord(ord(x >= NTT_2P))));
+    x := x - (p2 and (QWord(0) - QWord(ord(x >= p2))));
     var y := fb[i];
-    y := y - (NTT_2P and (QWord(0) - QWord(ord(y >= NTT_2P))));
-    fa[i] := NttMulMod(x, y);
+    y := y - (p2 and (QWord(0) - QWord(ord(y >= p2))));
+    fa[i] := NttMulMod(x, y, NTT_PK1);
   end;
-  NttInv(@fa[0], n);
+  NttInv(@fa[0], n, NTT_PK1);
   // one pass folds 1/n and the Montgomery factor left by the pointwise step
-  var k := NttMulMod(NttMulMod(NttPowMod(QWord(n), NTT_P - 2), NttR2), NttR2);
-  for var i := 0 to na + nb - 2 do fa[i] := NttMulMod(fa[i], k);
+  var k := NttMulMod(NttMulMod(NttPowMod(QWord(n), NTT_P - 2, NTT_PK1), NttR2A[NTT_PK1], NTT_PK1), NttR2A[NTT_PK1], NTT_PK1);
+  for var i := 0 to na + nb - 2 do fa[i] := NttMulMod(fa[i], k, NTT_PK1);
   result := NttUnpack(@fa[0], na + nb - 1, b, la + lb);
   NttReleaseTables;
 end;
@@ -3623,30 +3697,227 @@ begin
   var n: SizeInt := 1;
   while n < 2 * na do n := n shl 1;
   NttInitOnce;
-  NttEnsureTables(n);
+  NttEnsureTables(n, NTT_PK1);
   SetLength(fa, n);
   NttPack(pa, la, b, @fa[0], na, n);
-  NttFwd(@fa[0], n);
+  NttFwd(@fa[0], n, NTT_PK1);
   // the forward transform leaves values in [0,4p); reduce below 2p so the
   // pointwise Montgomery product cannot overflow 128 bits
+  var p2 := QWord(2) * NTT_P; // QWord() keeps the folded constant unsigned
   for var i := 0 to n - 1 do begin
     var x := fa[i];
-    x := x - (NTT_2P and (QWord(0) - QWord(ord(x >= NTT_2P))));
-    fa[i] := NttMulMod(x, x);
+    x := x - (p2 and (QWord(0) - QWord(ord(x >= p2))));
+    fa[i] := NttMulMod(x, x, NTT_PK1);
   end;
-  NttInv(@fa[0], n);
-  var k := NttMulMod(NttMulMod(NttPowMod(QWord(n), NTT_P - 2), NttR2), NttR2);
-  for var i := 0 to 2 * na - 2 do fa[i] := NttMulMod(fa[i], k);
+  NttInv(@fa[0], n, NTT_PK1);
+  var k := NttMulMod(NttMulMod(NttPowMod(QWord(n), NTT_P - 2, NTT_PK1), NttR2A[NTT_PK1], NTT_PK1), NttR2A[NTT_PK1], NTT_PK1);
+  for var i := 0 to 2 * na - 2 do fa[i] := NttMulMod(fa[i], k, NTT_PK1);
   result := NttUnpack(@fa[0], 2 * na - 1, b, 2 * la);
   NttReleaseTables;
 end;
+
+{$ifdef BIGINT_INT128}
+
+// -- 3-prime NTT with 64-bit-limb coefficients ----------------------
+// limbs are the transform coefficients directly (no bit packing), each prime
+// yields the convolution mod p, and Garner's CRT lifts the three residues to
+// the exact coefficient, folded into limbs by a 192-bit sliding accumulator
+
+var
+  NttCrtReady: boolean = false;
+  NttC01, NttC01S: QWord;  // inv(p0) mod p1 and its Shoup companion
+  NttC02, NttC02S: QWord;  // inv(p0) mod p2
+  NttC12, NttC12S: QWord;  // inv(p1) mod p2
+  NttRedS: array[0..NTT_NP - 1] of QWord; // floor(2^64/p), Shoup companion of 1
+  NttPP01Lo, NttPP01Hi: QWord; // p0*p1 as two limbs
+
+procedure NttCrtInit;
+begin
+  if NttCrtReady then exit;
+  NttC01 := NttPowMod(NTT_PRIMES[0] mod NTT_PRIMES[1], NTT_PRIMES[1] - 2, 1);
+  NttC02 := NttPowMod(NTT_PRIMES[0] mod NTT_PRIMES[2], NTT_PRIMES[2] - 2, 2);
+  NttC12 := NttPowMod(NTT_PRIMES[1] mod NTT_PRIMES[2], NTT_PRIMES[2] - 2, 2);
+  NttC01S := NttShoup(NttC01, 1);
+  NttC02S := NttShoup(NttC02, 2);
+  NttC12S := NttShoup(NttC12, 2);
+  for var k := 0 to NTT_NP - 1 do NttRedS[k] := NttShoup(1, k);
+  var pp := UInt128(NTT_PRIMES[0]) * NTT_PRIMES[1];
+  NttPP01Lo := QWord(pp);
+  NttPP01Hi := QWord(pp shr 64);
+  NttCrtReady := true;
+end;
+
+// x * c mod p with the precomputed Shoup companion cs; exact result in [0,p)
+function NttShoupMul(x, c, cs, p: QWord): QWord; inline;
+begin
+  var q := QWord((UInt128(x) * cs) shr 64);
+  var r := x * c - q * p;
+  result := if r >= p then r - p else r;
+end;
+
+// residues mod prime pk of the product (pa,la)*(pb,lb): fa gets the exact
+// convolution mod p in [0,p), fb is scratch; both are n limbs
+procedure Ntt3Residues(pk: integer; pa: PLimb; la: SizeInt; pb: PLimb; lb: SizeInt; n: SizeInt; fa, fb: PQWord);
+begin
+  var p := NTT_PRIMES[pk];
+  var p2 := 2 * p;
+  // pack: one Shoup product by 1 reduces each limb below 2p, inside the
+  // forward transform's [0,4p) invariant
+  var rc := NttRedS[pk];
+  for var i := 0 to la - 1 do begin
+    var x := QWord(pa[i]);
+    var q := QWord((UInt128(x) * rc) shr 64);
+    fa[i] := x - q * p;
+  end;
+  for var i := 0 to lb - 1 do begin
+    var x := QWord(pb[i]);
+    var q := QWord((UInt128(x) * rc) shr 64);
+    fb[i] := x - q * p;
+  end;
+  FillChar(fa[la], (n - la) * SizeOf(QWord), 0);
+  FillChar(fb[lb], (n - lb) * SizeOf(QWord), 0);
+  NttFwd(fa, n, pk);
+  NttFwd(fb, n, pk);
+  for var i := 0 to n - 1 do begin
+    var x := fa[i];
+    x := x - (p2 and (QWord(0) - QWord(ord(x >= p2))));
+    var y := fb[i];
+    y := y - (p2 and (QWord(0) - QWord(ord(y >= p2))));
+    fa[i] := NttMulMod(x, y, pk);
+  end;
+  NttInv(fa, n, pk);
+  // fold 1/n and the Montgomery factor; exact-reduces to [0,p)
+  var sc := NttMulMod(NttMulMod(NttPowMod(QWord(n), p - 2, pk), NttR2A[pk], pk), NttR2A[pk], pk);
+  for var i := 0 to n - 1 do fa[i] := NttMulMod(fa[i], sc, pk);
+end;
+
+// squaring variant: one forward transform per prime instead of two
+procedure Ntt3ResiduesSqr(pk: integer; pa: PLimb; la: SizeInt; n: SizeInt; fa: PQWord);
+begin
+  var p := NTT_PRIMES[pk];
+  var p2 := 2 * p;
+  var rc := NttRedS[pk];
+  for var i := 0 to la - 1 do begin
+    var x := QWord(pa[i]);
+    var q := QWord((UInt128(x) * rc) shr 64);
+    fa[i] := x - q * p;
+  end;
+  FillChar(fa[la], (n - la) * SizeOf(QWord), 0);
+  NttFwd(fa, n, pk);
+  for var i := 0 to n - 1 do begin
+    var x := fa[i];
+    x := x - (p2 and (QWord(0) - QWord(ord(x >= p2))));
+    fa[i] := NttMulMod(x, x, pk);
+  end;
+  NttInv(fa, n, pk);
+  var sc := NttMulMod(NttMulMod(NttPowMod(QWord(n), p - 2, pk), NttR2A[pk], pk), NttR2A[pk], pk);
+  for var i := 0 to n - 1 do fa[i] := NttMulMod(fa[i], sc, pk);
+end;
+
+// Garner CRT of the three residue arrays into rl output limbs: coefficient
+// x = r0 + p0*t1 + p0*p1*t2 < p0*p1*p2 lands at limb i through a 192-bit
+// sliding accumulator (x < n * 2^128, so three limbs always suffice)
+function Ntt3Crt(r0, r1, r2: PQWord; rl: SizeInt): TLimbs;
+begin
+  var res := LNew(rl);
+  var a0: QWord := 0;
+  var a1: QWord := 0;
+  var a2: QWord := 0;
+  var p1 := NTT_PRIMES[1];
+  var p2 := NTT_PRIMES[2];
+  for var i := 0 to rl - 1 do begin
+    var v0 := r0[i];
+    // t1 = (r1 - r0) * inv(p0) mod p1
+    var v1 := r1[i];
+    var d1 := v1 + (p1 and (QWord(0) - QWord(ord(v1 < v0)))) - v0;
+    var t1 := NttShoupMul(d1, NttC01, NttC01S, p1);
+    // t2 = ((r2 - r0) * inv(p0) - t1) * inv(p1) mod p2
+    var v2 := r2[i];
+    var d2 := v2 + (p2 and (QWord(0) - QWord(ord(v2 < v0)))) - v0;
+    var u2 := NttShoupMul(d2, NttC02, NttC02S, p2);
+    var d3 := u2 + (p2 and (QWord(0) - QWord(ord(u2 < t1)))) - t1;
+    var t2 := NttShoupMul(d3, NttC12, NttC12S, p2);
+    // acc += r0 + p0*t1 + p0p1*t2
+    var lo := UInt128(NTT_PRIMES[0]) * t1 + v0;
+    var m1 := UInt128(NttPP01Lo) * t2;
+    var m2 := UInt128(NttPP01Hi) * t2;
+    var s := UInt128(a0) + QWord(lo);
+    s := s + QWord(m1);
+    a0 := QWord(s);
+    var carry := QWord(s shr 64);
+    var s1 := UInt128(a1) + QWord(lo shr 64);
+    s1 := s1 + QWord(m1 shr 64);
+    s1 := s1 + QWord(m2);
+    s1 := s1 + carry;
+    a1 := QWord(s1);
+    a2 := a2 + QWord(m2 shr 64) + QWord(s1 shr 64);
+    res[i] := TLimb(a0);
+    a0 := a1;
+    a1 := a2;
+    a2 := 0;
+  end;
+  LNorm(res);
+  result := res;
+end;
+
+function LMulNtt3P(pa: PLimb; la: SizeInt; pb: PLimb; lb: SizeInt): TLimbs;
+var
+  fa, fb, r0, r1: array of QWord;
+begin
+  var rl := la + lb;
+  var n: SizeInt := 1;
+  while n < rl do n := n shl 1;
+  NttInitOnce;
+  NttCrtInit;
+  for var k := 0 to NTT_NP - 1 do NttEnsureTables(n, k);
+  SetLength(fa, n);
+  SetLength(fb, n);
+  SetLength(r0, rl);
+  SetLength(r1, rl);
+  Ntt3Residues(0, pa, la, pb, lb, n, @fa[0], @fb[0]);
+  Move(fa[0], r0[0], rl * SizeOf(QWord));
+  Ntt3Residues(1, pa, la, pb, lb, n, @fa[0], @fb[0]);
+  Move(fa[0], r1[0], rl * SizeOf(QWord));
+  Ntt3Residues(2, pa, la, pb, lb, n, @fa[0], @fb[0]);
+  result := Ntt3Crt(@r0[0], @r1[0], @fa[0], rl);
+  NttReleaseTables;
+end;
+
+function LSqrNtt3P(pa: PLimb; la: SizeInt): TLimbs;
+var
+  fa, r0, r1: array of QWord;
+begin
+  var rl := 2 * la;
+  var n: SizeInt := 1;
+  while n < rl do n := n shl 1;
+  NttInitOnce;
+  NttCrtInit;
+  for var k := 0 to NTT_NP - 1 do NttEnsureTables(n, k);
+  SetLength(fa, n);
+  SetLength(r0, rl);
+  SetLength(r1, rl);
+  Ntt3ResiduesSqr(0, pa, la, n, @fa[0]);
+  Move(fa[0], r0[0], rl * SizeOf(QWord));
+  Ntt3ResiduesSqr(1, pa, la, n, @fa[0]);
+  Move(fa[0], r1[0], rl * SizeOf(QWord));
+  Ntt3ResiduesSqr(2, pa, la, n, @fa[0]);
+  result := Ntt3Crt(@r0[0], @r1[0], @fa[0], rl);
+  NttReleaseTables;
+end;
+
+{$endif}
 
 function LMulP(pa: PLimb; la: SizeInt; pb: PLimb; lb: SizeInt): TLimbs;
 begin
   var mn := MinS(la, lb);
   if mn < BigIntKaratsubaThreshold then exit(LMulBasicP(pa, la, pb, lb));
   if MaxS(la, lb) < 2 * mn then begin
-    if NttUse(la, lb) then exit(LMulNttP(pa, la, pb, lb));
+    case NttPick(la, lb) of
+      1: exit(LMulNttP(pa, la, pb, lb));
+      {$ifdef BIGINT_INT128}
+      3: exit(LMulNtt3P(pa, la, pb, lb));
+      {$endif}
+    end;
     if mn >= BigIntToom4Threshold then exit(LMulToom4P(pa, la, pb, lb));
     if mn >= BigIntToom3Threshold then exit(LMulToom3P(pa, la, pb, lb));
   end;
@@ -3661,7 +3932,12 @@ end;
 function LSqrP(pa: PLimb; la: SizeInt): TLimbs;
 begin
   if la < BigIntKaratsubaThreshold then exit(LSqrBasicP(pa, la));
-  if NttUse(la, la) then exit(LSqrNttP(pa, la));
+  case NttPick(la, la) of
+    1: exit(LSqrNttP(pa, la));
+    {$ifdef BIGINT_INT128}
+    3: exit(LSqrNtt3P(pa, la));
+    {$endif}
+  end;
   if la >= BigIntToom4Threshold then exit(LSqrToom4P(pa, la));
   if la >= BigIntToom3Threshold then exit(LSqrToom3P(pa, la));
   result := LSqrKaraP(pa, la);
