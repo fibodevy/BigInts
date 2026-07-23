@@ -506,7 +506,9 @@ begin
 end.
 ```
 
-### Primes and a toy RSA
+### Primes and RSA
+
+The public exponent runs on the fast `modPow`; the secret one goes through the constant-time `TModRingSec` so decrypt/sign timing does not leak the key.
 
 ```pascal
 program rsa;
@@ -517,14 +519,15 @@ uses BigInts;
 
 begin
   BigIntRandomize;
-  var p := UBigInt.randomPrime(512);
-  var q := UBigInt.randomPrime(512);
+  var p := UBigInt.randomPrime(1024);
+  var q := UBigInt.randomPrime(1024);
   var n := p * q;
   var e: UBigInt := 65537;
-  var d := e.modInverse((p - 1) * (q - 1));
+  var d := e.modInverse((p - 1).lcm(q - 1));
+  var priv := TModRingSec.create(n);
   var msg: UBigInt := '0x48656C6C6F21';    // "Hello!"
   var cipher := msg.modPow(e, n);
-  writeln(cipher.modPow(d, n) = msg);      // TRUE
+  writeln(priv.modPow(cipher, d) = msg);   // TRUE
   {$ifdef WINDOWS}readln;{$endif}
 end.
 ```
