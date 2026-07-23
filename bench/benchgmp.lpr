@@ -115,9 +115,12 @@ begin
 end;
 
 const
-  W_NAME = 20;
-  W_TIME = 13;
+  W_TIME = 32;
   W_RATIO = 8;
+  W_RAM = 10;
+
+var
+  W_NAME: integer = 24; // widest operation label; set at startup
 
 function PadL(const s: string; w: integer): string;
 begin
@@ -134,26 +137,39 @@ end;
 procedure Sep;
 begin
   writeln('+', StringOfChar('-', W_NAME + 2), '+', StringOfChar('-', W_TIME + 2), '+',
-          StringOfChar('-', W_TIME + 2), '+', StringOfChar('-', W_RATIO + 2), '+');
+          StringOfChar('-', W_TIME + 2), '+', StringOfChar('-', W_RATIO + 2), '+', StringOfChar('-', W_RAM + 2), '+');
 end;
 
-procedure Cells(const name, c1, c2, c3: string);
+procedure Cells(const name, c1, c2, c3, c4: string);
 begin
-  writeln('| ', PadR(name, W_NAME), ' | ', PadL(c1, W_TIME), ' | ', PadL(c2, W_TIME), ' | ', PadL(c3, W_RATIO), ' |');
+  writeln('| ', PadR(name, W_NAME), ' | ', PadL(c1, W_TIME), ' | ', PadL(c2, W_TIME), ' | ', PadL(c3, W_RATIO), ' | ', PadL(c4, W_RAM), ' |');
 end;
 
 // always microseconds so a column never mixes units (ns vs ms reads wrong at
-// a glance); 3 decimals keep sub-microsecond ops legible
+// a glance); 3 decimals keep sub-microsecond ops legible. the seconds twin on
+// the right (integer part space-padded to 3, fraction zero-padded to 3) makes
+// the slow rows readable without unit juggling
 function FmtNs(ns: Double): string;
 begin
-  result := Format('%.3f us', [ns / 1e3]);
+  result := Format('%.3f us / %7.3f s', [ns / 1e3, ns / 1e9]);
+end;
+
+// FPC heap in use right now (our side only; GMP allocates through its own C
+// heap and is invisible here). sampled per row with the operands still live,
+// so it reads as the operand footprint for that size
+function RamStr: string;
+begin
+  var b := Double(GetFPCHeapStatus.CurrHeapUsed);
+  if b >= 1024*1024*1024 then result := Format('%.2f GB', [b / (1024*1024*1024)])
+  else if b >= 1024*1024 then result := Format('%.1f MB', [b / (1024*1024)])
+  else result := Format('%.0f KB', [b / 1024]);
 end;
 
 procedure Row(const name: string; const ourOp, gmpOp: TOp);
 begin
   var ours := BenchNs(ourOp);
   var g := BenchNs(gmpOp);
-  Cells(name, FmtNs(ours), FmtNs(g), Format('%.1fx', [ours / g]));
+  Cells(name, FmtNs(ours), FmtNs(g), Format('%.1fx', [ours / g]), RamStr);
 end;
 
 // random value with exactly the requested bit length
@@ -163,45 +179,92 @@ begin
   result.setBit(bits - 1);
 end;
 
+// decimal-digit count needed to size an operand: bits = ceil(digits*log2(10))
+function DigitsToBits(digits: LongWord): LongWord;
+begin
+  result := LongWord(Trunc(digits*3.3219280948873623)) + 1;
+end;
+
+// row tag for a digit count: fold whole thousands/millions/billions into
+// K/M/B, raw number otherwise
+function SizeTag(digits: LongWord): string;
+begin
+  if (digits >= 1000000000) and (digits mod 1000000000 = 0) then exit(IntToStr(digits div 1000000000)+'B');
+  if (digits >= 1000000) and (digits mod 1000000 = 0) then exit(IntToStr(digits div 1000000)+'M');
+  if (digits >= 1000) and (digits mod 1000 = 0) then exit(IntToStr(digits div 1000)+'K');
+  result := IntToStr(digits);
+end;
+
 // ---------------------------------------------------------------------------
 // benchmark sections
 // ---------------------------------------------------------------------------
 
 const
-  addSizes: array[4] of LongWord = (128, 1024, 16384, 262144);
-  mulSizes: array[5] of LongWord = (128, 1024, 8192, 65536, 262144);
-  sqrSizes: array[2] of LongWord = (8192, 65536);
-  strSizes: array[2] of LongWord = (4096, 65536);
-  powSizes: array[3] of LongWord = (512, 1024, 2048);
-  gcdSizes: array[2] of LongWord = (1024, 16384);
+  // sizes are decimal-digit counts on a shared axis: 128, 1024, 16384,
+  // 262144, then 1/10/100 million and a billion. the sub-million rungs sit in
+  // every op; the large ones only reach as far as the op already did, never
+  // extended past its range (GMP's 32-bit mp_size_t caps mul/div at 100
+  // million and sqr at 10 million, modPow/gcd stay small)
+  addSizes: array[8] of LongWord = (128, 1024, 16384, 262144, 1000000, 10000000, 100000000, 1000000000);
+  mulSizes: array[7] of LongWord = (128, 1024, 16384, 262144, 1000000, 10000000, 100000000);
+  sqrSizes: array[6] of LongWord = (128, 1024, 16384, 262144, 1000000, 10000000);
+  divSizes: array[7] of LongWord = (128, 1024, 16384, 262144, 1000000, 10000000, 100000000);
+  strSizes: array[4] of LongWord = (128, 1024, 16384, 262144);
+  powSizes: array[3] of LongWord = (128, 1024, 16384);
+  gcdSizes: array[5] of LongWord = (128, 1024, 16384, 262144, 1000000);
 
 var
   gr, gq, gm: mpz_t; // shared gmp result slots
 
-procedure BenchAdd(bits: LongWord);
+// widest operation label across every row, so the name column never overflows;
+// the div/divmod pair rows at the top sizes are the longest
+function LabelWidth: integer;
+  procedure bump(const s: string);
+  begin
+    if Length(s) > result then result := Length(s);
+  end;
+begin
+  result := Length('operation');
+  for var d in addSizes do begin
+    bump($'add ({SizeTag(d)} digits)'); bump($'addTo ({SizeTag(d)} digits)');
+    bump($'sub ({SizeTag(d)} digits)'); bump($'subTo ({SizeTag(d)} digits)');
+  end;
+  for var d in mulSizes do bump($'mul ({SizeTag(d)} digits)');
+  bump($'mul ({SizeTag(100000)}x{SizeTag(1000)} digits)');
+  for var d in sqrSizes do bump($'sqr ({SizeTag(d)} digits)');
+  for var d in divSizes do begin
+    bump($'div ({SizeTag(d)} / {SizeTag(d div 2)} digits)');
+    bump($'divmod ({SizeTag(d)} / {SizeTag(d div 2)} digits)');
+  end;
+  for var d in strSizes do begin bump($'toString ({SizeTag(d)} digits)'); bump($'parse ({SizeTag(d)} digits)'); end;
+  for var d in powSizes do bump(if d >= 16384 then $'modPow ({SizeTag(d)} digits, 4k-bit e)' else $'modPow ({SizeTag(d)} digits)');
+  for var d in gcdSizes do bump($'gcd ({SizeTag(d)} digits)');
+end;
+
+procedure BenchAdd(digits: LongWord);
 var
   za, zb: mpz_t;
 begin
-  var a := RandExact(bits);
-  var b := RandExact(bits);
+  var a := RandExact(DigitsToBits(digits));
+  var b := RandExact(DigitsToBits(digits));
   mpz_init(za); mpz_init(zb);
   mpzFromU(za, a); mpzFromU(zb, b);
-  Row($'add {bits}b',
+  Row($'add ({SizeTag(digits)} digits)',
     procedure(n: Int64) begin for var i: Int64 := 1 to n do sink := sink xor (a + b).bitLength; end,
     procedure(n: Int64) begin for var i: Int64 := 1 to n do mpz_add(gr, za, zb); end);
   mpz_clear(za); mpz_clear(zb);
 end;
 
-procedure BenchSub(bits: LongWord);
+procedure BenchSub(digits: LongWord);
 var
   za, zb: mpz_t;
 begin
-  var a := RandExact(bits);
-  var b := RandExact(bits);
+  var a := RandExact(DigitsToBits(digits));
+  var b := RandExact(DigitsToBits(digits));
   if a < b then begin var t := a; a := b; b := t; end;
   mpz_init(za); mpz_init(zb);
   mpzFromU(za, a); mpzFromU(zb, b);
-  Row($'sub {bits}b',
+  Row($'sub ({SizeTag(digits)} digits)',
     procedure(n: Int64) begin for var i: Int64 := 1 to n do sink := sink xor (a - b).bitLength; end,
     procedure(n: Int64) begin for var i: Int64 := 1 to n do mpz_sub(gr, za, zb); end);
   mpz_clear(za); mpz_clear(zb);
@@ -209,140 +272,142 @@ end;
 
 // in-place addTo/subTo against the same mpz calls, which are in-place on the
 // GMP side already; r persists across iterations so its buffer gets reused
-procedure BenchAddTo(bits: LongWord);
+procedure BenchAddTo(digits: LongWord);
 var
   za, zb: mpz_t;
   r: UBigInt;
 begin
-  var a := RandExact(bits);
-  var b := RandExact(bits);
+  var a := RandExact(DigitsToBits(digits));
+  var b := RandExact(DigitsToBits(digits));
   mpz_init(za); mpz_init(zb);
   mpzFromU(za, a); mpzFromU(zb, b);
-  Row($'addTo {bits}b',
+  Row($'addTo ({SizeTag(digits)} digits)',
     procedure(n: Int64) begin for var i: Int64 := 1 to n do begin addTo(r, a, b); sink := sink xor r.bitLength; end; end,
     procedure(n: Int64) begin for var i: Int64 := 1 to n do mpz_add(gr, za, zb); end);
   mpz_clear(za); mpz_clear(zb);
 end;
 
-procedure BenchSubTo(bits: LongWord);
+procedure BenchSubTo(digits: LongWord);
 var
   za, zb: mpz_t;
   r: UBigInt;
 begin
-  var a := RandExact(bits);
-  var b := RandExact(bits);
+  var a := RandExact(DigitsToBits(digits));
+  var b := RandExact(DigitsToBits(digits));
   if a < b then begin var t := a; a := b; b := t; end;
   mpz_init(za); mpz_init(zb);
   mpzFromU(za, a); mpzFromU(zb, b);
-  Row($'subTo {bits}b',
+  Row($'subTo ({SizeTag(digits)} digits)',
     procedure(n: Int64) begin for var i: Int64 := 1 to n do begin subTo(r, a, b); sink := sink xor r.bitLength; end; end,
     procedure(n: Int64) begin for var i: Int64 := 1 to n do mpz_sub(gr, za, zb); end);
   mpz_clear(za); mpz_clear(zb);
 end;
 
-procedure BenchMul(abits, bbits: LongWord);
+procedure BenchMul(adigits, bdigits: LongWord);
 var
   za, zb: mpz_t;
 begin
-  var a := RandExact(abits);
-  var b := RandExact(bbits);
+  var a := RandExact(DigitsToBits(adigits));
+  var b := RandExact(DigitsToBits(bdigits));
   mpz_init(za); mpz_init(zb);
   mpzFromU(za, a); mpzFromU(zb, b);
-  Row(if abits = bbits then $'mul {abits}b' else $'mul {abits}x{bbits}b',
+  Row(if adigits = bdigits then $'mul ({SizeTag(adigits)} digits)' else $'mul ({SizeTag(adigits)}x{SizeTag(bdigits)} digits)',
     procedure(n: Int64) begin for var i: Int64 := 1 to n do sink := sink xor (a * b).bitLength; end,
     procedure(n: Int64) begin for var i: Int64 := 1 to n do mpz_mul(gr, za, zb); end);
   mpz_clear(za); mpz_clear(zb);
 end;
 
-procedure BenchSqr(bits: LongWord);
+procedure BenchSqr(digits: LongWord);
 var
   za: mpz_t;
 begin
-  var a := RandExact(bits);
+  var a := RandExact(DigitsToBits(digits));
   mpz_init(za);
   mpzFromU(za, a);
-  Row($'sqr {bits}b',
+  Row($'sqr ({SizeTag(digits)} digits)',
     procedure(n: Int64) begin for var i: Int64 := 1 to n do sink := sink xor a.sqr.bitLength; end,
     procedure(n: Int64) begin for var i: Int64 := 1 to n do mpz_mul(gr, za, za); end);
   mpz_clear(za);
 end;
 
-procedure BenchDivQ(nbits, dbits: LongWord);
+procedure BenchDivQ(ndigits, ddigits: LongWord);
 var
   zn, zd: mpz_t;
 begin
-  var nv := RandExact(nbits);
-  var dv := RandExact(dbits);
+  var nv := RandExact(DigitsToBits(ndigits));
+  var dv := RandExact(DigitsToBits(ddigits));
   mpz_init(zn); mpz_init(zd);
   mpzFromU(zn, nv); mpzFromU(zd, dv);
-  Row($'div {nbits}/{dbits}b',
+  Row($'div ({SizeTag(ndigits)} / {SizeTag(ddigits)} digits)',
     procedure(n: Int64) begin for var i: Int64 := 1 to n do sink := sink xor (nv div dv).bitLength; end,
     procedure(n: Int64) begin for var i: Int64 := 1 to n do mpz_tdiv_q(gq, zn, zd); end);
   mpz_clear(zn); mpz_clear(zd);
 end;
 
-procedure BenchDiv(nbits, dbits: LongWord);
+procedure BenchDiv(ndigits, ddigits: LongWord);
 var
   zn, zd: mpz_t;
 begin
-  var nv := RandExact(nbits);
-  var dv := RandExact(dbits);
+  var nv := RandExact(DigitsToBits(ndigits));
+  var dv := RandExact(DigitsToBits(ddigits));
   mpz_init(zn); mpz_init(zd);
   mpzFromU(zn, nv); mpzFromU(zd, dv);
-  Row($'divmod {nbits}/{dbits}b',
+  Row($'divmod ({SizeTag(ndigits)} / {SizeTag(ddigits)} digits)',
     procedure(n: Int64) begin for var i: Int64 := 1 to n do begin var (q, r) := nv.divMod(dv); sink := sink xor q.bitLength xor r.bitLength; end; end,
     procedure(n: Int64) begin for var i: Int64 := 1 to n do mpz_tdiv_qr(gq, gr, zn, zd); end);
   mpz_clear(zn); mpz_clear(zd);
 end;
 
-procedure BenchToString(bits: LongWord);
+procedure BenchToString(digits: LongWord);
 var
   za: mpz_t;
 begin
-  var a := RandExact(bits);
+  var a := RandExact(DigitsToBits(digits));
   mpz_init(za);
   mpzFromU(za, a);
   var buf: AnsiString;
   SetLength(buf, mpz_sizeinbase(za, 10) + 2);
-  Row($'toString {bits}b',
+  Row($'toString ({SizeTag(digits)} digits)',
     procedure(n: Int64) begin for var i: Int64 := 1 to n do sink := sink xor LongWord(Length(a.toString)); end,
     procedure(n: Int64) begin for var i: Int64 := 1 to n do mpz_get_str(PAnsiChar(buf), 10, za); end);
   mpz_clear(za);
 end;
 
-procedure BenchParse(bits: LongWord);
+procedure BenchParse(digits: LongWord);
 begin
-  var s := RandExact(bits).toString;
-  Row($'parse {bits}b',
+  var s := RandExact(DigitsToBits(digits)).toString;
+  Row($'parse ({SizeTag(digits)} digits)',
     procedure(n: Int64) begin for var i: Int64 := 1 to n do sink := sink xor UBigInt.parse(s).bitLength; end,
     procedure(n: Int64) begin for var i: Int64 := 1 to n do mpz_set_str(gr, PAnsiChar(s), 10); end);
 end;
 
-procedure BenchModPow(bits: LongWord);
+procedure BenchModPow(digits: LongWord);
 var
   zb, ze, zm: mpz_t;
 begin
-  var base := RandExact(bits);
-  var e := RandExact(bits);
-  var m := RandExact(bits);
+  var base := RandExact(DigitsToBits(digits));
+  // a full-size exponent makes the ladder length quadratic in the size; the
+  // big rows cap it at 4096 bits so they measure the modular products
+  var e := RandExact(if digits >= 16384 then 4096 else DigitsToBits(digits));
+  var m := RandExact(DigitsToBits(digits));
   m.setBit(0); // odd modulus
   mpz_init(zb); mpz_init(ze); mpz_init(zm);
   mpzFromU(zb, base); mpzFromU(ze, e); mpzFromU(zm, m);
-  Row($'modPow {bits}b',
+  Row(if digits >= 16384 then $'modPow ({SizeTag(digits)} digits, 4k-bit e)' else $'modPow ({SizeTag(digits)} digits)',
     procedure(n: Int64) begin for var i: Int64 := 1 to n do sink := sink xor base.modPow(e, m).bitLength; end,
     procedure(n: Int64) begin for var i: Int64 := 1 to n do mpz_powm(gr, zb, ze, zm); end);
   mpz_clear(zb); mpz_clear(ze); mpz_clear(zm);
 end;
 
-procedure BenchGcd(bits: LongWord);
+procedure BenchGcd(digits: LongWord);
 var
   za, zb: mpz_t;
 begin
-  var a := RandExact(bits);
-  var b := RandExact(bits);
+  var a := RandExact(DigitsToBits(digits));
+  var b := RandExact(DigitsToBits(digits));
   mpz_init(za); mpz_init(zb);
   mpzFromU(za, a); mpzFromU(zb, b);
-  Row($'gcd {bits}b',
+  Row($'gcd ({SizeTag(digits)} digits)',
     procedure(n: Int64) begin for var i: Int64 := 1 to n do sink := sink xor a.gcd(b).bitLength; end,
     procedure(n: Int64) begin for var i: Int64 := 1 to n do mpz_gcd(gr, za, zb); end);
   mpz_clear(za); mpz_clear(zb);
@@ -373,27 +438,26 @@ begin
   writeln;
 
   writeln('(ratio = BigInts / GMP; >1 slower, <1 faster)');
+  W_NAME := LabelWidth;
   Sep;
-  Cells('operation', 'BigInts', 'GMP', 'ratio');
+  Cells('operation', 'BigInts', 'GMP', 'ratio', 'RAM used');
   Sep;
   RandSeed := 42;
-  for var bits in addSizes do BenchAdd(bits);
-  for var bits in addSizes do BenchAddTo(bits);
-  for var bits in addSizes do BenchSub(bits);
-  for var bits in addSizes do BenchSubTo(bits);
-  for var bits in mulSizes do BenchMul(bits, bits);
-  BenchMul(65536, 1024);
-  BenchDivQ(2048, 1024);
-  BenchDivQ(8192, 4096);
-  BenchDivQ(131072, 65536);
-  for var bits in sqrSizes do BenchSqr(bits);
-  BenchDiv(2048, 1024);
-  BenchDiv(8192, 4096);
-  BenchDiv(131072, 65536);
-  for var bits in strSizes do BenchToString(bits);
-  for var bits in strSizes do BenchParse(bits);
-  for var bits in powSizes do BenchModPow(bits);
-  for var bits in gcdSizes do BenchGcd(bits);
+  for var d in addSizes do BenchAdd(d);
+  for var d in addSizes do BenchAddTo(d);
+  for var d in addSizes do BenchSub(d);
+  for var d in addSizes do BenchSubTo(d);
+  for var d in mulSizes do BenchMul(d, d);
+  BenchMul(100000, 1000);
+  // dividend / half-size divisor; the fast divide keeps the big ones near
+  // multiply speed, so they stay in range
+  for var d in divSizes do BenchDivQ(d, d div 2);
+  for var d in sqrSizes do BenchSqr(d);
+  for var d in divSizes do BenchDiv(d, d div 2);
+  for var d in strSizes do BenchToString(d);
+  for var d in strSizes do BenchParse(d);
+  for var d in powSizes do BenchModPow(d);
+  for var d in gcdSizes do BenchGcd(d);
   Sep;
 
   writeln;
