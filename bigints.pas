@@ -5412,6 +5412,47 @@ begin
   end;
 end;
 
+// true when (p, len) is divisible by a prime in 53..997: one single-limb
+// remainder per packed product, then word-sized mods against its primes.
+// worth the extra passes only when the modPow a rejection saves is pricey,
+// so callers gate it on the operand size; the caller guarantees the value
+// itself is above 997, making divisible mean composite
+function HasMidPrimeFactor(p: PLimb; len: SizeInt): boolean;
+const
+  {$if LIMB_BITS = 64}
+  MID_PRODS: array[0..19] of TLimb = (
+    TLimb(3749562977351496827), TLimb(1572096270996914903), TLimb(4209294403030111035), TLimb(5339760549444364639), TLimb(4753219111004352187),
+    TLimb(260006624961107813), TLimb(707992818804600227), TLimb(4744450443318129435), TLimb(4340108409515894501), TLimb(2321032300312655019),
+    TLimb(429396606821275461), TLimb(49010633640532829), TLimb(1915768503665110467), TLimb(4917264111686304361), TLimb(182675399263485151),
+    TLimb(261171077386532413), TLimb(7598286435627855011), TLimb(723963793809266999), TLimb(779063344180506659), TLimb(971230541));
+  {$else}
+  MID_PRODS: array[0..47] of TLimb = (
+    TLimb(907383479), TLimb(4132280413), TLimb(121330189), TLimb(257557397), TLimb(490995677), TLimb(842952707), TLimb(1314423991), TLimb(2125525169),
+    TLimb(3073309843), TLimb(16965341), TLimb(20193023), TLimb(23300239), TLimb(29884301), TLimb(35360399), TLimb(42749359), TLimb(49143869),
+    TLimb(56466073), TLimb(65111573), TLimb(76027969), TLimb(84208541), TLimb(94593973), TLimb(103569859), TLimb(119319383), TLimb(133390067),
+    TLimb(154769821), TLimb(178433279), TLimb(193397129), TLimb(213479407), TLimb(229580147), TLimb(250367549), TLimb(271661713), TLimb(293158127),
+    TLimb(319512181), TLimb(357349471), TLimb(393806449), TLimb(422400701), TLimb(452366557), TLimb(507436351), TLimb(547978913), TLimb(575204137),
+    TLimb(627947039), TLimb(666785731), TLimb(710381447), TLimb(777767161), TLimb(834985999), TLimb(894826021), TLimb(951747481), TLimb(997));
+  {$endif}
+  MID_PRIMES: array[0..152] of word = (
+    53, 59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157, 163, 167, 173, 179, 181, 191, 193, 197,
+    199, 211, 223, 227, 229, 233, 239, 241, 251, 257, 263, 269, 271, 277, 281, 283, 293, 307, 311, 313, 317, 331, 337, 347, 349, 353, 359, 367,
+    373, 379, 383, 389, 397, 401, 409, 419, 421, 431, 433, 439, 443, 449, 457, 461, 463, 467, 479, 487, 491, 499, 503, 509, 521, 523, 541, 547,
+    557, 563, 569, 571, 577, 587, 593, 599, 601, 607, 613, 617, 619, 631, 641, 643, 647, 653, 659, 661, 673, 677, 683, 691, 701, 709, 719, 727,
+    733, 739, 743, 751, 757, 761, 769, 773, 787, 797, 809, 811, 821, 823, 827, 829, 839, 853, 857, 859, 863, 877, 881, 883, 887, 907, 911, 919,
+    929, 937, 941, 947, 953, 967, 971, 977, 983, 991, 997);
+begin
+  var idx := 0;
+  for var b := 0 to High(MID_PRODS) do begin
+    var r := LModWP(p, len, MID_PRODS[b]);
+    while (idx <= High(MID_PRIMES)) and (MID_PRODS[b] mod MID_PRIMES[idx] = 0) do begin
+      if r mod MID_PRIMES[idx] = 0 then exit(true);
+      inc(idx);
+    end;
+  end;
+  result := false;
+end;
+
 function UBigInt.isProbablePrime(rounds: integer): boolean;
 const
   // trial primes catch every composite below 47*47, and the first 12 double
@@ -5423,6 +5464,7 @@ begin
   var f := SmallOddFactor(dataPtr, fLen);
   if f <> 0 then exit(self = f);
   if self < 47 * 47 then exit(true);
+  if (fLen > 2) and HasMidPrimeFactor(dataPtr, fLen) then exit(false);
   // n-1 = d * 2^s with d odd
   var nm1 := self - 1;
   var s := nm1.lowestSetBit;
@@ -6013,8 +6055,9 @@ begin
   if isEven then exit(self = 2);
   // deterministic Miller-Rabin already settles everything below 3.3e24
   if bitLength <= 81 then exit(isProbablePrime);
-  // cheap trial reject before the modPow-priced tests (self > 47 here)
+  // cheap trial reject before the modPow-priced tests (self > 997 here)
   if SmallOddFactor(dataPtr, fLen) <> 0 then exit(false);
+  if HasMidPrimeFactor(dataPtr, fLen) then exit(false);
   // Baillie-PSW above: strong base-2 Miller-Rabin plus a strong Lucas test
   if not MillerRabin2(self) then exit(false);
   if isPerfectSquare then exit(false);
