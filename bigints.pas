@@ -10874,9 +10874,9 @@ begin
   var td := t.toDouble;
   // once erfc drops below the rounding threshold, erf is +-1
   if td * td > (p + 3) * 2.302585 + 5 then exit(if neg then -BigDecimal.one else BigDecimal.one);
-  // the series cancels for large t; widen the working precision to compensate
-  var guard := System.Trunc(0.44 * td * td) + 12;
-  var r := ErfSeries(t, p + guard);
+  // exact full-width accumulation in the series absorbs the alternating-term
+  // cancellation, so a flat margin suffices, no t^2-scaled widening needed
+  var r := ErfSeries(t, p + 12);
   if neg then r := -r;
   result := DecGuardCut(r, p);
 end;
