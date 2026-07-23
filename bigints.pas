@@ -3332,19 +3332,23 @@ end;
 const
   NTT_TAB_CACHE_MAX = SizeInt(1) shl 20;
 
+// free prime pk's twiddle tables when oversized; cached ones stay
+procedure NttReleaseOne(pk: integer);
+begin
+  if NttTabNA[pk] <= NTT_TAB_CACHE_MAX then exit;
+  NttWFA[pk] := nil;
+  NttWIA[pk] := nil;
+  {$ifdef BIGINT_INT128}
+  NttWSA[pk] := nil;
+  NttWISA[pk] := nil;
+  {$endif}
+  NttTabNA[pk] := 0;
+end;
+
 // free oversized twiddle tables after a transform; cached ones stay
 procedure NttReleaseTables;
 begin
-  for var k := 0 to NTT_NP - 1 do begin
-    if NttTabNA[k] <= NTT_TAB_CACHE_MAX then continue;
-    NttWFA[k] := nil;
-    NttWIA[k] := nil;
-    {$ifdef BIGINT_INT128}
-    NttWSA[k] := nil;
-    NttWISA[k] := nil;
-    {$endif}
-    NttTabNA[k] := 0;
-  end;
+  for var k := 0 to NTT_NP - 1 do NttReleaseOne(k);
 end;
 
 // the zeta products below are written out inline: with a native 128-bit type
@@ -3878,15 +3882,21 @@ begin
   while n < rl do n := n shl 1;
   NttInitOnce;
   NttCrtInit;
-  for var k := 0 to NTT_NP - 1 do NttEnsureTables(n, k);
   SetLength(fa, n);
   SetLength(fb, n);
   SetLength(r0, rl);
   SetLength(r1, rl);
+  // per-prime table build and release, so at most one prime's oversized
+  // tables are resident at a time
+  NttEnsureTables(n, 0);
   Ntt3Residues(0, pa, la, pb, lb, n, @fa[0], @fb[0]);
   Move(fa[0], r0[0], rl * SizeOf(QWord));
+  NttReleaseOne(0);
+  NttEnsureTables(n, 1);
   Ntt3Residues(1, pa, la, pb, lb, n, @fa[0], @fb[0]);
   Move(fa[0], r1[0], rl * SizeOf(QWord));
+  NttReleaseOne(1);
+  NttEnsureTables(n, 2);
   Ntt3Residues(2, pa, la, pb, lb, n, @fa[0], @fb[0]);
   result := Ntt3Crt(@r0[0], @r1[0], @fa[0], rl);
   NttReleaseTables;
@@ -3901,14 +3911,18 @@ begin
   while n < rl do n := n shl 1;
   NttInitOnce;
   NttCrtInit;
-  for var k := 0 to NTT_NP - 1 do NttEnsureTables(n, k);
   SetLength(fa, n);
   SetLength(r0, rl);
   SetLength(r1, rl);
+  NttEnsureTables(n, 0);
   Ntt3ResiduesSqr(0, pa, la, n, @fa[0]);
   Move(fa[0], r0[0], rl * SizeOf(QWord));
+  NttReleaseOne(0);
+  NttEnsureTables(n, 1);
   Ntt3ResiduesSqr(1, pa, la, n, @fa[0]);
   Move(fa[0], r1[0], rl * SizeOf(QWord));
+  NttReleaseOne(1);
+  NttEnsureTables(n, 2);
   Ntt3ResiduesSqr(2, pa, la, n, @fa[0]);
   result := Ntt3Crt(@r0[0], @r1[0], @fa[0], rl);
   NttReleaseTables;
