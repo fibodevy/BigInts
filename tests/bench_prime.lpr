@@ -57,5 +57,5 @@ begin
   t1 := now64;
   report('nextPrime 512b', t0, t1, 10);
   writeln('  acc=', acc);
-  readln;
+  {$ifdef WINDOWS}readln;{$endif}
 end.

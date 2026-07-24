@@ -70,5 +70,5 @@ begin
   report('jacobi small/big', t0, t1, 20000);
 
   writeln('sink=', sink);
-  readln;
+  {$ifdef WINDOWS}readln;{$endif}
 end.

@@ -250,6 +250,6 @@ begin
   TestDecimalOps;
   if fails = 0 then writeln('ALL OK')
   else writeln(fails, ' FAILURES');
-  if ParamStr(1) = 'wait' then readln;
+  {$ifdef WINDOWS}readln;{$endif}
   if fails <> 0 then Halt(1);
 end.

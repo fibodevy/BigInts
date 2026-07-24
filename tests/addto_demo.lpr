@@ -125,5 +125,5 @@ begin
   writeln;
   if fails = 0 then writeln(#27'[32mSUCCESS'#27'[0m - all checks passed')
   else writeln(#27'[31mFAILURE'#27'[0m - ', fails, ' check(s) failed');
-  readln;
+  {$ifdef WINDOWS}readln;{$endif}
 end.

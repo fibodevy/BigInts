@@ -389,5 +389,5 @@ begin
   BenchDSubAlign;
   writeln;
   writeln($'(sink = {sink})');
-  if ParamStr(1) = 'wait' then readln;
+  {$ifdef WINDOWS}readln;{$endif}
 end.

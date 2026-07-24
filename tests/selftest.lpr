@@ -2971,4 +2971,5 @@ begin
   if failCount = 0 then writeln(#27'[32mALL TESTS PASSED (', passCount, ' checks)'#27'[0m')
   else writeln(#27'[31m', failCount, ' FAILED / ', passCount, ' passed'#27'[0m');
   if failCount <> 0 then ExitCode := 1;
+  {$ifdef WINDOWS}readln;{$endif}
 end.

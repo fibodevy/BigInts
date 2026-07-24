@@ -112,4 +112,5 @@ begin
   runB(4096, 120000);
   writeln;
   writeln($'(sink = {sink})');
+  {$ifdef WINDOWS}readln;{$endif}
 end.

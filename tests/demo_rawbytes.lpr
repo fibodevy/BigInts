@@ -107,5 +107,5 @@ begin
 
   writeln;
   if fails = 0 then writeln(#27'[32mALL OK'#27'[0m') else writeln(#27'[31m', fails, ' FAILED'#27'[0m');
-  readln;
+  {$ifdef WINDOWS}readln;{$endif}
 end.

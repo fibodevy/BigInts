@@ -67,4 +67,5 @@ begin
   runD(1000, 120000);
   writeln;
   writeln($'(sink = {sink})');
+  {$ifdef WINDOWS}readln;{$endif}
 end.
