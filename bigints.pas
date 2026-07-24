@@ -103,6 +103,8 @@ type
     procedure setLimbs(const v: TBigIntLimbs);
     function getBitProp(i: LongWord): boolean; inline;
     procedure putBitProp(i: LongWord; v: boolean); inline;
+    procedure fillBytesLE(dst: PByte; n: SizeInt);
+    procedure fillBytesBE(dst: PByte; n: SizeInt);
     property fLimbs: TBigIntLimbs read getLimbs write setLimbs;
   public
     // fArr is a managed field, so copy/addref/finalize are compiler-default;
@@ -301,6 +303,17 @@ type
     function toBytesBE(len: SizeInt): TBytes;
     class function fromBytesLE(const bytes: TBytes): UBigInt; static;
     class function fromBytesBE(const bytes: TBytes): UBigInt; static;
+    class function fromBytesLE(src: Pointer; len: SizeInt): UBigInt; static;
+    class function fromBytesBE(src: Pointer; len: SizeInt): UBigInt; static;
+    // magnitude bytes packed in a string container (raw bytes, not digit text)
+    function toByteStringLE: string;
+    function toByteStringBE: string;
+    class function fromByteStringLE(const s: string): UBigInt; static;
+    class function fromByteStringBE(const s: string): UBigInt; static;
+    // allocates dst with GetMem and fills it with the magnitude bytes; the
+    // caller must release it with FreeMem. returns the byte count
+    function toBytesLE(out dst: Pointer): SizeInt;
+    function toBytesBE(out dst: Pointer): SizeInt;
     // misc
     function digitCount: LongWord;
     function toStringGrouped(sep: char = '_'; groupSize: integer = 3): string;
@@ -363,6 +376,7 @@ type
     procedure setLimbs(const v: TBigIntLimbs);
     function getBitProp(i: LongWord): boolean; inline;
     procedure putBitProp(i: LongWord; v: boolean); inline;
+    procedure fillBytesLE(dst: PByte; n: SizeInt);
     property fLimbs: TBigIntLimbs read getLimbs write setLimbs;
   public
     class operator Initialize(var x: BigInt);
@@ -564,6 +578,18 @@ type
     function toBytesBE(len: SizeInt): TBytes;
     class function fromBytesLE(const bytes: TBytes): BigInt; static;
     class function fromBytesBE(const bytes: TBytes): BigInt; static;
+    class function fromBytesLE(src: Pointer; len: SizeInt): BigInt; static;
+    class function fromBytesBE(src: Pointer; len: SizeInt): BigInt; static;
+    // two's complement bytes packed in a string container (raw bytes, not
+    // digit text)
+    function toByteStringLE: string;
+    function toByteStringBE: string;
+    class function fromByteStringLE(const s: string): BigInt; static;
+    class function fromByteStringBE(const s: string): BigInt; static;
+    // allocates dst with GetMem and fills it with the two's complement bytes;
+    // the caller must release it with FreeMem. returns the byte count
+    function toBytesLE(out dst: Pointer): SizeInt;
+    function toBytesBE(out dst: Pointer): SizeInt;
     // misc
     function digitCount: LongWord;
     function toStringGrouped(sep: char = '_'; groupSize: integer = 3): string;
@@ -7765,14 +7791,25 @@ begin
   result := -1;
 end;
 
+procedure UBigInt.fillBytesLE(dst: PByte; n: SizeInt);
+begin
+  var p := dataPtr;
+  for var i := 0 to n - 1 do dst[i] := byte(p[i shr BYTES_SHIFT] shr ((i and BYTES_MASK) * 8));
+end;
+
+procedure UBigInt.fillBytesBE(dst: PByte; n: SizeInt);
+begin
+  var p := dataPtr;
+  for var i := 0 to n - 1 do dst[n - 1 - i] := byte(p[i shr BYTES_SHIFT] shr ((i and BYTES_MASK) * 8));
+end;
+
 function UBigInt.toBytesLE: TBytes;
 var
   res: TBytes;
 begin
   var n := SizeInt((QWord(bitLength) + 7) shr 3);
   SetLength(res, n);
-  var p := dataPtr;
-  for var i := 0 to n - 1 do res[i] := byte(p[i shr BYTES_SHIFT] shr ((i and BYTES_MASK) * 8));
+  fillBytesLE(PByte(Pointer(res)), n);
   result := res;
 end;
 
@@ -7782,8 +7819,7 @@ var
 begin
   var n := SizeInt((QWord(bitLength) + 7) shr 3);
   SetLength(res, n);
-  var p := dataPtr;
-  for var i := 0 to n - 1 do res[n - 1 - i] := byte(p[i shr BYTES_SHIFT] shr ((i and BYTES_MASK) * 8));
+  fillBytesBE(PByte(Pointer(res)), n);
   result := res;
 end;
 
@@ -7801,25 +7837,73 @@ begin
 end;
 
 class function UBigInt.fromBytesLE(const bytes: TBytes): UBigInt;
+begin
+  result := fromBytesLE(Pointer(bytes), Length(bytes));
+end;
+
+class function UBigInt.fromBytesBE(const bytes: TBytes): UBigInt;
+begin
+  result := fromBytesBE(Pointer(bytes), Length(bytes));
+end;
+
+class function UBigInt.fromBytesLE(src: Pointer; len: SizeInt): UBigInt;
 var
   res: TLimbs;
 begin
-  var n := Length(bytes);
-  SetLength(res, (n + BYTES_MASK) shr BYTES_SHIFT);
-  for var i := 0 to n - 1 do res[i shr BYTES_SHIFT] := res[i shr BYTES_SHIFT] or (TLimb(bytes[i]) shl ((i and BYTES_MASK) * 8));
+  SetLength(res, (len + BYTES_MASK) shr BYTES_SHIFT);
+  for var i := 0 to len - 1 do res[i shr BYTES_SHIFT] := res[i shr BYTES_SHIFT] or (TLimb(PByte(src)[i]) shl ((i and BYTES_MASK) * 8));
   LNorm(res);
   result.fLimbs := res;
 end;
 
-class function UBigInt.fromBytesBE(const bytes: TBytes): UBigInt;
+class function UBigInt.fromBytesBE(src: Pointer; len: SizeInt): UBigInt;
 var
   res: TLimbs;
 begin
-  var n := Length(bytes);
-  SetLength(res, (n + BYTES_MASK) shr BYTES_SHIFT);
-  for var i := 0 to n - 1 do res[i shr BYTES_SHIFT] := res[i shr BYTES_SHIFT] or (TLimb(bytes[n - 1 - i]) shl ((i and BYTES_MASK) * 8));
+  SetLength(res, (len + BYTES_MASK) shr BYTES_SHIFT);
+  for var i := 0 to len - 1 do res[i shr BYTES_SHIFT] := res[i shr BYTES_SHIFT] or (TLimb(PByte(src)[len - 1 - i]) shl ((i and BYTES_MASK) * 8));
   LNorm(res);
   result.fLimbs := res;
+end;
+
+function UBigInt.toByteStringLE: string;
+begin
+  var n := SizeInt((QWord(bitLength) + 7) shr 3);
+  SetLength(result, n);
+  fillBytesLE(PByte(Pointer(result)), n);
+end;
+
+function UBigInt.toByteStringBE: string;
+begin
+  var n := SizeInt((QWord(bitLength) + 7) shr 3);
+  SetLength(result, n);
+  fillBytesBE(PByte(Pointer(result)), n);
+end;
+
+class function UBigInt.fromByteStringLE(const s: string): UBigInt;
+begin
+  result := fromBytesLE(Pointer(s), Length(s));
+end;
+
+class function UBigInt.fromByteStringBE(const s: string): UBigInt;
+begin
+  result := fromBytesBE(Pointer(s), Length(s));
+end;
+
+function UBigInt.toBytesLE(out dst: Pointer): SizeInt;
+begin
+  var n := SizeInt((QWord(bitLength) + 7) shr 3);
+  dst := GetMem(n);
+  fillBytesLE(dst, n);
+  result := n;
+end;
+
+function UBigInt.toBytesBE(out dst: Pointer): SizeInt;
+begin
+  var n := SizeInt((QWord(bitLength) + 7) shr 3);
+  dst := GetMem(n);
+  fillBytesBE(dst, n);
+  result := n;
 end;
 
 function UBigInt.digitCount: LongWord;
@@ -9837,6 +9921,13 @@ begin
   result := magnitude.isKthPower(k);
 end;
 
+procedure BigInt.fillBytesLE(dst: PByte; n: SizeInt);
+begin
+  var p := dataPtr;
+  var low := LLowestNZP(p, fLen);
+  for var i := 0 to n - 1 do dst[i] := byte(TCLimbAtP(p, fLen, fNeg, low, i shr BYTES_SHIFT) shr ((i and BYTES_MASK) * 8));
+end;
+
 function BigInt.toBytesLE: TBytes;
 var
   res: TBytes;
@@ -9844,9 +9935,7 @@ begin
   // minimal two's complement including the sign bit
   var n := SizeInt(bitLength div 8) + 1;
   SetLength(res, n);
-  var p := dataPtr;
-  var low := LLowestNZP(p, fLen);
-  for var i := 0 to n - 1 do res[i] := byte(TCLimbAtP(p, fLen, fNeg, low, i shr BYTES_SHIFT) shr ((i and BYTES_MASK) * 8));
+  fillBytesLE(PByte(Pointer(res)), n);
   result := res;
 end;
 
@@ -9875,30 +9964,77 @@ begin
 end;
 
 class function BigInt.fromBytesLE(const bytes: TBytes): BigInt;
+begin
+  result := fromBytesLE(Pointer(bytes), Length(bytes));
+end;
+
+class function BigInt.fromBytesBE(const bytes: TBytes): BigInt;
+begin
+  result := fromBytesBE(Pointer(bytes), Length(bytes));
+end;
+
+class function BigInt.fromBytesLE(src: Pointer; len: SizeInt): BigInt;
 var
   res: TLimbs;
 begin
-  var n := Length(bytes);
-  if n = 0 then exit(default(BigInt));
-  var neg := bytes[n - 1] >= $80;
-  var limbCount := (n + BYTES_MASK) shr BYTES_SHIFT;
+  if len = 0 then exit(default(BigInt));
+  var neg := PByte(src)[len - 1] >= $80;
+  var limbCount := (len + BYTES_MASK) shr BYTES_SHIFT;
   SetLength(res, limbCount);
   // sign-extend the incomplete top limb (a full top limb gets all its bytes)
-  if neg and (n and BYTES_MASK <> 0) then res[limbCount - 1] := High(TLimb) shl ((n and BYTES_MASK) * 8);
-  for var i := 0 to n - 1 do res[i shr BYTES_SHIFT] := res[i shr BYTES_SHIFT] or (TLimb(bytes[i]) shl ((i and BYTES_MASK) * 8));
+  if neg and (len and BYTES_MASK <> 0) then res[limbCount - 1] := High(TLimb) shl ((len and BYTES_MASK) * 8);
+  for var i := 0 to len - 1 do res[i shr BYTES_SHIFT] := res[i shr BYTES_SHIFT] or (TLimb(PByte(src)[i]) shl ((i and BYTES_MASK) * 8));
   if neg then LTCNegateInPlaceP(PLimb(Pointer(res)), Length(res));
   LNorm(res);
   result.fLimbs := res;
   result.fNeg := neg and (Length(res) > 0);
 end;
 
-class function BigInt.fromBytesBE(const bytes: TBytes): BigInt;
+class function BigInt.fromBytesBE(src: Pointer; len: SizeInt): BigInt;
 var
   tmp: TBytes;
 begin
-  tmp := Copy(bytes);
-  for var i := 0 to (Length(tmp) shr 1) - 1 do SwapValues(tmp[i], tmp[High(tmp) - i]);
+  SetLength(tmp, len);
+  for var i := 0 to len - 1 do tmp[i] := PByte(src)[len - 1 - i];
   result := fromBytesLE(tmp);
+end;
+
+function BigInt.toByteStringLE: string;
+begin
+  var n := SizeInt(bitLength div 8) + 1;
+  SetLength(result, n);
+  fillBytesLE(PByte(Pointer(result)), n);
+end;
+
+function BigInt.toByteStringBE: string;
+begin
+  result := toByteStringLE;
+  var n := Length(result);
+  for var i := 1 to n shr 1 do SwapValues(result[i], result[n + 1 - i]);
+end;
+
+class function BigInt.fromByteStringLE(const s: string): BigInt;
+begin
+  result := fromBytesLE(Pointer(s), Length(s));
+end;
+
+class function BigInt.fromByteStringBE(const s: string): BigInt;
+begin
+  result := fromBytesBE(Pointer(s), Length(s));
+end;
+
+function BigInt.toBytesLE(out dst: Pointer): SizeInt;
+begin
+  var n := SizeInt(bitLength div 8) + 1;
+  dst := GetMem(n);
+  fillBytesLE(dst, n);
+  result := n;
+end;
+
+function BigInt.toBytesBE(out dst: Pointer): SizeInt;
+begin
+  result := toBytesLE(dst);
+  for var i := 0 to (result shr 1) - 1 do SwapValues(PByte(dst)[i], PByte(dst)[result - 1 - i]);
 end;
 
 function BigInt.digitCount: LongWord;
