@@ -31,6 +31,11 @@ unit BigInts;
 {$if defined(CPUX86_64) and defined(USEASM)}{$define BIGINT_ASM}{$endif}
 {$if defined(CPU386) and defined(USEASM)}{$define BIGINT_ASM32}{$endif}
 
+// the x86_64 kernels are written against the Microsoft x64 argument registers;
+// on every other x86_64 target the SysV ABI applies and a prologue shuffles the
+// four integer arguments into that layout
+{$if defined(BIGINT_ASM) and not defined(WINDOWS)}{$define BIGINT_ABI_SYSV}{$endif}
+
 // limb arithmetic relies on modular 32-bit/64-bit wraparound
 {$q-}{$r-}
 
@@ -1195,8 +1200,10 @@ type
 
 {$ifdef BIGINT_ASM}
 
-// x86_64 primitives: win64 ABI (rcx, rdx, r8, r9), only volatile registers,
-// carry chains kept live across iterations (lea/dec/jnz preserve CF)
+// x86_64 primitives: arguments in rcx, rdx, r8, r9, only registers volatile in
+// both ABIs, carry chains kept live across iterations (lea/dec/jnz preserve CF).
+// each kernel opens with the BIGINT_ABI_SYSV prologue, which is empty on Windows
+// and otherwise moves rdi, rsi, rdx, rcx into those four registers
 
 function LimbBsr(x: TLimb): LongWord; inline;
 begin
@@ -1220,6 +1227,12 @@ end;
 {$else}
 procedure UMulLimb(a, b: TLimb; out hi, lo: TLimb); assembler; nostackframe;
 asm
+{$ifdef BIGINT_ABI_SYSV}
+  mov r8, rdx
+  mov r9, rcx
+  mov rcx, rdi
+  mov rdx, rsi
+{$endif}
   mov rax, rcx
   mul rdx       // rdx:rax = a * b
   mov [r8], rdx
@@ -1230,6 +1243,12 @@ end;
 // (hi:lo) div d and its remainder, caller guarantees hi < d
 function UDivLimb(hi, lo, d: TLimb; out rem: TLimb): TLimb; assembler; nostackframe;
 asm
+{$ifdef BIGINT_ABI_SYSV}
+  mov r8, rdx
+  mov r9, rcx
+  mov rcx, rdi
+  mov rdx, rsi
+{$endif}
   mov rax, rdx
   mov rdx, rcx
   div r8        // rax = quotient, rdx = remainder
@@ -1247,6 +1266,12 @@ end;
 // leaves CF alone), tail peeled after the quads with the carry live
 function MpnAddN(rp, ap, bp: PLimb; n: SizeInt): TLimb; assembler; nostackframe;
 asm
+{$ifdef BIGINT_ABI_SYSV}
+  mov r8, rdx
+  mov r9, rcx
+  mov rcx, rdi
+  mov rdx, rsi
+{$endif}
   mov r10, r9
   shr r9, 2
   and r10d, 3
@@ -1291,6 +1316,12 @@ end;
 // rp := ap - bp over n limbs, returns borrow; same shape as MpnAddN
 function MpnSubN(rp, ap, bp: PLimb; n: SizeInt): TLimb; assembler; nostackframe;
 asm
+{$ifdef BIGINT_ABI_SYSV}
+  mov r8, rdx
+  mov r9, rcx
+  mov rcx, rdi
+  mov rdx, rsi
+{$endif}
   mov r10, r9
   shr r9, 2
   and r10d, 3
@@ -1335,6 +1366,12 @@ end;
 // rp := ap + b with carry propagation, returns the final carry
 function MpnAdd1(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb; assembler; nostackframe;
 asm
+{$ifdef BIGINT_ABI_SYSV}
+  mov r8, rdx
+  mov r9, rcx
+  mov rcx, rdi
+  mov rdx, rsi
+{$endif}
   mov rax, r9        // carry
   test r8, r8
   jz @done
@@ -1366,6 +1403,12 @@ end;
 // rp := ap - b with borrow propagation, returns the final borrow
 function MpnSub1(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb; assembler; nostackframe;
 asm
+{$ifdef BIGINT_ABI_SYSV}
+  mov r8, rdx
+  mov r9, rcx
+  mov rcx, rdi
+  mov rdx, rsi
+{$endif}
   mov rax, r9        // borrow
   test r8, r8
   jz @done
@@ -1423,6 +1466,12 @@ var
 // rp := ap * b, returns the high limb (plain mul variant)
 function MpnMul1Gen(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb; assembler; nostackframe;
 asm
+{$ifdef BIGINT_ABI_SYSV}
+  mov r8, rdx
+  mov r9, rcx
+  mov rcx, rdi
+  mov rdx, rsi
+{$endif}
   mov r10, rdx       // ap (mul clobbers rdx)
   xor r11d, r11d     // carry
   test r8, r8
@@ -1446,6 +1495,12 @@ end;
 // low limbs are peeled first so the carry limb seeds the chain
 function MpnMul1Adx(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb; assembler; nostackframe;
 asm
+{$ifdef BIGINT_ABI_SYSV}
+  mov r8, rdx
+  mov r9, rcx
+  mov rcx, rdi
+  mov rdx, rsi
+{$endif}
   push rbx
   mov r10, rdx             // ap
   mov rdx, r9              // b, implicit mulx operand
@@ -1504,6 +1559,12 @@ end;
 // rp += ap * b, returns the carry limb (plain mul/adc variant)
 function MpnAddMul1Gen(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb; assembler; nostackframe;
 asm
+{$ifdef BIGINT_ABI_SYSV}
+  mov r8, rdx
+  mov r9, rcx
+  mov rcx, rdi
+  mov rdx, rsi
+{$endif}
   mov r10, rdx
   xor r11d, r11d
   test r8, r8
@@ -1529,6 +1590,12 @@ end;
 // the low limbs are peeled first so the carry limb seeds the chains
 function MpnAddMul1Adx(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb; assembler; nostackframe;
 asm
+{$ifdef BIGINT_ABI_SYSV}
+  mov r8, rdx
+  mov r9, rcx
+  mov rcx, rdi
+  mov rdx, rsi
+{$endif}
   push rbx
   mov r10, rdx             // ap
   mov rdx, r9              // b, implicit mulx operand
@@ -1597,6 +1664,12 @@ end;
 // addressable memory, so it never occurs; the noasm loop below is signed
 function MpnSubMul1Gen(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb; assembler; nostackframe;
 asm
+{$ifdef BIGINT_ABI_SYSV}
+  mov r8, rdx
+  mov r9, rcx
+  mov rcx, rdi
+  mov rdx, rsi
+{$endif}
   mov r10, rdx
   xor r11d, r11d
   test r8, r8
@@ -1623,6 +1696,12 @@ end;
 // dec closing each pass resets OF for the next quad and leaves CF alone
 function MpnSubMul1Adx(rp, ap: PLimb; n: SizeInt; b: TLimb): TLimb; assembler; nostackframe;
 asm
+{$ifdef BIGINT_ABI_SYSV}
+  mov r8, rdx
+  mov r9, rcx
+  mov rcx, rdi
+  mov rdx, rsi
+{$endif}
   push rbx
   push rsi
   push rdi
@@ -1690,6 +1769,12 @@ end;
 // alias ap; returns the bits shifted out of the top
 function MpnLshift(rp, ap: PLimb; n: SizeInt; cnt: integer): TLimb; assembler; nostackframe;
 asm
+{$ifdef BIGINT_ABI_SYSV}
+  mov r8, rdx
+  mov r9, rcx
+  mov rcx, rdi
+  mov rdx, rsi
+{$endif}
   mov r11, rcx               // rp
   mov ecx, r9d               // cl = cnt
   xor r9d, r9d
@@ -1714,6 +1799,12 @@ end;
 // rp := ap shr cnt for cnt in 1..LIMB_BITS-1, walks low to high so rp may alias ap
 procedure MpnRshift(rp, ap: PLimb; n: SizeInt; cnt: integer); assembler; nostackframe;
 asm
+{$ifdef BIGINT_ABI_SYSV}
+  mov r8, rdx
+  mov r9, rcx
+  mov rcx, rdi
+  mov rdx, rsi
+{$endif}
   mov r11, rcx               // rp
   mov ecx, r9d               // cl = cnt
   xor r10d, r10d             // i
